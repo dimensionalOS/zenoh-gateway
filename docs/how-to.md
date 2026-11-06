@@ -1,6 +1,6 @@
 # How to
 
-Snippets are from an app page inside dimOS Desktop, using [dim-app](https://github.com/jeff-hykin/dim-app)'s `DimApp`
+Snippets are from an app page inside dimOS Desktop, using [dim-app](https://github.com/dimensionalOS/ddtk)'s `DimApp`
 (vendored at `./dim-app/`). Every page needs this in its `dimos.yaml`:
 
 ```yaml
@@ -153,7 +153,7 @@ Needed for deadmen and leases. The first `DimApp` / `getZenoh` call's options wi
 ## How do I use the client without dim-app?
 
 ```js
-import { connect } from "https://esm.sh/gh/jeff-hykin/zenoh-gateway@74b478b/client/zenoh_gateway.ts"
+import { connect } from "https://esm.sh/gh/dimensionalOS/zenoh-gateway@74b478b/client/zenoh_gateway.ts"
 const { zenohGatewayUrl = "/zenoh-gateway" } = await (await fetch("../../api/desktop/zenoh?app=my-app")).json()
 const z = await connect(new URL(zenohGatewayUrl, location.href).href, { heartbeatHz: 5 })
 const sub = z.subscribe("dimos/odom/*", { delivery: "latest" }, (msg) => console.log(msg.bytes))

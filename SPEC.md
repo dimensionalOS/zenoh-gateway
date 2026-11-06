@@ -204,7 +204,7 @@ must coalesce by content (tf by child frame) needs an encoding that does it; the
 ## Client
 
 `client/zenoh_gateway.ts` (strict TypeScript, no dependencies). Browsers load it from esm.sh, which
-transpiles it (`https://esm.sh/gh/jeff-hykin/zenoh-gateway@<commit>/client/zenoh_gateway.ts`), or bundle it
+transpiles it (`https://esm.sh/gh/dimensionalOS/zenoh-gateway@<commit>/client/zenoh_gateway.ts`), or bundle it
 (`deno bundle`, the same esbuild transform; zenoh-gateway-cli's `deno task build` bundles it).
 
 ## Rust client
@@ -287,7 +287,7 @@ A subscription names a message **encoding** (`encoding`), the **channel** its ou
 **options** the encoding gets (`encodeOptions`). No `encoding` = raw passthrough on the data channel (Hz is the only
 degradation). There is no auto-detection and no encoding is built in: the application embedding the gateway registers
 them by name (`ServerBuilder::encoding`; a name registered twice fails the build), e.g. the robotics encodings of
-[zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs), one per message type, named after its file. The
+[zenoh-dimos-codecs](https://github.com/dimensionalOS/zenoh-dimos-codecs), one per message type, named after its file. The
 core knows no message types: its only special paths are video and audio tracks. The client fetches the registry on
 connect (`control` op `encodings` → `{encodings: [{name, output}]}`, output on the default channel `"video"`,
 `"audio"`, `"fields"` or `"data"`, as `z.encodings`); the gateway refuses an unknown name (`rejected` event, listing the
@@ -404,7 +404,7 @@ per-frame metadata. Built in: `H264Encoder` (openh264, constrained baseline) for
 frames come ~100 ms late at 30 Hz).
 
 A hardware encoder plugs in for its format as `ServerBuilder::video_encoder(factory)` (called once to ask the format;
-one per format), or for one encoding as its `video_encoder(format)` (which wins). [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs)' `encoders` module has
+one per format), or for one encoding as its `video_encoder(format)` (which wins). [zenoh-dimos-codecs](https://github.com/dimensionalOS/zenoh-dimos-codecs)' `encoders` module has
 VideoToolbox (macOS) and GStreamer (`nvv4l2h264enc` on a Jetson, `nvh264enc`, `vah264enc` / `vaapih264enc`, loaded at
 runtime) backends, probed by encoding a test frame and wrapped in a fallback to openh264; zenoh-gateway-cli uses it
 (`--video-encoder auto|software|videotoolbox|gstreamer`). Any encoder is fed from

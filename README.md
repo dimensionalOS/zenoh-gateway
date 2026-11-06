@@ -7,13 +7,13 @@ library serves browsers over WebRTC; a dependency-free TypeScript client talks t
 by default, AV1 built in, or any encoder you plug in), sound as Opus, everything else as bytes on per-stream data
 channels. A per-browser bandwidth allocator decides who gets what when the link is short.
 
-- [zenoh-gateway-cli](https://github.com/jeff-hykin/zenoh-gateway-cli): the `zenoh-gateway` command, the example page
+- [zenoh-gateway-cli](https://github.com/dimensionalOS/zenoh-gateway-cli): the `zenoh-gateway` command, the example page
   and the end-to-end tests.
-- [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs): ROS 2 / dimos images, depth and point clouds.
+- [zenoh-dimos-codecs](https://github.com/dimensionalOS/zenoh-dimos-codecs): ROS 2 / dimos images, depth and point clouds.
 - [docs/how-to.md](docs/how-to.md): recipes (subscribe, publish, video, point clouds, ...). [SPEC.md](SPEC.md): the
   detailed contract.
 
-![the example page: topic list, H.264 video, point cloud, depth, a raw stream and live allocation stats](https://raw.githubusercontent.com/jeff-hykin/zenoh-gateway-cli/main/test/artifacts/example.png)
+![the example page: topic list, H.264 video, point cloud, depth, a raw stream and live allocation stats](https://raw.githubusercontent.com/dimensionalOS/zenoh-gateway-cli/main/test/artifacts/example.png)
 
 ## Architecture
 
@@ -27,7 +27,7 @@ channels. A per-browser bandwidth allocator decides who gets what when the link 
 ## Client API
 
 ```js
-import { connect, Priority, registerEncoding } from "https://esm.sh/gh/jeff-hykin/zenoh-gateway@<commit or tag>/client/zenoh_gateway.ts"
+import { connect, Priority, registerEncoding } from "https://esm.sh/gh/dimensionalOS/zenoh-gateway@<commit or tag>/client/zenoh_gateway.ts"
 
 const z = await connect("http://robot.local:7448", { heartbeatHz: 5, heartbeatMisses: 3 })
 const sub = z.subscribe("camera/**", { encoding: "ros2_image", maxHz: 15 }, (msg) => {})
@@ -132,7 +132,7 @@ sets `msg.decoded = decoder(msg.bytes, msg)`. Video and audio need no decoder. A
 
 A subscription names an **encoding** (how to read its messages), a **channel** to send the result on, and
 **encodeOptions**. Nothing is auto-detected and the core knows no message types: the application registers encodings
-(e.g. [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs)). No encoding = raw bytes, and rate is
+(e.g. [zenoh-dimos-codecs](https://github.com/dimensionalOS/zenoh-dimos-codecs)). No encoding = raw bytes, and rate is
 the only thing that degrades.
 
 - **video** (`video-h264` default, `video-av1`, `video-vp8`, `video-vp9`): the gateway encodes pictures at the granted
@@ -150,7 +150,7 @@ add encodings.
 
 ```toml
 [dependencies]
-zenoh-gateway = { git = "https://github.com/jeff-hykin/zenoh-gateway", rev = "<commit>" }
+zenoh-gateway = { git = "https://github.com/dimensionalOS/zenoh-gateway", rev = "<commit>" }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -321,8 +321,8 @@ zenoh = { git = "https://github.com/jeff-hykin/zenoh-vendor", tag = "zenoh-1.10.
 ```
 
 ```sh
-nix flake init -t github:jeff-hykin/zenoh-gateway#downstream
-cargo generate-lockfile && nix run github:jeff-hykin/zenoh-gateway#crate2nix -- generate
+nix flake init -t github:dimensionalOS/zenoh-gateway#downstream
+cargo generate-lockfile && nix run github:dimensionalOS/zenoh-gateway#crate2nix -- generate
 git add -A && nix build .#my-app-aarch64-linux --max-jobs auto
 ```
 
@@ -339,7 +339,7 @@ bin/test                                   # every suite whose inputs changed si
 ```
 
 `bin/test` also runs the browser suites in `client/test` (headless Chrome, shaped links). The end-to-end suites (real zenoh peer, server and headless Chrome) live in
-[zenoh-gateway-cli](https://github.com/jeff-hykin/zenoh-gateway-cli).
+[zenoh-gateway-cli](https://github.com/dimensionalOS/zenoh-gateway-cli).
 
 ## Known limitations
 

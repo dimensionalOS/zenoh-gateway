@@ -16373,7 +16373,7 @@ rec {
         edition = "2024";
         workspace_member = null;
         src = pkgs.fetchgit {
-          url = "https://github.com/jeff-hykin/zenoh-dimos-codecs";
+          url = "https://github.com/dimensionalOS/zenoh-dimos-codecs";
           rev = "013142da5ba4777a6d00993acc85148d0fe674ce";
           sha256 = "1i29b061720y08vlji7z6d0wxwpyfa9rxkw6vz81rsncmxp1wqmh";
         };

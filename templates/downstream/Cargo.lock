@@ -4925,7 +4925,7 @@ dependencies = [
 [[package]]
 name = "zenoh-dimos-codecs"
 version = "0.2.0"
-source = "git+https://github.com/jeff-hykin/zenoh-dimos-codecs?rev=013142da5ba4777a6d00993acc85148d0fe674ce#013142da5ba4777a6d00993acc85148d0fe674ce"
+source = "git+https://github.com/dimensionalOS/zenoh-dimos-codecs?rev=013142da5ba4777a6d00993acc85148d0fe674ce#013142da5ba4777a6d00993acc85148d0fe674ce"
 dependencies = [
  "anyhow",
  "image-webp",

@@ -5,7 +5,7 @@
 //! deadmen. The browser side is `client/zenoh_gateway.ts` in the repository.
 //!
 //! This crate is the library for embedding the server in an application; the `zenoh-gateway` command
-//! (with a set of robotics encodings) is [zenoh-gateway-cli](https://github.com/jeff-hykin/zenoh-gateway-cli):
+//! (with a set of robotics encodings) is [zenoh-gateway-cli](https://github.com/dimensionalOS/zenoh-gateway-cli):
 //!
 //! ```no_run
 //! # async fn run() -> anyhow::Result<()> {
@@ -30,7 +30,7 @@
 //! A subscription may pick a message encoding by name (`encoding: "<name>"`), the [`Channel`] its output travels on
 //! (`channel`) and options for it (`encodeOptions`). The server has none built in: implement [`MessageEncoding`] and pass
 //! it to [`ServerBuilder::encoding`] (e.g. the robotics ones of
-//! [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs)). An encoding produces [`VideoImage`]s, which
+//! [zenoh-dimos-codecs](https://github.com/dimensionalOS/zenoh-dimos-codecs)). An encoding produces [`VideoImage`]s, which
 //! the gateway encodes (H.264 or AV1 built in, others through [`ServerBuilder::video_encoder`]) on a video track (no
 //! browser code needed), PCM for an Opus track, or bytes for the data channel: a [`Fields`] message the client decodes
 //! by itself, or its own format, which the page decodes with a decoder registered through the client's
