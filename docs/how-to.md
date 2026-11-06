@@ -153,7 +153,8 @@ Needed for deadmen and leases. The first `DimApp` / `getZenoh` call's options wi
 ## How do I use the client without dim-app?
 
 ```js
-import { connect } from "https://esm.sh/gh/dimensionalOS/zenoh-gateway@74b478b/client/zenoh_gateway.ts"
+// Desktop serves the client at its gateway's commit (GET /gateways/desktop/management/gateways/zenoh names it as `client`)
+import { connect } from "/zenoh-gateway/client/<commit>/zenoh_gateway.js"
 const { zenohGatewayUrl = "/zenoh-gateway" } = await (await fetch("../../api/desktop/zenoh?app=my-app")).json()
 const z = await connect(new URL(zenohGatewayUrl, location.href).href, { heartbeatHz: 5 })
 const sub = z.subscribe("dimos/odom/*", { delivery: "latest" }, (msg) => console.log(msg.bytes))

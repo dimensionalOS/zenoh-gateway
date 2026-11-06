@@ -27,7 +27,7 @@ channels. A per-browser bandwidth allocator decides who gets what when the link 
 ## Client API
 
 ```js
-import { connect, Priority, registerEncoding } from "https://esm.sh/gh/dimensionalOS/zenoh-gateway@<commit or tag>/client/zenoh_gateway.ts"
+import { connect, Priority, registerEncoding } from "./zenoh_gateway.js" // client/zenoh_gateway.ts, bundled
 
 const z = await connect("http://robot.local:7448", { heartbeatHz: 5, heartbeatMisses: 3 })
 const sub = z.subscribe("camera/**", { encoding: "ros2_image", maxHz: 15 }, (msg) => {})
@@ -37,7 +37,8 @@ cmd.put(bytes)
 await cmd.setDeadman(stopBytes)
 ```
 
-Pin a commit (esm.sh transpiles on the fly), or bundle it with `deno bundle client/zenoh_gateway.ts`. An unknown option
+Bundle it with `deno bundle --platform browser client/zenoh_gateway.ts`, vendor it (ddtk's `tools/vendor_zenoh_client.js`),
+or, in a Desktop app, import the copy Desktop serves at `/zenoh-gateway/client/<commit>/zenoh_gateway.js`. An unknown option
 or bad value rejects the subscription or publisher; `ready()` rejects with the reason.
 
 ### `connect(url, options)` → `Promise<ZenohGateway>`

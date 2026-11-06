@@ -18,7 +18,7 @@ except when a subscription explicitly picks one of its message encodings (see "E
 ## JS API
 
 ```js
-import { connect, Priority, registerEncoding } from "./zenoh_gateway.ts"   // via esm.sh, or bundled: see "Client"
+import { connect, Priority, registerEncoding } from "./zenoh_gateway.js"   // bundled or vendored: see "Client"
 
 const z = await connect("http://robot.local:7448", {
     heartbeatHz: 5,         // 0 (default) = no heartbeat; needed for deadmen and leases
@@ -203,9 +203,9 @@ must coalesce by content (tf by child frame) needs an encoding that does it; the
 
 ## Client
 
-`client/zenoh_gateway.ts` (strict TypeScript, no dependencies). Browsers load it from esm.sh, which
-transpiles it (`https://esm.sh/gh/dimensionalOS/zenoh-gateway@<commit>/client/zenoh_gateway.ts`), or bundle it
-(`deno bundle`, the same esbuild transform; zenoh-gateway-cli's `deno task build` bundles it).
+`client/zenoh_gateway.ts` (strict TypeScript, no dependencies). Browsers get it as JavaScript: bundled (`deno bundle
+--platform browser`; zenoh-gateway-cli's `deno task build` does), vendored (ddtk's `tools/vendor_zenoh_client.js`), or
+from Desktop, which serves its gateway's commit at `/zenoh-gateway/client/<commit>/zenoh_gateway.js`.
 
 ## Rust client
 
