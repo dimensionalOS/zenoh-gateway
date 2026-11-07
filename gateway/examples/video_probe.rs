@@ -132,7 +132,12 @@ async fn main() -> Result<()> {
     let mut decode_errors = 0usize;
     let started = Instant::now();
     let deadline = started + Duration::from_secs_f64(options.seconds);
+    let mut next_stats = started + Duration::from_secs(5);
     while Instant::now() < deadline {
+        if Instant::now() >= next_stats {
+            next_stats += Duration::from_secs(5);
+            println!("[t+{:.0}s stats]\n{}", started.elapsed().as_secs_f64(), subscription_stats(&client, &options.key).await);
+        }
         let Ok(Some(message)) = tokio::time::timeout_at(deadline.into(), subscription.recv()).await else { break };
         match message {
             Message::VideoInfo(info) => {
@@ -239,6 +244,7 @@ async fn subscription_stats(client: &Client, key: &str) -> String {
         format!("  encoding errors: {}   last: {}", field("encodingErrors"), field("lastEncodingError")),
         format!("  picture: {}x{}   decode {} ms   encode {} ms", field("videoWidth"), field("videoHeight"), field("decodeMs"), field("encodeMs")),
         format!("  the allocator granted: {} bytes/s at {} Hz", channel["allocation"]["budgetBytesPerSec"], channel["allocation"]["hz"]),
+        format!("  cpuScaleCap: {}   quality: {}", stat["cpuScaleCap"], stat["quality"]),
     ]
     .join("\n")
 }

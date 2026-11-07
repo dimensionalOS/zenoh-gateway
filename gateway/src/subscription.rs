@@ -437,7 +437,7 @@ impl SubShared {
 
     /// Per-key Hz cap from the allocation (None = no allocation cap).
     fn allocated_key_hz(&self, rate_hz: f64, allocation: &Allocation) -> Option<f64> {
-        if self.reserved() || !allocation.constrained || rate_hz <= 0.0 {
+        if self.never_thinned() || !allocation.constrained || rate_hz <= 0.0 {
             return None;
         }
         let wanted = self.tuning().max_hz.map_or(rate_hz, |max| max.min(rate_hz));
@@ -468,21 +468,32 @@ impl SubShared {
         EncodeOptions { quality, options: self.encode_options.clone() }
     }
 
-    /// Reserved at its measured rate, never paced or shrunk: strict-priority and audio streams, and a video stream
-    /// whose frames depend on each other, which is either a passthrough channel
-    /// ([`VideoFormat::passthrough_only`], forwarded as the source encoded it) or one decoded by a
-    /// [`StreamDecoder`](crate::StreamDecoder).
+    /// Reserved at its measured rate: strict-priority streams, audio, and a passthrough video channel
+    /// ([`VideoFormat::passthrough_only`]). The allocator reserves what such a stream sends rather than offering it a
+    /// grant it could not meet.
     ///
-    /// Neither can be thinned: a decoder cannot be fed a subset of a stream, and a dropped predicted frame costs the
-    /// picture until the source's next keyframe, which the gateway cannot ask for. A passthrough stream cannot be
-    /// shrunk either, since the gateway does not encode its frames. So such a stream takes what the source sends or
-    /// nothing, and the allocator reserves it rather than offering a smaller grant it could not meet.
+    /// What they have in common is that **what they send does not depend on what they are granted**: Opus emits its
+    /// packets regardless, a strict stream forwards what was published, and a passthrough stream carries bytes the
+    /// publisher already encoded and the gateway cannot change. That is the precondition for reporting a measured rate
+    /// as a demand ([`Usage`]'s `fixed_bytes_per_sec`), and it is why a **re-encoded** stream must not be reserved
+    /// however much it resembles one: its grant sets the encoder's bitrate, which sets the bytes it sends, which would
+    /// become its next demand - so a picture that shrank once would be granted less, shrink again, and have nothing
+    /// pulling it back. Such a stream still must not be thinned; that is [`Self::never_thinned`].
     /// (Reliable ones shrink last, see `allocator`, their queue bounded by `reliable_max_backlog`.)
     pub fn reserved(&self) -> bool {
         self.is_strict()
             || self.channel == Channel::Audio
             || matches!(self.channel, Channel::Video(format) if format.passthrough_only())
-            || self.stream_decoded.load(Ordering::Relaxed)
+    }
+
+    /// Never held to fewer frames than its source sends. Everything [`Self::reserved`] covers, and a stream decoded by
+    /// a [`StreamDecoder`](crate::StreamDecoder): a decoder cannot be fed a subset of its stream, and a dropped
+    /// predicted frame costs the picture until the source's next keyframe, which the gateway cannot ask for.
+    ///
+    /// Deliberately wider than `reserved`, which also fixes the stream's demand at its measured rate - see there for
+    /// why that is wrong for a stream the gateway encodes itself.
+    pub fn never_thinned(&self) -> bool {
+        self.reserved() || self.stream_decoded.load(Ordering::Relaxed)
     }
 
     /// The send loop built a `StreamDecoder` for this stream: it must now see every sample ([`Self::reserved`]).
@@ -1194,6 +1205,36 @@ mod tests {
     fn shared(opts: &str) -> SubShared {
         let registry = Arc::new(EncodingRegistry::new([]).unwrap());
         SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data }, registry, Arc::default(), DEFAULT_RELIABLE_MAX_BACKLOG)
+    }
+
+    /// A video subscription of `channel`, which `shared` cannot make because it always resolves to the data channel.
+    fn video_shared(channel: Channel) -> SubShared {
+        let registry = Arc::new(EncodingRegistry::new([]).unwrap());
+        let opts = SubOpts::parse(&serde_json::from_str("{}").unwrap()).unwrap();
+        SubShared::new(&opts, Resolved { encoding: None, channel, output: EncodingOutput::Video }, registry, Arc::default(), DEFAULT_RELIABLE_MAX_BACKLOG)
+    }
+
+    /// `reserved` and `never_thinned` must not be the same set, and the difference is the whole of a bug that pinned a
+    /// re-encoded camera to a twentieth of the bitrate it needed.
+    ///
+    /// `reserved` says "this stream's demand is the bytes it sent", which holds only where what a stream sends does
+    /// not depend on what it is granted. `never_thinned` says "do not hold it to fewer frames than its source sends".
+    /// A stream-decoded stream needs the second and must not have the first: its grant sets the encoder's bitrate,
+    /// which sets the bytes it sends, which would become its next demand - a one-way ratchet down.
+    #[test]
+    fn a_re_encoded_stream_is_never_thinned_but_never_reserved() {
+        let h265 = video_shared(Channel::Video(crate::encoding::video::VideoFormat::H265));
+        assert!(h265.reserved() && h265.never_thinned(), "passthrough: the publisher's bytes are what they are");
+
+        let h264 = video_shared(Channel::Video(crate::encoding::video::VideoFormat::H264));
+        assert!(!h264.reserved() && !h264.never_thinned(), "a plain video stream is both thinned and unreserved");
+        // once the send loop makes a stream decoder for it, it must not be thinned - and must still not be reserved
+        h264.note_stream_decoded();
+        assert!(h264.never_thinned(), "a decoder cannot be fed a subset of its stream");
+        assert!(!h264.reserved(), "its demand must be able to exceed the bytes it is currently sending, or it cannot grow back");
+
+        let audio = video_shared(Channel::Audio);
+        assert!(audio.reserved() && audio.never_thinned(), "Opus sends its packets whatever it is granted");
     }
 
     #[test]
