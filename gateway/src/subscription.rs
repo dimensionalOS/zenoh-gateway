@@ -720,12 +720,6 @@ impl SubShared {
         (key.and_then(|(key, item)| Some((key, item?))), wake_at)
     }
 
-    /// Whether any key has a sample queued, ignoring pacing: a stream-decoded loop asks this to tell a picture that is
-    /// about to be superseded from the newest one, so it encodes only the latter.
-    pub fn has_queued(&self) -> bool {
-        self.state.lock().keys.values().any(|queue| !queue.items.is_empty())
-    }
-
     /// Whether `pick` would return a message now, or when to look again.
     fn ready(&self, now: Instant) -> (bool, Option<Instant>) {
         let (next, wake_at) = self.next(now, false);

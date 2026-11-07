@@ -41,6 +41,8 @@ struct Options {
     seconds: f64,
     /// print a line per frame as well as the summary
     verbose: bool,
+    /// bearer token (app's zenohGatewayToken) for a gateway with an authorize hook
+    token: Option<String>,
 }
 
 fn usage() -> String {
@@ -48,7 +50,7 @@ fn usage() -> String {
 }
 
 fn options() -> Result<Options> {
-    let mut options = Options { url: String::new(), key: String::new(), encoding: None, channel: "video-h264".to_owned(), seconds: 20.0, verbose: false };
+    let mut options = Options { url: String::new(), key: String::new(), encoding: None, channel: "video-h264".to_owned(), seconds: 20.0, verbose: false, token: None };
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         let mut value = || args.next().with_context(|| format!("{argument} needs a value\n{}", usage()));
@@ -59,6 +61,7 @@ fn options() -> Result<Options> {
             "--channel" => options.channel = value()?,
             "--seconds" => options.seconds = value()?.parse().context("--seconds takes a number")?,
             "--verbose" => options.verbose = true,
+            "--token" => options.token = Some(value()?),
             "--help" | "-h" => bail!("{}", usage()),
             other => bail!("unknown argument {other}\n{}", usage()),
         }
@@ -105,7 +108,7 @@ fn spread(name: &str, values: &mut [f64]) -> String {
 async fn main() -> Result<()> {
     let options = options()?;
     println!("connecting to {} ...", options.url);
-    let client = Client::connect(&options.url, ClientOptions::default()).await?;
+    let client = Client::connect(&options.url, ClientOptions { token: options.token.clone(), ..ClientOptions::default() }).await?;
     let offset = client.clock_offset_ms();
     println!(
         "connected: rtt {}, clock offset {}",
@@ -160,7 +163,10 @@ async fn main() -> Result<()> {
     let elapsed = started.elapsed().as_secs_f64();
 
     let (Some(first_seq), Some(last_seq)) = (first_seq, last_seq) else {
-        bail!("no frames in {elapsed:.1}s: is {} publishing, and does the gateway have an encoder for {}?", options.key, options.channel);
+        // the gateway's own account of the stream says far more than a guess from out here: whether samples arrived at
+        // all, whether any were encoded, and the last error if there was one
+        println!("\nno frames in {elapsed:.1}s. what the gateway says about this subscription:\n{}", subscription_stats(&client, &options.key).await);
+        bail!("no frames in {elapsed:.1}s on {} (see the gateway's stats above)", options.channel);
     };
     let sent = (last_seq.wrapping_sub(first_seq) as usize) + 1;
     let arrived = frames.len();
@@ -207,7 +213,34 @@ async fn main() -> Result<()> {
     if decode_errors > 0 {
         println!("note:      {decode_errors} messages arrived that were not video — is {} really a video channel?", options.channel);
     }
+    // the gateway's own counters whenever the stream is not healthy: fewer frames than it sent, or any at all lost
+    if arrived < sent || arrived as f64 / elapsed < 1.0 {
+        println!("\nthe stream is not healthy; what the gateway says:\n{}", subscription_stats(&client, &options.key).await);
+    }
     Ok(())
+}
+
+/// The gateway's counters for the subscription on `key`, as `client.stats()` reports them.
+///
+/// Worth asking for by name: a probe out here can only say "no frames", while the gateway knows whether it received
+/// samples, how many it encoded, what it last failed at and how often a stream decoder had to start over. A silent
+/// `received=2337, encodes=0, lastEncodingError=null` says "the encode stage never ran", which is a different bug from
+/// "the encoder is broken" and takes a different hour to find.
+async fn subscription_stats(client: &Client, key: &str) -> String {
+    let Ok(stats) = client.stats().await else { return "  (the gateway did not answer a stats request)".to_owned() };
+    let Some(channels) = stats["channels"].as_array() else { return "  (no channels in the gateway's stats)".to_owned() };
+    let mine = channels.iter().find(|channel| channel["key"].as_str() == Some(key));
+    let Some(channel) = mine.or_else(|| channels.first()) else { return "  (the gateway has no subscriptions)".to_owned() };
+    let stat = &channel["stats"];
+    let field = |name: &str| stat[name].to_string();
+    [
+        format!("  samples received: {}   sent: {}   encoded: {}", field("received"), field("sent"), field("encodes")),
+        format!("  dropped from the queue: {}   by age: {}   stream decoder restarts: {}", field("droppedQueue"), field("droppedAge"), field("streamResyncs")),
+        format!("  encoding errors: {}   last: {}", field("encodingErrors"), field("lastEncodingError")),
+        format!("  picture: {}x{}   decode {} ms   encode {} ms", field("videoWidth"), field("videoHeight"), field("decodeMs"), field("encodeMs")),
+        format!("  the allocator granted: {} bytes/s at {} Hz", channel["allocation"]["budgetBytesPerSec"], channel["allocation"]["hz"]),
+    ]
+    .join("\n")
 }
 
 /// `at` as unix ms, from `started` being now-ish: the probe's own clock, to be moved onto the gateway's.
