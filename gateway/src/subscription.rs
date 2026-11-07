@@ -55,6 +55,10 @@ pub struct SubStats {
     pub dropped_send_error: u64,
     /// video: times the send loop held off encoding because written frames still waited in the RTP pacer
     pub pacer_waits: u64,
+    /// video on a stateful encoding: the longest a stream-decoded key's consumer had been away when a sample of it had
+    /// to be dropped (ms). A drop costs such a stream the pictures until the publisher's next keyframe, so this says
+    /// what to go and look at
+    pub worst_consumer_gap_ms: f64,
     /// video on a stateful encoding (`MessageEncoding::stream_decoder`): times the decoder had to start over at a
     /// keyframe because samples were dropped from the queue before it read them. Each one costs the picture until the
     /// publisher's next keyframe, so this is the number to watch when such a stream stutters
@@ -146,6 +150,8 @@ struct KeyQueue {
     /// the latest sample's arrival: a key quiet for `stale_after` with nothing queued is forgotten (kept, every key a
     /// wildcard subscription ever matched stayed for its life)
     last_arrival: Option<Instant>,
+    /// when a consumer last took a sample of this key, so a drop can say how long the loop had been away
+    last_taken: Option<Instant>,
 }
 
 /// How often a key may send.
@@ -715,10 +721,19 @@ impl SubShared {
             }
             state.payload_bytes = ewma(state.payload_bytes, payload_len as f64);
             if let Some(cap) = self.delivery.queue {
-                let cap = if self.stream_decoded.load(Ordering::Relaxed) { cap.max(STREAM_DECODE_BACKLOG) } else { cap };
+                let stream_decoded = self.stream_decoded.load(Ordering::Relaxed);
+                let cap = if stream_decoded { cap.max(STREAM_DECODE_BACKLOG) } else { cap };
+                let away = queue.last_taken.map(|taken| Instant::now().duration_since(taken).as_secs_f64() * 1000.0);
                 while queue.items.len() > cap {
                     state.stats.unqueue(&queue.items.pop_front().unwrap());
                     state.stats.dropped_queue += 1;
+                    if stream_decoded {
+                        // a dropped sample costs such a stream every picture until the publisher's next keyframe, so
+                        // what the consumer was doing for long enough to let `cap` samples pile up is worth knowing by
+                        // name. It is rare by construction: once per keyframe interval at worst
+                        state.stats.worst_consumer_gap_ms = state.stats.worst_consumer_gap_ms.max(away.unwrap_or_default());
+                        log::warn!("{key}: a sample was dropped with {} queued, {} since the send loop last took one — the decoder has to start over at the publisher's next keyframe", queue.items.len(), away.map_or("no sample yet".to_owned(), |away| format!("{away:.0} ms")));
+                    }
                 }
             }
         }
@@ -807,6 +822,7 @@ impl SubShared {
             }),
             _ => None,
         };
+        queue.last_taken = Some(now);
         state.stats.unqueue(&item);
         (Some((key, Some(item))), wake_at)
     }
