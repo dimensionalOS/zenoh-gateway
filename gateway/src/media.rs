@@ -1273,12 +1273,14 @@ struct Fed {
 /// Samples of one key waiting to be picked before the send loop spends a frame catching up: it decodes the picture (so
 /// the stream's reference chain stays whole) and does not encode it, which costs this one frame and saves the stream.
 ///
-/// Half of [`STREAM_DECODE_BACKLOG`](crate::subscription::STREAM_DECODE_BACKLOG), not "anything queued": at 30 Hz a
+/// Half of the key's [backlog](crate::subscription::stream_decode_backlog), not "anything queued": at 30 Hz a
 /// sample is almost always queued, and skipping the encode whenever one was sent **nothing at all** (2337 samples
 /// received, 0 frames encoded). Half leaves the loop encoding every frame at its rate and catching up only when it has
 /// fallen far enough behind that the queue is about to drop a sample — which for a stream decoder is a gap in the
 /// reference chain and the pictures until the publisher's next keyframe, about a second on a robot camera.
-const CATCH_UP_BACKLOG: usize = crate::subscription::STREAM_DECODE_BACKLOG / 2;
+fn catch_up_backlog() -> usize {
+    (crate::subscription::stream_decode_backlog() / 2).max(1)
+}
 
 /// Where a video send loop's wall clock goes, logged every `PROFILE_FRAMES` iterations.
 ///
@@ -1324,6 +1326,10 @@ impl Profile {
 
 /// Iterations between profile lines: ~5 s at 30 Hz, often enough to see a stall move and rare enough to read.
 const PROFILE_FRAMES: u64 = 150;
+/// ...or this long, whichever comes first. A loop slow enough to be worth profiling reaches the count slowly — at
+/// 5 Hz it would take half a minute to say anything, and a short run (a 14 s measurement on a robot) got **no line
+/// at all**, which is the one outcome a diagnostic may not have.
+const PROFILE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A picture this much before its due time is taken as due: frames arrive a little early or late, and holding one back
 /// for a millisecond costs a whole interval (libwebrtc's frame-rate controller allows the same half-interval slack).
@@ -1621,7 +1627,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         let depth = if stream_decoded { 0 } else { decode_ahead(decode_ms, encode_ms) };
         let finished = picking_while(finish_decode(task, shared.codecs.encode_timeout), &mut ahead, depth.saturating_sub(1), &shared, &codec).await;
         profile.decode += stage.elapsed();
-        if profile.iterations >= PROFILE_FRAMES {
+        if profile.iterations >= PROFILE_FRAMES || profile_since.elapsed() >= PROFILE_INTERVAL {
             profile.report(&key, profile_since.elapsed());
             profile_since = Instant::now();
         }
@@ -1685,7 +1691,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             let interval = shared.min_interval().unwrap_or_default();
             let now = Instant::now();
             let due = last_encode.is_none_or(|previous| now.duration_since(previous) + CATCH_UP_EARLY >= interval);
-            if !due || shared.backlog(&key) >= CATCH_UP_BACKLOG {
+            if !due || shared.backlog(&key) >= catch_up_backlog() {
                 catching_up += 1;
                 shared.record_catch_up();
                 continue;
