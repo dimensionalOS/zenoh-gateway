@@ -456,12 +456,25 @@ pub trait StreamDecoder: Send {
     /// sample completed no picture (parameter sets on their own). An `Err` is a stream the decoder could not follow;
     /// the gateway reports it and carries on, and the decoder is expected to have put itself back into
     /// [`resync`](Self::resync)'s state if what follows is now unusable.
-    fn decode(&mut self, sample: &EncodingSample<'_>) -> Result<Option<DecodedFrame>>;
+    ///
+    /// `frame_id` numbers the samples given to this decoder, so a decoder whose output trails its input can say which
+    /// sample the picture it returns belongs to ([`last_frame_id`](Self::last_frame_id)).
+    fn decode(&mut self, sample: &EncodingSample<'_>, frame_id: u64) -> Result<Option<DecodedFrame>>;
 
     /// Samples were lost before the next one: the queue dropped them while this subscription was behind, or it is
     /// starting. What comes next may refer to pictures this decoder never saw, so show nothing until the stream can be
     /// picked up again — at the next keyframe, for a video codec.
     fn resync(&mut self);
+
+    /// The `frame_id` of the picture [`decode`](Self::decode) last returned, for a decoder that holds frames (one that
+    /// pushes a sample in and takes an earlier sample's picture out, so a picture decodes while the gateway encodes the
+    /// one before it). The gateway sends that picture with its own sample's stamp, frame id and timing, not the stamp of
+    /// the sample that was just pushed in — which would read a frame interval short of the real latency.
+    ///
+    /// `None` (the default): the picture it returned is the sample it was just given.
+    fn last_frame_id(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A message encoding a subscription picks by name (subscribe option `encoding`).
