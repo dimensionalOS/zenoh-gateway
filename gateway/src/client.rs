@@ -29,7 +29,7 @@ mod api;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 pub use api::*;
 use base64::Engine;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use log::{debug, warn};
 use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
@@ -1370,7 +1370,95 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
 }
 
 fn video_format(mime: &str) -> Option<VideoFormat> {
-    [VideoFormat::H264, VideoFormat::Vp8, VideoFormat::Vp9, VideoFormat::Av1].into_iter().find(|format| format.mime_type() == mime)
+    [VideoFormat::H264, VideoFormat::Vp8, VideoFormat::Vp9, VideoFormat::Av1, VideoFormat::H265].into_iter().find(|format| format.mime_type() == mime)
+}
+
+/// Annex-B start code, which [`H265Depacketizer`] puts in front of every NAL unit it rebuilds.
+const ANNEX_B: [u8; 4] = [0, 0, 0, 1];
+/// RFC 7798 payload types that aren't a NAL unit of their own.
+const H265_AP: u8 = 48;
+const H265_FU: u8 = 49;
+
+/// Rebuilds H.265 Annex-B NAL units from RFC 7798 payloads: a single NAL unit packet as it is, an aggregation packet
+/// (48) split at its length prefixes, a fragmentation unit (49) merged across its packets. `rtc-rtp`'s own `H265Packet`
+/// parses a payload but hands back the payload itself, so it can't rebuild an access unit.
+///
+/// One of these per access unit ([`complete`]), fed that unit's packets in order; a fragmentation unit's first packet
+/// carries the NAL header to rebuild, the rest only payload. PACI packets (50) are refused: nothing that reaches this
+/// gateway sends them.
+#[derive(Default)]
+struct H265Depacketizer {
+    /// inside a fragmentation unit: its NAL header has been emitted, so later fragments are payload only
+    fragment: bool,
+}
+
+/// The NAL unit type of an RFC 7798 payload header or an Annex-B NAL header.
+fn h265_nal_type(first: u8) -> u8 {
+    (first >> 1) & 0x3f
+}
+
+impl Depacketizer for H265Depacketizer {
+    fn depacketize(&mut self, payload: &Bytes) -> rtc::shared::error::Result<Bytes> {
+        if payload.len() <= 2 {
+            return Err(rtc::shared::error::Error::ErrShortPacket);
+        }
+        let mut out = Vec::with_capacity(payload.len() + 8);
+        match h265_nal_type(payload[0]) {
+            H265_AP => {
+                let mut at = 2;
+                while at + 2 <= payload.len() {
+                    let len = u16::from_be_bytes([payload[at], payload[at + 1]]) as usize;
+                    let (start, end) = (at + 2, at + 2 + len);
+                    if len == 0 || end > payload.len() {
+                        return Err(rtc::shared::error::Error::ErrShortPacket);
+                    }
+                    out.extend_from_slice(&ANNEX_B);
+                    out.extend_from_slice(&payload[start..end]);
+                    at = end;
+                }
+            }
+            H265_FU => {
+                let (header, data) = (payload[2], &payload[3..]);
+                let (start, end) = (header & 0x80 != 0, header & 0x40 != 0);
+                if start {
+                    // the NAL header the fragments rebuild: the unit's own type, the payload header's layer id and tid
+                    out.extend_from_slice(&ANNEX_B);
+                    out.push((payload[0] & 0x81) | ((header & 0x3f) << 1));
+                    out.push(payload[1]);
+                    self.fragment = true;
+                } else if !self.fragment {
+                    // a fragmentation unit whose first packet never arrived: `complete` only calls this on a whole run
+                    // of packets, so this is a stream that isn't RFC 7798
+                    return Err(rtc::shared::error::Error::ErrShortPacket);
+                }
+                out.extend_from_slice(data);
+                if end {
+                    self.fragment = false;
+                }
+            }
+            // a PACI packet (50) or either reserved type: not a NAL unit, and nothing here sends one
+            kind if kind >= H265_AP => return Err(rtc::shared::error::Error::ErrShortPacket),
+            // single NAL unit packet: the payload is the NAL unit, header and all
+            _ => {
+                out.extend_from_slice(&ANNEX_B);
+                out.extend_from_slice(payload);
+            }
+        }
+        Ok(Bytes::from(out))
+    }
+
+    /// The first packet of an access unit: anything but a fragmentation unit that isn't its own first fragment.
+    fn is_partition_head(&self, payload: &Bytes) -> bool {
+        match payload.first().map(|&first| h265_nal_type(first)) {
+            Some(H265_FU) => payload.get(2).is_some_and(|header| header & 0x80 != 0),
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    fn is_partition_tail(&self, marker: bool, _payload: &Bytes) -> bool {
+        marker
+    }
 }
 
 /// Rebuilds access units from RTP (reordered and retransmitted packets included). After a lost
@@ -1424,6 +1512,7 @@ fn complete(packets: &mut Vec<Packet>, format: VideoFormat) -> Option<Vec<u8>> {
         VideoFormat::Vp8 => Box::new(Vp8Packet::default()),
         VideoFormat::Vp9 => Box::new(Vp9Packet::default()),
         VideoFormat::Av1 => Box::new(Av1Depacketizer::default()),
+        VideoFormat::H265 => Box::new(H265Depacketizer::default()),
     };
     if !depacketizer.is_partition_head(&packets[0].payload) {
         return None;
@@ -1435,10 +1524,12 @@ fn complete(packets: &mut Vec<Packet>, format: VideoFormat) -> Option<Vec<u8>> {
     Some(data)
 }
 
-/// Decodable on its own: an H.264 IDR slice, a VP8/VP9 key frame, an AV1 sequence header.
+/// Decodable on its own: an H.264 IDR slice, an H.265 IRAP picture, a VP8/VP9 key frame, an AV1 sequence header.
 fn is_keyframe(format: VideoFormat, data: &[u8]) -> bool {
     match format {
         VideoFormat::H264 => data.windows(4).any(|window| window[..3] == [0, 0, 1] && window[3] & 0x1f == 5),
+        // an IRAP picture: BLA (16-18), IDR (19, 20) or CRA (21)
+        VideoFormat::H265 => data.windows(4).any(|window| window[..3] == [0, 0, 1] && (16..=21).contains(&h265_nal_type(window[3]))),
         VideoFormat::Vp8 => data.first().is_some_and(|byte| byte & 1 == 0),
         // frame marker 0b10, profile 0-2, not show_existing_frame, frame_type 0
         VideoFormat::Vp9 => data.first().is_some_and(|byte| byte >> 6 == 2 && byte & 0x30 != 0x30 && byte & 0x0c == 0),

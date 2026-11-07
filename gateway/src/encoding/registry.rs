@@ -121,7 +121,10 @@ pub type VideoEncoderFactory = Arc<dyn Fn() -> Box<dyn VideoEncoder> + Send + Sy
 /// Name → encoding, the video encoders by format, plus the decode/encode caches and the video encode sessions.
 pub struct EncodingRegistry {
     codecs: BTreeMap<String, Arc<dyn MessageEncoding>>,
-    decoded: WorkCache<(String, EncodingOutput, u64), DecodedFrame>,
+    /// keyed on the whole `Channel`, not just its kind: an encoding is handed the channel and may decode a sample
+    /// differently for each (a picture for `video-h264`, the access unit itself for `video-h265`), so two frontends on
+    /// different video channels must not share one entry
+    decoded: WorkCache<(String, Channel, u64), DecodedFrame>,
     encoded: WorkCache<(String, u16, String, u64, Compress), Encoded>,
     video_encoders: HashMap<VideoFormat, VideoEncoderFactory>,
     /// the server's default; subscriptions override parts of it
@@ -218,7 +221,7 @@ impl EncodingRegistry {
     }
 
     pub fn decode_shared(&self, codec: &dyn MessageEncoding, sample: &EncodingSample<'_>, hash: u64, channel: Channel) -> (Result<Arc<DecodedFrame>, String>, bool) {
-        self.decoded.get_or_compute((codec.name().to_owned(), channel.kind(), hash), self.encode_timeout, || {
+        self.decoded.get_or_compute((codec.name().to_owned(), channel, hash), self.encode_timeout, || {
             // a picture goes with its sample's header even when the decode left it out
             match codec.decode(sample, channel).map_err(|error| format!("{error:#}"))? {
                 DecodedFrame::Video(image) if image.message_header().is_none() => Ok(DecodedFrame::Video(match codec.header(sample) {

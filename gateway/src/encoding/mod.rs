@@ -62,7 +62,7 @@ impl EncodingOutput {
 /// What a subscription's frames travel on (subscribe option `channel`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Channel {
-    /// A WebRTC video track of this format (`video-h264`, `video-vp8`, `video-vp9`, `video-av1`).
+    /// A WebRTC video track of this format (`video-h264`, `video-vp8`, `video-vp9`, `video-av1`, `video-h265`).
     Video(VideoFormat),
     /// A WebRTC Opus audio track (`audio-opus`).
     Audio,
@@ -72,7 +72,7 @@ pub enum Channel {
 
 impl Channel {
     /// Every channel name, as subscriptions spell them.
-    pub const NAMES: [&str; 6] = ["video-h264", "video-vp8", "video-vp9", "video-av1", "audio-opus", "data"];
+    pub const NAMES: [&str; 7] = ["video-h264", "video-vp8", "video-vp9", "video-av1", "video-h265", "audio-opus", "data"];
 
     /// The channel called `name`, e.g. `"video-h264"`.
     pub fn parse(name: &str) -> Result<Self, String> {
@@ -81,6 +81,7 @@ impl Channel {
             "video-vp8" => Channel::Video(VideoFormat::Vp8),
             "video-vp9" => Channel::Video(VideoFormat::Vp9),
             "video-av1" => Channel::Video(VideoFormat::Av1),
+            "video-h265" => Channel::Video(VideoFormat::H265),
             "audio-opus" => Channel::Audio,
             "data" => Channel::Data,
             other => return Err(format!("unknown channel {other:?} (one of {})", Self::NAMES.join(", "))),
@@ -94,6 +95,7 @@ impl Channel {
             Channel::Video(VideoFormat::Vp8) => "video-vp8",
             Channel::Video(VideoFormat::Vp9) => "video-vp9",
             Channel::Video(VideoFormat::Av1) => "video-av1",
+            Channel::Video(VideoFormat::H265) => "video-h265",
             Channel::Audio => "audio-opus",
             Channel::Data => "data",
         }

@@ -89,7 +89,7 @@ or bad value rejects the subscription or publisher; `ready()` rejects with the r
 | `minQuality` | 0 | the lowest quality the allocator may pick |
 | `qualityToHzTradeoff` | 0.5 (video: 1) | 0 = keep quality, drop rate; 1 = keep rate, drop quality (video: fewer bits per frame at the same size) |
 | `encoding` | none (raw bytes) | a name from `z.encodings` |
-| `channel` | from the encoding | `"video-h264"`, `"video-vp8"`, `"video-vp9"`, `"video-av1"`, `"audio-opus"` or `"data"` |
+| `channel` | from the encoding | `"video-h264"`, `"video-vp8"`, `"video-vp9"`, `"video-av1"`, `"video-h265"`, `"audio-opus"` or `"data"` |
 | `encodeOptions` | `{}` | for the encoding; `quality` (0–1, default 1) is the most the allocator picks |
 | `compress` | the encoding's | `"zstd"` or `"none"` (data channels); `msg.bytes` is always decompressed |
 | `maxBitrate` | ~0.3 bit/pixel | video: the most bits/s it asks for |
@@ -136,7 +136,7 @@ A subscription names an **encoding** (how to read its messages), a **channel** t
 (e.g. [zenoh-dimos-codecs](https://github.com/dimensionalOS/zenoh-dimos-codecs)). No encoding = raw bytes, and rate is
 the only thing that degrades.
 
-- **video** (`video-h264` default, `video-av1`, `video-vp8`, `video-vp9`): the gateway encodes pictures at the granted
+- **video** (`video-h264` default, `video-av1`, `video-vp8`, `video-vp9`, `video-h265`): the gateway encodes pictures at the granted
   bitrate and sends them on a video track (`sub.mediaStream`). Built in: H.264 (openh264) and AV1 (rav1e, default
   feature `av1`, ~3 frames more latency). Plug in others with `ServerBuilder::video_encoder` (e.g. VideoToolbox, or
   GStreamer on a Jetson); VP8 and VP9 need one. The page refuses a channel its browser can't play.

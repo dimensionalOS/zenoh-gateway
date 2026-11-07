@@ -443,10 +443,14 @@ impl SubShared {
         EncodeOptions { quality, options: self.encode_options.clone() }
     }
 
-    /// Reserved at its measured rate, never paced or shrunk: strict-priority and audio streams. (Reliable ones shrink
-    /// last, see `allocator`, their queue bounded by `reliable_max_backlog`.)
+    /// Reserved at its measured rate, never paced or shrunk: strict-priority and audio streams, and a passthrough video
+    /// channel ([`VideoFormat::passthrough_only`]), whose frames the gateway forwards as the source encoded them. Such a
+    /// stream cannot be thinned (a dropped predicted frame breaks the picture until the source's next keyframe, which
+    /// the gateway cannot ask for) nor shrunk (it does not encode the frames), so it takes the bits the source sends or
+    /// none, and the allocator reserves them rather than offering it a smaller grant it could not meet.
+    /// (Reliable ones shrink last, see `allocator`, their queue bounded by `reliable_max_backlog`.)
     pub fn reserved(&self) -> bool {
-        self.is_strict() || self.channel == Channel::Audio
+        self.is_strict() || self.channel == Channel::Audio || matches!(self.channel, Channel::Video(format) if format.passthrough_only())
     }
 
     pub fn video_source(&self) -> Option<(u32, u32)> {

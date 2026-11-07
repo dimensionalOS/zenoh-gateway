@@ -26,7 +26,7 @@ export type SubscriptionState = "connecting" | "open" | "rejected" | "closed"
 export type EncodingOutput = "video" | "audio" | "data" | "fields"
 
 /** What a subscription's messages travel on: a video track of one format, the Opus audio track, or the data channel. */
-export type Channel = "video-h264" | "video-vp8" | "video-vp9" | "video-av1" | "audio-opus" | "data"
+export type Channel = "video-h264" | "video-vp8" | "video-vp9" | "video-av1" | "video-h265" | "audio-opus" | "data"
 
 /** A message encoding the gateway has registered. */
 export interface EncodingInfo {
@@ -69,7 +69,32 @@ function channelOf(options: SubscribeOptions, encodings: readonly EncodingInfo[]
 }
 
 /** The RTP mime type a media channel carries. */
-const channelMimes: Record<Exclude<Channel, "data">, string> = { "video-h264": "video/H264", "video-vp8": "video/VP8", "video-vp9": "video/VP9", "video-av1": "video/AV1", "audio-opus": "audio/opus" }
+const channelMimes: Record<Exclude<Channel, "data">, string> = { "video-h264": "video/H264", "video-vp8": "video/VP8", "video-vp9": "video/VP9", "video-av1": "video/AV1", "video-h265": "video/H265", "audio-opus": "audio/opus" }
+
+/** Whether this browser has a decoder for `channel`, i.e. whether subscribing on it would play. `data` is always true.
+ *
+ * A gateway may offer the same camera on several channels — notably `video-h265`, which it passes through from the
+ * source without decoding it (no re-encode: lower latency and full frame rate), and `video-h264`, which it decodes and
+ * re-encodes so every browser can play it. Only the page knows which the browser in front of it can decode, and it has
+ * to know before it subscribes, so pick here rather than asking the gateway: `playableChannel(["video-h265",
+ * "video-h264"])` is `"video-h265"` in a Chrome or Safari with hardware HEVC and `"video-h264"` elsewhere (Firefox has
+ * no HEVC over WebRTC). Subscribing on a channel this says `false` for is rejected with an error rather than left to
+ * show nothing. */
+export function canPlayChannel(channel: Channel): boolean {
+    if (channel === "data") {
+        return true
+    }
+    const kind = channel === "audio-opus" ? "audio" : "video"
+    const mime = channelMimes[channel].toLowerCase()
+    const codecs = globalThis.RTCRtpReceiver?.getCapabilities?.(kind)?.codecs
+    // (no getCapabilities: assume playable, as the subscription's own guard does, and let the track speak)
+    return codecs === undefined ? true : codecs.some((codec) => codec.mimeType.toLowerCase() === mime)
+}
+
+/** The first of `channels` this browser can play ([`canPlayChannel`]), else the last one. Order them best-first. */
+export function playableChannel<T extends Channel>(channels: readonly [T, ...T[]]): T {
+    return channels.find(canPlayChannel) ?? channels[channels.length - 1]
+}
 
 /** Per-frame details of a video subscription; the pixels are on `mediaStream`. */
 export interface VideoFrameInfo {
@@ -949,8 +974,7 @@ export class Subscription extends Endpoint {
         this.#transceiver = null
         const kind = channelName === "audio-opus" ? "audio" : "video"
         const mime = channelMimes[channelName]
-        const playable = globalThis.RTCRtpReceiver?.getCapabilities?.(kind)?.codecs.some((codec) => codec.mimeType.toLowerCase() === mime.toLowerCase()) ?? true
-        if (!playable) {
+        if (!canPlayChannel(channelName)) {
             acceptance.reject(new Error(`zenoh-gateway: this browser can't play ${channelName} (no ${mime} decoder); pick another channel`))
             return
         }
