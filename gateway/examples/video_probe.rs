@@ -249,6 +249,9 @@ async fn subscription_stats(client: &Client, key: &str) -> String {
         // what the send loop was away doing when a sample had to be dropped: a dropped sample costs a stream-decoded
         // stream every picture until the publisher's next keyframe, so this is the number that explains a low rate
         format!("  the send loop was away up to {} ms when a sample was dropped", stat["worstConsumerGapMs"]),
+        // pictures decoded to keep the stream whole and not encoded: the frames a loop behind its publisher gives up
+        // instead of giving up the stream until the next keyframe
+        format!("  caught up (decoded, not encoded): {}", stat["catchUpSkips"]),
     ]
     .join("\n")
 }

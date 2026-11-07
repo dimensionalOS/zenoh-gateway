@@ -43,7 +43,7 @@ const STRICT_PRIORITY: u8 = 2;
 /// so with room for one sample the queue drops whatever arrives during an encode, and each drop costs the picture until
 /// the publisher's next keyframe. A few samples of room cover an encode; the loop then decodes its way back to the
 /// newest and encodes only that, so the backlog costs no latency.
-const STREAM_DECODE_BACKLOG: usize = 8;
+pub(crate) const STREAM_DECODE_BACKLOG: usize = 8;
 
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,6 +55,10 @@ pub struct SubStats {
     pub dropped_send_error: u64,
     /// video: times the send loop held off encoding because written frames still waited in the RTP pacer
     pub pacer_waits: u64,
+    /// video on a stateful encoding: pictures decoded to keep the stream's reference chain whole and then not encoded,
+    /// because the key's backlog was about to be dropped from. These are frames the viewer does not see — but a
+    /// *dropped sample* costs every picture until the publisher's next keyframe, which is far more of them
+    pub catch_up_skips: u64,
     /// video on a stateful encoding: the longest a stream-decoded key's consumer had been away when a sample of it had
     /// to be dropped (ms). A drop costs such a stream the pictures until the publisher's next keyframe, so this says
     /// what to go and look at
@@ -460,6 +464,12 @@ impl SubShared {
         match self.allocated_key_hz(queue.rate_hz, allocation).filter(|hz| !(lift && *hz > 0.0)) {
             Some(hz) if hz <= 0.0 => Spacing::Never,
             Some(hz) => Spacing::Every(crate::secs(1.0 / hz).max(self.tuning().min_interval.unwrap_or_default())),
+            // a stream decoder has to see **every** sample, so its key is not spaced at all: `maxHz` limits what is
+            // encoded and sent, not what the decoder is fed (the send loop encodes one picture an interval and decodes
+            // the rest to keep the stream whole). Spaced at `maxHz` with a publisher at the same rate, a backlog could
+            // never drain: a robot's queue sat full at 8 samples and dropped every arrival after it, and each drop is a
+            // gap in the reference chain and the pictures until the publisher's next keyframe — ~1 s per lost sample
+            None if self.stream_decoded.load(Ordering::Relaxed) => Spacing::Any,
             None => self.tuning().min_interval.map_or(Spacing::Any, Spacing::Every),
         }
     }
@@ -505,6 +515,19 @@ impl SubShared {
     /// The send loop built a `StreamDecoder` for this stream: it must now see every sample ([`Self::reserved`]).
     pub fn note_stream_decoded(&self) {
         self.stream_decoded.store(true, Ordering::Relaxed);
+    }
+
+    /// The spacing `maxHz` asks for, which for a stream-decoded subscription is applied to **encoding** a picture and
+    /// not to picking the sample ([`key_interval`](Self::key_interval)): the decoder has to see every sample.
+    pub fn min_interval(&self) -> Option<Duration> {
+        self.tuning().min_interval
+    }
+
+    /// Samples of `key` waiting to be picked. For a stream-decoded key this is what the queue is about to start
+    /// dropping from, and dropping one costs that stream every picture until the publisher's next keyframe — so the
+    /// send loop reads it to decide whether to spend this frame catching up instead of encoding.
+    pub fn backlog(&self, key: &str) -> usize {
+        self.state.lock().keys.get(key).map_or(0, |queue| queue.items.len())
     }
 
     pub fn video_source(&self) -> Option<(u32, u32)> {
@@ -628,6 +651,12 @@ impl SubShared {
 
     pub fn record_stream_resync(&self) {
         self.state.lock().stats.stream_resyncs += 1;
+    }
+
+    /// A picture decoded to keep a stream's reference chain whole and then not encoded, because its key's backlog was
+    /// about to be dropped from.
+    pub fn record_catch_up(&self) {
+        self.state.lock().stats.catch_up_skips += 1;
     }
 
     pub fn record_video_timing(&self, decode_ms: Option<f64>, encode_ms: Option<f64>, cpu_scale_cap: f64) {
