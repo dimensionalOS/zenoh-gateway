@@ -36,6 +36,14 @@ const VIDEO_PRICE_HEADROOM: f64 = 1.5;
 pub const DEFAULT_RELIABLE_MAX_BACKLOG: Duration = Duration::from_secs(2);
 /// Streams at this zenoh priority or more urgent (2 INTERACTIVE_HIGH, 1 REAL_TIME) bypass allocation and pacing.
 const STRICT_PRIORITY: u8 = 2;
+/// Samples a stream-decoded key may queue, whatever `delivery` says (`latest` keeps one).
+///
+/// Such a stream's decoder has to see every sample, and the loop that feeds it cannot read one while it is encoding the
+/// last picture — an encode is several times a decode (27 ms against 6 ms for 720p H.265 to H.264 on a loaded machine),
+/// so with room for one sample the queue drops whatever arrives during an encode, and each drop costs the picture until
+/// the publisher's next keyframe. A few samples of room cover an encode; the loop then decodes its way back to the
+/// newest and encodes only that, so the backlog costs no latency.
+const STREAM_DECODE_BACKLOG: usize = 8;
 
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +55,10 @@ pub struct SubStats {
     pub dropped_send_error: u64,
     /// video: times the send loop held off encoding because written frames still waited in the RTP pacer
     pub pacer_waits: u64,
+    /// video on a stateful encoding (`MessageEncoding::stream_decoder`): times the decoder had to start over at a
+    /// keyframe because samples were dropped from the queue before it read them. Each one costs the picture until the
+    /// publisher's next keyframe, so this is the number to watch when such a stream stutters
+    pub stream_resyncs: u64,
     pub queued: usize,
     pub queued_bytes: usize,
     /// bytes sent the page hasn't acked
@@ -104,6 +116,10 @@ pub struct VideoLatency {
 
 pub struct Pending {
     pub payload: ZBytes,
+    /// this key's samples, numbered from 1 as they arrive. A gap between what a consumer last took and this says
+    /// samples were dropped from the queue in between, which a `StreamDecoder` has to know: `seq` cannot say it,
+    /// because it numbers the subscription's samples across every key a wildcard matched.
+    pub key_seq: u64,
     pub encoding: Encoding,
     pub kind: SampleKind,
     pub attachment: Option<ZBytes>,
@@ -123,6 +139,9 @@ struct KeyQueue {
     next_due: Option<Instant>,
     /// arrivals since the allocator last looked, and the resulting source rate
     arrivals: u32,
+    /// samples ever pushed for this key, which `arrivals` cannot say since the allocator resets it. It numbers them for
+    /// `Pending::key_seq`, so a consumer can tell a sample it never saw from one it chose not to send
+    received: u64,
     rate_hz: f64,
     /// the latest sample's arrival: a key quiet for `stale_after` with nothing queued is forgotten (kept, every key a
     /// wildcard subscription ever matched stayed for its life)
@@ -245,6 +264,11 @@ pub struct SubShared {
     stream_id: usize,
     /// published priority of the latest sample (used when the subscription sets none)
     sample_priority: AtomicU8,
+    /// the send loop built a `StreamDecoder` for this stream, so it must see every sample (see [`SubShared::reserved`]).
+    /// Set where the decoder is built rather than asked of the encoding here, because `reserved` is consulted on every
+    /// sample and building a decoder is not cheap; the first samples may be thinned before it is set, which costs one
+    /// resync and settles
+    stream_decoded: AtomicBool,
     state: Mutex<SubState>,
     data_ready: Notify,
     closed: AtomicBool,
@@ -283,6 +307,7 @@ impl SubShared {
             gate,
             stream_id: NEXT_STREAM.fetch_add(1, Ordering::Relaxed),
             sample_priority: AtomicU8::new(0),
+            stream_decoded: AtomicBool::new(false),
             delivery: opts.delivery(),
             reliable_max_backlog,
             tuning: Mutex::new(Tuning::new(opts, codecs.video_policy, matches!(channel, Channel::Video(_)))),
@@ -443,14 +468,26 @@ impl SubShared {
         EncodeOptions { quality, options: self.encode_options.clone() }
     }
 
-    /// Reserved at its measured rate, never paced or shrunk: strict-priority and audio streams, and a passthrough video
-    /// channel ([`VideoFormat::passthrough_only`]), whose frames the gateway forwards as the source encoded them. Such a
-    /// stream cannot be thinned (a dropped predicted frame breaks the picture until the source's next keyframe, which
-    /// the gateway cannot ask for) nor shrunk (it does not encode the frames), so it takes the bits the source sends or
-    /// none, and the allocator reserves them rather than offering it a smaller grant it could not meet.
+    /// Reserved at its measured rate, never paced or shrunk: strict-priority and audio streams, and a video stream
+    /// whose frames depend on each other, which is either a passthrough channel
+    /// ([`VideoFormat::passthrough_only`], forwarded as the source encoded it) or one decoded by a
+    /// [`StreamDecoder`](crate::StreamDecoder).
+    ///
+    /// Neither can be thinned: a decoder cannot be fed a subset of a stream, and a dropped predicted frame costs the
+    /// picture until the source's next keyframe, which the gateway cannot ask for. A passthrough stream cannot be
+    /// shrunk either, since the gateway does not encode its frames. So such a stream takes what the source sends or
+    /// nothing, and the allocator reserves it rather than offering a smaller grant it could not meet.
     /// (Reliable ones shrink last, see `allocator`, their queue bounded by `reliable_max_backlog`.)
     pub fn reserved(&self) -> bool {
-        self.is_strict() || self.channel == Channel::Audio || matches!(self.channel, Channel::Video(format) if format.passthrough_only())
+        self.is_strict()
+            || self.channel == Channel::Audio
+            || matches!(self.channel, Channel::Video(format) if format.passthrough_only())
+            || self.stream_decoded.load(Ordering::Relaxed)
+    }
+
+    /// The send loop built a `StreamDecoder` for this stream: it must now see every sample ([`Self::reserved`]).
+    pub fn note_stream_decoded(&self) {
+        self.stream_decoded.store(true, Ordering::Relaxed);
     }
 
     pub fn video_source(&self) -> Option<(u32, u32)> {
@@ -572,6 +609,10 @@ impl SubShared {
         self.state.lock().stats.pacer_waits += 1;
     }
 
+    pub fn record_stream_resync(&self) {
+        self.state.lock().stats.stream_resyncs += 1;
+    }
+
     pub fn record_video_timing(&self, decode_ms: Option<f64>, encode_ms: Option<f64>, cpu_scale_cap: f64) {
         let mut state = self.state.lock();
         state.stats.decode_ms = decode_ms;
@@ -634,6 +675,8 @@ impl SubShared {
                 timestamp_ms,
                 received_ms,
                 seq,
+                // filled in below, where the key's own queue is
+                key_seq: 0,
                 arrived: Instant::now(),
                 priority: self.priority_override.unwrap_or(sample.priority() as u8),
                 payload: sample.payload().clone(),
@@ -644,6 +687,9 @@ impl SubShared {
                 Some(queue) => queue,
                 None => state.keys.entry(key.to_owned()).or_default(),
             };
+            queue.received += 1;
+            let mut pending = pending;
+            pending.key_seq = queue.received;
             queue.items.push_back(pending);
             queue.arrivals += 1;
             queue.last_arrival = Some(Instant::now());
@@ -658,6 +704,7 @@ impl SubShared {
             }
             state.payload_bytes = ewma(state.payload_bytes, payload_len as f64);
             if let Some(cap) = self.delivery.queue {
+                let cap = if self.stream_decoded.load(Ordering::Relaxed) { cap.max(STREAM_DECODE_BACKLOG) } else { cap };
                 while queue.items.len() > cap {
                     state.stats.unqueue(&queue.items.pop_front().unwrap());
                     state.stats.dropped_queue += 1;
@@ -671,6 +718,12 @@ impl SubShared {
     pub fn pick(&self, now: Instant) -> (Option<(String, Pending)>, Option<Instant>) {
         let (key, wake_at) = self.next(now, true);
         (key.and_then(|(key, item)| Some((key, item?))), wake_at)
+    }
+
+    /// Whether any key has a sample queued, ignoring pacing: a stream-decoded loop asks this to tell a picture that is
+    /// about to be superseded from the newest one, so it encodes only the latter.
+    pub fn has_queued(&self) -> bool {
+        self.state.lock().keys.values().any(|queue| !queue.items.is_empty())
     }
 
     /// Whether `pick` would return a message now, or when to look again.
@@ -1198,6 +1251,7 @@ mod tests {
             timestamp_ms: 0.0,
             received_ms: 0.0,
             seq,
+            key_seq: seq as u64 + 1,
             arrived,
             priority,
         }

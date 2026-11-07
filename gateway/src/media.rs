@@ -5,7 +5,7 @@
 
 use crate::encoding::registry::{self, EncodingRegistry};
 use crate::encoding::video::{EncodedVideo, VideoEncoder, VideoPolicy, target};
-use crate::encoding::{Channel, DecodedFrame, EncodingSample, MessageEncoding, MessageHeader, VideoFormat};
+use crate::encoding::{Channel, DecodedFrame, EncodingSample, MessageEncoding, MessageHeader, StreamDecoder, VideoFormat};
 use crate::subscription::{self, SubShared};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -903,9 +903,11 @@ pub(crate) struct FrameTimes {
 }
 
 /// A decoded frame and whether another frontend's decode was reused, or the decode error.
-/// (the frame, whether it was another frontend's, and its message header when the frame cannot carry one itself: a
-/// picture gets its header in `decode_shared`, while a frame an encoder renders or passes through has nowhere to put it)
-type DecodeOutcome = std::result::Result<(Arc<DecodedFrame>, bool, Option<MessageHeader>), String>;
+/// What one sample's decode gave: the frame (`None` from a [`StreamDecoder`] that is resyncing, or from a sample that
+/// completes no picture), whether it was another frontend's, its message header when the frame cannot carry one itself
+/// (a picture gets its header in `decode_shared`, while a frame an encoder renders or passes through has nowhere to put
+/// it), and the stream decoder back, since it was lent to the blocking task.
+type DecodeOutcome = std::result::Result<(Option<Arc<DecodedFrame>>, bool, Option<MessageHeader>, Option<Box<dyn StreamDecoder>>), String>;
 
 /// A picked frame and its decode, running on the blocking pool.
 pub struct Decoding {
@@ -917,9 +919,9 @@ pub struct Decoding {
 
 /// A decode's frame, whether it was another frontend's, the ms it took and the sample's identity; or why there is none.
 /// Given up after `timeout` (`ServerBuilder::encode_timeout`): a hung decoder keeps only its blocking thread.
-pub async fn finish_decode(task: tokio::task::JoinHandle<(DecodeOutcome, f64, u64)>, timeout: Duration) -> std::result::Result<(Arc<DecodedFrame>, bool, f64, u64, Option<MessageHeader>), String> {
+pub async fn finish_decode(task: tokio::task::JoinHandle<(DecodeOutcome, f64, u64)>, timeout: Duration) -> std::result::Result<(Option<Arc<DecodedFrame>>, bool, f64, u64, Option<MessageHeader>, Option<Box<dyn StreamDecoder>>), String> {
     match tokio::time::timeout(timeout, task).await {
-        Ok(Ok((Ok((decoded, reused, header)), ms, hash))) => Ok((decoded, reused, ms, hash, header)),
+        Ok(Ok((Ok((decoded, reused, header, decoder)), ms, hash))) => Ok((decoded, reused, ms, hash, header, decoder)),
         Ok(Ok((Err(error), _, _))) => Err(error),
         Ok(Err(error)) => Err(format!("decoder task failed: {error}")),
         Err(_) => Err(format!("decode took over {timeout:?}: skipped")),
@@ -927,21 +929,35 @@ pub async fn finish_decode(task: tokio::task::JoinHandle<(DecodeOutcome, f64, u6
 }
 
 /// Starts decoding a picked sample.
-pub fn start_decode(shared: &SubShared, codec: &Arc<dyn MessageEncoding>, key: String, item: subscription::Pending) -> Decoding {
+///
+/// With `decoder`, this stream's [`StreamDecoder`] decodes the sample instead of the encoding's
+/// [`decode`](MessageEncoding::decode): its frames depend on the frames before it, so it is lent to the blocking task
+/// and handed back in the outcome, nothing is shared with other frontends (their decoders are at other points in the
+/// stream), and the caller must feed it every sample of the key in arrival order.
+pub fn start_decode(shared: &SubShared, codec: &Arc<dyn MessageEncoding>, key: String, item: subscription::Pending, decoder: Option<Box<dyn StreamDecoder>>) -> Decoding {
     let payload = item.payload.to_bytes().into_owned();
     let (hash_key, encoding, codecs, codec, channel) = (key.clone(), item.encoding.clone(), shared.codecs.clone(), codec.clone(), shared.channel);
     let task = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         let sample = EncodingSample::new(&hash_key, &payload, &encoding);
         let hash = registry::sample_hash(&sample);
-        let (decoded, reused) = codecs.decode_shared(&*codec, &sample, hash, channel);
-        // read here, on the blocking pool, where the payload already is: a frame that is not a picture has nowhere to
-        // keep its header, so the step that sends it takes this one
-        let decoded = decoded.map(|decoded| {
-            let header = (!matches!(&*decoded, DecodedFrame::Video(_))).then(|| codec.header(&sample)).flatten();
-            (decoded, reused, header)
-        });
-        (decoded, started.elapsed().as_secs_f64() * 1000.0, hash)
+        // the header is read here, on the blocking pool, where the payload already is: a frame that is not a picture has
+        // nowhere to keep its header, so the step that sends it takes this one
+        let header = || codec.header(&sample);
+        let outcome = match decoder {
+            Some(mut decoder) => match decoder.decode(&sample) {
+                Ok(frame) => Ok((frame.map(Arc::new), false, header(), Some(decoder))),
+                Err(error) => Err(format!("{error:#}")),
+            },
+            None => {
+                let (decoded, reused) = codecs.decode_shared(&*codec, &sample, hash, channel);
+                decoded.map(|decoded| {
+                    let own_header = (!matches!(&*decoded, DecodedFrame::Video(_))).then(header).flatten();
+                    (Some(decoded), reused, own_header, None)
+                })
+            }
+        };
+        (outcome, started.elapsed().as_secs_f64() * 1000.0, hash)
     });
     Decoding { key, item, task }
 }
@@ -1467,7 +1483,7 @@ async fn picking_while<T>(work: impl Future<Output = T>, ahead: &mut VecDeque<De
         }
         let (picked, wake_at) = shared.pick(Instant::now());
         if let Some((key, item)) = picked {
-            ahead.push_back(start_decode(shared, codec, key, item));
+            ahead.push_back(start_decode(shared, codec, key, item, None));
             continue;
         }
         tokio::select! {
@@ -1489,6 +1505,15 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
     let mut last_write: Option<Instant> = None;
     let mut warned_write = false;
     let mut ahead: VecDeque<Decoding> = VecDeque::new();
+    // this subscription's stream decoders, one per key, with the key_seq of the last sample each was fed. The first is
+    // made here so that asking whether the encoding wants one costs no decoder: making a libde265 one starts threads.
+    let mut first_decoder = codec.stream_decoder(shared.channel);
+    let stream_decoded = first_decoder.is_some();
+    let mut stream_decoders: HashMap<String, (Box<dyn StreamDecoder>, u64)> = HashMap::new();
+    if stream_decoded {
+        // so the allocator stops thinning this stream: a decoder cannot be fed a subset of it
+        shared.note_stream_decoded();
+    }
     let (mut decode_ms, mut encode_ms): (Option<f64>, Option<f64>) = (None, None);
     // one frame at the granted rate: what may still wait in the RTP pacer when the next frame is encoded
     let mut frame_interval = Duration::ZERO;
@@ -1510,17 +1535,37 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                     shared.wait_for_data(wake_at).await;
                     continue;
                 };
-                start_decode(&shared, &codec, key, item)
+                // a stream decode takes this key's decoder with it, and tells it when samples were lost on the way
+                let decoder = stream_decoded.then(|| {
+                    let (mut decoder, fed) = stream_decoders.remove(&key).unwrap_or_else(|| (first_decoder.take().expect("the first key takes the decoder made at subscribe"), 0));
+                    // key_seq numbers this key's samples as they arrive, so a jump is samples the queue dropped before
+                    // this loop read them: what follows may refer to pictures the decoder never saw
+                    if fed != 0 && item.key_seq != fed + 1 {
+                        decoder.resync();
+                        shared.record_stream_resync();
+                    }
+                    decoder
+                });
+                start_decode(&shared, &codec, key, item, decoder)
             }
         };
         let Decoding { key, item, task } = decoding;
-        let depth = decode_ahead(decode_ms, encode_ms);
-        let finished = picking_while(finish_decode(task, shared.codecs.encode_timeout), &mut ahead, depth - 1, &shared, &codec).await;
+        // a stream decoder is fed one sample at a time, in order, so nothing may decode ahead of it: a read-ahead
+        // decode would both take the sample through the per-sample `decode` (which cannot decode a predicted frame) and
+        // take it off the queue, leaving the decoder a gap to resync over
+        let depth = if stream_decoded { 0 } else { decode_ahead(decode_ms, encode_ms) };
+        let finished = picking_while(finish_decode(task, shared.codecs.encode_timeout), &mut ahead, depth.saturating_sub(1), &shared, &codec).await;
         let (decoded, hash, decoded_header) = match finished {
-            Ok((decoded, reused, ms, hash, header)) => {
+            Ok((decoded, reused, ms, hash, header, decoder)) => {
                 if !reused {
                     decode_ms = Some(ewma(decode_ms, ms));
                 }
+                // the decoder comes back whatever it made of the sample, and has now been fed it
+                if let Some(decoder) = decoder {
+                    stream_decoders.insert(key.clone(), (decoder, item.key_seq));
+                }
+                // a decoder waiting for a keyframe, or a sample that completed no picture: nothing to encode or send
+                let Some(decoded) = decoded else { continue };
                 (decoded, hash, header)
             }
             Err(error) => {
@@ -1528,6 +1573,12 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                 continue;
             }
         };
+        // A stream decoder has to see every sample, but only the newest picture is worth encoding: decoding is several
+        // times cheaper than encoding, so when samples are already waiting the loop decodes its way up to the newest
+        // and encodes that. The frames skipped here were decoded, which is all the reference chain needs.
+        if stream_decoded && shared.has_queued() {
+            continue;
+        }
         let source = match &*decoded {
             DecodedFrame::Video(image) => (image.width(), image.height()),
             // (a frame the encoder renders itself: its size once it has encoded one, no floor before)

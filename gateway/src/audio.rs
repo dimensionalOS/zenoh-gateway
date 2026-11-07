@@ -71,10 +71,13 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         };
         // the per-sample frame carries the sample's header (its stamp) when asked
         let header = shared.sends_header().then(|| subscription::sample_header(&*codec, &key, &item)).flatten();
-        let decoding = start_decode(&shared, &codec, key, item);
+        // audio is decoded sample by sample: Opus frames do not depend on each other, so no stream decoder
+        let decoding = start_decode(&shared, &codec, key, item, None);
         let crate::media::Decoding { key, item, task } = decoding;
         let decoded = match crate::media::finish_decode(task, shared.codecs.encode_timeout).await {
-            Ok((decoded, ..)) => decoded,
+            Ok((Some(decoded), ..)) => decoded,
+            // only a stream decoder gives no frame, and audio has none
+            Ok((None, ..)) => continue,
             Err(error) => {
                 shared.record_encoding_error(&error);
                 continue;
