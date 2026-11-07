@@ -264,7 +264,7 @@ impl VideoFormat {
     /// comes from the source's own encoder and carries its reference chain.
     ///
     /// The gateway therefore neither thins the stream to the granted frame rate
-    /// ([`key_interval`](crate::subscription::SubShared)) nor scales its pictures ([`VideoPolicy`]): dropping or
+    /// (the subscription's `key_interval`) nor scales its pictures ([`VideoPolicy`]): dropping or
     /// resizing a frame it did not encode would break the picture until the source's next keyframe, which it cannot
     /// ask for. Such a stream takes the bits the source sends or none.
     pub fn passthrough_only(self) -> bool {

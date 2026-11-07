@@ -852,6 +852,8 @@ type DecodeOutcome = std::result::Result<(Option<Arc<DecodedFrame>>, bool, Optio
 pub struct Decoding {
     pub key: String,
     pub item: subscription::Pending,
+    /// the number this sample was given, to match the picture a [`StreamDecoder`] gives back to its own sample
+    pub frame_id: u64,
     /// (what came of the sample, milliseconds it took, its identity across frontends: key + payload hash)
     pub task: tokio::task::JoinHandle<(DecodeOutcome, f64, u64)>,
 }
@@ -872,8 +874,10 @@ pub async fn finish_decode(task: tokio::task::JoinHandle<(DecodeOutcome, f64, u6
 /// With `decoder`, this stream's [`StreamDecoder`] decodes the sample instead of the encoding's
 /// [`decode`](MessageEncoding::decode): its frames depend on the frames before it, so it is lent to the blocking task
 /// and handed back in the outcome, nothing is shared with other frontends (their decoders are at other points in the
-/// stream), and the caller must feed it every sample of the key in arrival order.
-pub fn start_decode(shared: &SubShared, codec: &Arc<dyn MessageEncoding>, key: String, item: subscription::Pending, decoder: Option<Box<dyn StreamDecoder>>) -> Decoding {
+/// stream), and the caller must feed it every sample of the key in arrival order. `frame_id` numbers those samples (it
+/// is ignored without a `decoder`): a decoder that holds frames returns an earlier sample's picture and says which with
+/// [`StreamDecoder::last_frame_id`], so the caller can send it with that sample's stamp and timing.
+pub fn start_decode(shared: &SubShared, codec: &Arc<dyn MessageEncoding>, key: String, item: subscription::Pending, decoder: Option<Box<dyn StreamDecoder>>, frame_id: u64) -> Decoding {
     let payload = item.payload.to_bytes().into_owned();
     let (hash_key, encoding, codecs, codec, channel) = (key.clone(), item.encoding.clone(), shared.codecs.clone(), codec.clone(), shared.channel);
     let task = tokio::task::spawn_blocking(move || {
@@ -884,7 +888,7 @@ pub fn start_decode(shared: &SubShared, codec: &Arc<dyn MessageEncoding>, key: S
         // nowhere to keep its header, so the step that sends it takes this one
         let header = || codec.header(&sample);
         let outcome = match decoder {
-            Some(mut decoder) => match decoder.decode(&sample) {
+            Some(mut decoder) => match decoder.decode(&sample, frame_id) {
                 Ok(frame) => Ok((frame.map(Arc::new), false, header(), Some(decoder))),
                 Err(error) => Err(format!("{error:#}")),
             },
@@ -898,7 +902,7 @@ pub fn start_decode(shared: &SubShared, codec: &Arc<dyn MessageEncoding>, key: S
         };
         (outcome, started.elapsed().as_secs_f64() * 1000.0, hash)
     });
-    Decoding { key, item, task }
+    Decoding { key, item, task, frame_id }
 }
 
 /// Resolution-scale steps the CPU governor moves by.
@@ -1244,6 +1248,34 @@ struct Input {
     sample: crate::frame::SampleMeta,
 }
 
+/// A sample given to a [`StreamDecoder`], kept until the picture it completes comes out.
+///
+/// A decoder that holds a frame returns an earlier sample's picture (so that picture decodes while the gateway encodes
+/// the one before it), and the picture has to be sent with **its own** sample's stamp, timing and metadata: sent with
+/// the newest sample's, the RTP timestamp is a frame interval ahead of the picture and the gateway's own latency reads
+/// a frame interval short — the measurement that says whether the stream is within its budget. The encoder side keeps
+/// the same thing, for the same reason, in [`SessionState::pending`].
+struct Fed {
+    frame_id: u64,
+    key: String,
+    timestamp_ms: f64,
+    received_ms: f64,
+    seq: u32,
+    /// its identity across frontends (key + payload hash), which tells the encode session whether another viewer's
+    /// loop already encoded this sample
+    hash: u64,
+    /// the sample's message header, for a frame that cannot carry one itself (a picture keeps its own)
+    header: Option<MessageHeader>,
+    /// the sample's zenoh encoding and attachment, when they say something
+    sample: crate::frame::SampleMeta,
+}
+
+/// Samples waiting for their picture before the oldest is given up unstamped: a decoder that holds frames holds one or
+/// two, so this is only ever reached by one that holds pictures back indefinitely (one waiting for a keyframe, whose
+/// samples complete no picture at all and never will) — and there it keeps a stream that is showing nothing from
+/// growing a queue of samples per second.
+const FED_MAX: usize = 64;
+
 /// What one step gave a member: frames to send, and how the encode went (if it ran one).
 #[derive(Default)]
 struct Step {
@@ -1416,7 +1448,7 @@ async fn picking_while<T>(work: impl Future<Output = T>, ahead: &mut VecDeque<De
         }
         let (picked, wake_at) = shared.pick(Instant::now());
         if let Some((key, item)) = picked {
-            ahead.push_back(start_decode(shared, codec, key, item, None));
+            ahead.push_back(start_decode(shared, codec, key, item, None, 0));
             continue;
         }
         tokio::select! {
@@ -1430,6 +1462,11 @@ async fn picking_while<T>(work: impl Future<Output = T>, ahead: &mut VecDeque<De
 /// of its grant (shared by viewers at that grant, off the runtime), write to the track. Later samples decode while this
 /// one decodes and encodes ([`decode_ahead`]), in order, so the slower stage's throughput sets the rate, not the two
 /// in series (a 1920x1536 jpeg on a Jetson Orin core, ~16 ms + ~20 ms, could not keep up with 30 Hz) nor one decode.
+///
+/// A [`StreamDecoder`] cannot be read ahead of (it must be fed every sample in order, one at a time), so there the
+/// overlap comes from the decoder itself holding a frame: it takes a sample and gives back an earlier sample's picture,
+/// which decoded while this loop encoded the one before it. Each picture is therefore sent with the stamp, timing and
+/// seq of its **own** sample — the [`Fed`] queue — and not of the sample that was pushed in to get it out.
 pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: TrackClaim) {
     let Some(codec) = shared.codec.clone() else { return };
     let sessions = &shared.codecs.video_sessions;
@@ -1443,6 +1480,12 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
     let mut first_decoder = codec.stream_decoder(shared.channel);
     let stream_decoded = first_decoder.is_some();
     let mut stream_decoders: HashMap<String, (Box<dyn StreamDecoder>, u64)> = HashMap::new();
+    // per key, the samples given to its decoder whose picture has not come out yet, oldest first, and the number the
+    // next sample gets: a decoder that holds a frame gives back an earlier sample's picture, which is sent with that
+    // sample's stamp. Per key because each key has its own decoder, each at its own point in its own stream: one queue
+    // for all of them would drop a key's waiting sample as soon as another key's decoder ran ahead of its number
+    let mut fed: HashMap<String, VecDeque<Fed>> = HashMap::new();
+    let mut next_fed_id: u64 = 0;
     if stream_decoded {
         // so the allocator stops thinning this stream: a decoder cannot be fed a subset of it
         shared.note_stream_decoded();
@@ -1470,42 +1513,83 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                 };
                 // a stream decode takes this key's decoder with it, and tells it when samples were lost on the way
                 let decoder = stream_decoded.then(|| {
-                    let (mut decoder, fed) = stream_decoders.remove(&key).unwrap_or_else(|| (first_decoder.take().expect("the first key takes the decoder made at subscribe"), 0));
+                    // the first key takes the decoder made at subscribe; another key, or one whose decoder a failed
+                    // decode kept (it is handed back with every outcome but an error), asks the encoding for a new one,
+                    // which starts over at the next keyframe exactly as a resync does
+                    let fresh = || {
+                        let made = first_decoder.take().or_else(|| codec.stream_decoder(shared.channel));
+                        if made.is_none() {
+                            // (an encoding that gave one at subscribe and none now: without one, this stream falls back
+                            // to decoding each sample on its own, which for a stream of predicted frames shows almost none)
+                            log::warn!("{key}: {} gave no stream decoder for a stream it decodes statefully", codec.name());
+                        }
+                        (made, 0)
+                    };
+                    let (decoder, last_fed) = stream_decoders.remove(&key).map_or_else(fresh, |(decoder, last_fed)| (Some(decoder), last_fed));
+                    let mut decoder = decoder?;
                     // key_seq numbers this key's samples as they arrive, so a jump is samples the queue dropped before
                     // this loop read them: what follows may refer to pictures the decoder never saw
-                    if fed != 0 && item.key_seq != fed + 1 {
+                    if last_fed != 0 && item.key_seq != last_fed + 1 {
                         decoder.resync();
                         shared.record_stream_resync();
                     }
-                    decoder
-                });
-                start_decode(&shared, &codec, key, item, decoder)
+                    Some(decoder)
+                }).flatten();
+                next_fed_id += 1;
+                start_decode(&shared, &codec, key, item, decoder, next_fed_id - 1)
             }
         };
-        let Decoding { key, item, task } = decoding;
+        let Decoding { key, item, task, frame_id } = decoding;
         // a stream decoder is fed one sample at a time, in order, so nothing may decode ahead of it: a read-ahead
         // decode would both take the sample through the per-sample `decode` (which cannot decode a predicted frame) and
         // take it off the queue, leaving the decoder a gap to resync over
         let depth = if stream_decoded { 0 } else { decode_ahead(decode_ms, encode_ms) };
         let finished = picking_while(finish_decode(task, shared.codecs.encode_timeout), &mut ahead, depth.saturating_sub(1), &shared, &codec).await;
-        let (decoded, hash, decoded_header) = match finished {
+        let (decoded, taken) = match finished {
             Ok((decoded, reused, ms, hash, header, decoder)) => {
                 if !reused {
                     decode_ms = Some(ewma(decode_ms, ms));
                 }
-                // the decoder comes back whatever it made of the sample, and has now been fed it
-                if let Some(decoder) = decoder {
-                    stream_decoders.insert(key.clone(), (decoder, item.key_seq));
+                let this = Fed { frame_id, key, timestamp_ms: item.timestamp_ms, received_ms: item.received_ms, seq: item.seq, hash, header, sample: subscription::sample_meta(&item) };
+                match decoder {
+                    // the decoder comes back whatever it made of the sample, and has now been fed it
+                    Some(decoder) => {
+                        // which sample this picture is, asked before the decoder is put away (`None`: the one just fed)
+                        let picture_id = decoder.last_frame_id().unwrap_or(frame_id);
+                        stream_decoders.insert(this.key.clone(), (decoder, item.key_seq));
+                        let waiting = fed.entry(this.key.clone()).or_default();
+                        waiting.push_back(this);
+                        while waiting.len() > FED_MAX {
+                            waiting.pop_front();
+                        }
+                        // a decoder waiting for a keyframe, or a sample that completed no picture: nothing to send
+                        let Some(decoded) = decoded else { continue };
+                        // this key's samples before this picture's completed no picture of their own
+                        while waiting.front().is_some_and(|sample| sample.frame_id < picture_id) {
+                            waiting.pop_front();
+                        }
+                        if waiting.front().is_none_or(|sample| sample.frame_id != picture_id) {
+                            // a picture for a sample this loop no longer has: a decoder that gave one frame id twice,
+                            // or held pictures back past `FED_MAX`. Nothing can say when it was taken, and a picture
+                            // sent with another sample's stamp is worse than one not sent
+                            shared.record_encoding_error(&format!("stream decoder gave frame {picture_id}, which is not one of this key's samples waiting for a picture"));
+                            continue;
+                        }
+                        (decoded, waiting.pop_front().expect("the front was just looked at"))
+                    }
+                    None => {
+                        // a decoder waiting for a keyframe, or a sample that completed no picture: nothing to send
+                        let Some(decoded) = decoded else { continue };
+                        (decoded, this)
+                    }
                 }
-                // a decoder waiting for a keyframe, or a sample that completed no picture: nothing to encode or send
-                let Some(decoded) = decoded else { continue };
-                (decoded, hash, header)
             }
             Err(error) => {
                 shared.record_encoding_error(&error);
                 continue;
             }
         };
+        let Fed { key, timestamp_ms, received_ms, seq, hash, header: decoded_header, sample: sample_meta, .. } = taken;
         let source = match &*decoded {
             DecodedFrame::Video(image) => (image.width(), image.height()),
             // (a frame the encoder renders itself: its size once it has encoded one, no floor before)
@@ -1520,7 +1604,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             (member.next_seq, member.synced) = (None, false);
         }
         member.session = Some(session.clone());
-        let input = Input { decoded, header: decoded_header, timestamp_ms: item.timestamp_ms, received_ms: item.received_ms, hash, quality, keyframe_requested: track.keyframe_requested.swap(false, Ordering::AcqRel), sample: subscription::sample_meta(&item) };
+        let input = Input { decoded, header: decoded_header, timestamp_ms, received_ms, hash, quality, keyframe_requested: track.keyframe_requested.swap(false, Ordering::AcqRel), sample: sample_meta };
         let stepping = step(session, &mut member, input, shared.codecs.clone(), codec.clone());
         let outcome = picking_while(stepping, &mut ahead, depth, &shared, &codec).await;
         encode_ms = outcome.encode_ms.or(encode_ms);
@@ -1553,7 +1637,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             let meta = metadata(frame, logged.source, quality, &written, times, logged.header.as_ref().filter(|_| shared.sends_header()).map(|header| (header, &logged.sample)));
             let shared_encode = logged.encoded_by != member.id;
             shared.record_video_frame(frame.data.len(), (frame.width, frame.height), quality, frame.keyframe, shared_encode, track.keyframe_requests.load(Ordering::Relaxed));
-            if subscription::send_small_frame(&dc, &key, logged.timestamp_ms, item.seq, next_frame_id, 0, &meta).await.is_err() && shared.is_closed() {
+            if subscription::send_small_frame(&dc, &key, logged.timestamp_ms, seq, next_frame_id, 0, &meta).await.is_err() && shared.is_closed() {
                 break;
             }
             next_frame_id = next_frame_id.wrapping_add(1);

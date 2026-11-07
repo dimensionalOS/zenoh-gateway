@@ -6,12 +6,13 @@ mod relay_sketch;
 use anyhow::Result;
 use openh264::formats::YUVSource;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 use tokio::time::timeout;
 use zenoh_gateway::client::{Client, ClientOptions, Delivery, Message, LeaseOptions, PublisherOptions, SubscribeOptions, VideoFrame};
-use zenoh_gateway::{Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, Fields, MessageHeader, RunningServer, Server, VideoImage, zenoh};
+use zenoh_gateway::{Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, Fields, MessageHeader, RunningServer, Server, StreamDecoder, VideoImage, zenoh};
 
 /// `[r, g, b, width u16, height u16]` → a solid picture.
 struct SolidColor;
@@ -864,5 +865,187 @@ async fn tls_serves_https_with_the_given_certificate() {
     assert!(offer.status().is_client_error(), "POST /offer over HTTPS: {}", offer.status());
     // plain HTTP on the same port gets no answer
     assert!(reqwest::get(format!("http://127.0.0.1:{port}{}", zenoh_gateway::HEALTH_PATH)).await.is_err());
+    running.shutdown().await.unwrap();
+}
+
+/// A video encoding whose decoder holds a picture back, as a pipelined one does: `decode` is given a sample and hands
+/// back the **previous** sample's picture, saying which with `last_frame_id`. One picture decodes while the gateway
+/// encodes the one before it, which is what lets a stream whose decode and encode each take most of a frame interval
+/// still run at its rate — and it means every picture the gateway sends belongs to a sample it read a frame ago.
+struct Held;
+
+/// Shade per sample number, so a decoded picture says which sample it came from.
+const HELD_SHADE: u8 = 20;
+
+/// `[number, published unix ms as f64]` → the sample's number and when it was published.
+fn held_sample(number: u8) -> Vec<u8> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64() * 1000.0;
+    [&[number][..], &now.to_le_bytes()].concat()
+}
+
+impl MessageEncoding for Held {
+    fn name(&self) -> &str {
+        "test-held"
+    }
+
+    fn output(&self) -> EncodingOutput {
+        EncodingOutput::Video
+    }
+
+    fn stream_decoder(&self, channel: Channel) -> Option<Box<dyn StreamDecoder>> {
+        matches!(channel, Channel::Video(_)).then(|| Box::new(HoldOne::default()) as Box<dyn StreamDecoder>)
+    }
+
+    /// Never reached: this encoding's frames come from its [`StreamDecoder`]. It fails loudly rather than quietly
+    /// decoding a sample on its own, which is how a stream that should be stateful ends up delivering one frame in
+    /// thirty.
+    fn decode(&self, _sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
+        anyhow::bail!("test-held decodes as a stream, not a sample at a time")
+    }
+}
+
+#[derive(Default)]
+struct HoldOne {
+    /// (the number of the sample it came from, its picture)
+    held: Option<(u64, DecodedFrame)>,
+    last_frame_id: Option<u64>,
+}
+
+impl StreamDecoder for HoldOne {
+    fn decode(&mut self, sample: &EncodingSample<'_>, frame_id: u64) -> Result<Option<DecodedFrame>> {
+        let number = sample.payload[0];
+        let published_ms = f64::from_le_bytes(sample.payload[1..9].try_into().unwrap());
+        // the picture is painted with its sample's number and stamped with when that sample was published, so what
+        // arrives can be matched to the sample it came from without trusting the gateway to say
+        let picture = VideoImage::rgb8(160, 120, [number * HELD_SHADE, 40, 90].repeat(160 * 120))?.with_header(published_ms / 1000.0, &format!("sample_{number}"));
+        let out = self.held.replace((frame_id, DecodedFrame::Video(picture)));
+        self.last_frame_id = out.as_ref().map(|(id, _)| *id);
+        Ok(out.map(|(_, frame)| frame))
+    }
+
+    fn last_frame_id(&self) -> Option<u64> {
+        self.last_frame_id
+    }
+
+    fn resync(&mut self) {
+        self.held = None;
+    }
+}
+
+/// A picture a decoder held back is sent with the stamp, timing and seq of **its own** sample, not of the sample that
+/// was pushed in to get it out.
+///
+/// Both come to the frontend: the picture's own `stamp` (the decoder put it there) and the gateway's `receivedMs` and
+/// `seq` for the sample it paired the picture with. Paired with the newest sample instead, every frame of the stream
+/// claims to have been received one publish interval after it was published — the gateway's own latency, which is the
+/// number that says whether a stream is within its budget, reading a frame interval short.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_picture_is_sent_with_its_own_sample_s_timing() {
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let running = Server::builder().session(session.clone()).encoding(Held).build().await.unwrap().bind("127.0.0.1:0").await.unwrap();
+    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions::default()).await.unwrap();
+    let options = SubscribeOptions { encoding: Some("test-held".into()), min_quality: Some(1.0), max_hz: Some(30.0), ..Default::default() };
+    let mut camera = client.subscribe("camera/front", options).await.unwrap();
+    /// between samples: long enough that a picture sent with the next sample's timing is unmistakable
+    const INTERVAL: Duration = Duration::from_millis(50);
+    let putter = tokio::spawn({
+        let session = session.clone();
+        async move {
+            for number in 1u8.. {
+                session.put("camera/front", held_sample(number % 12)).await.unwrap();
+                tokio::time::sleep(INTERVAL).await;
+            }
+        }
+    });
+    let (mut frames, mut infos) = (Vec::new(), Vec::new());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while frames.len() < 8 && std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(5), camera.recv()).await.expect("a message").expect("subscription open") {
+            Message::Video(frame) => frames.push(frame),
+            Message::VideoInfo(info) => infos.push(info),
+            _ => {}
+        }
+    }
+    putter.abort();
+    assert!(frames.len() >= 8, "{} frames: a decoder that holds one is not sending at the rate", frames.len());
+    // the pictures, in order, from one decoder: they are predicted frames off each other
+    let mut decoder = openh264::decoder::Decoder::new().unwrap();
+    let mut checked = 0;
+    let mut gaps = Vec::new();
+    for frame in &frames {
+        let Some(picture) = decoder.decode(&frame.data).unwrap() else { continue };
+        let (width, height) = picture.dimensions();
+        let mut rgb = vec![0u8; width * height * 3];
+        picture.write_rgb8(&mut rgb);
+        let red = rgb.as_chunks::<3>().0.iter().map(|pixel| pixel[0] as f64).sum::<f64>() / (width * height) as f64;
+        let number = (red / HELD_SHADE as f64).round() as u8;
+        assert!((red - (number * HELD_SHADE) as f64).abs() < 8.0, "a sample's number has to be readable back off the picture: red {red}");
+        let Some(info) = infos.iter().find(|info| info.rtp_timestamp == Some(frame.rtp_timestamp)) else { continue };
+        let (Some(stamp), Some(received_ms)) = (info.stamp, info.received_ms) else { panic!("the picture's stamp and the sample's arrival") };
+        assert_eq!(info.frame_id.as_deref(), Some(format!("sample_{number}").as_str()), "the frame's metadata describes the picture that arrived");
+        // the gateway got this picture's sample a moment before it was published; the sample it pushed in to get the
+        // picture out was published a whole interval later
+        gaps.push((received_ms - stamp * 1000.0, number, info.seq));
+        checked += 1;
+    }
+    assert!(checked >= 4, "only {checked} of {} frames could be matched to their metadata", frames.len());
+    let worst = gaps.iter().copied().fold((0.0f64, 0, 0), |worst, gap| if gap.0 > worst.0 { gap } else { worst });
+    assert!(worst.0 < INTERVAL.as_secs_f64() * 1000.0 * 0.5, "sample {} (seq {}) was published {:.0} ms before the gateway says it arrived, which is the next sample's arrival: {gaps:?}", worst.1, worst.2, worst.0);
+    // and each picture's own sample is a later one than the last picture's: the stream is in order, one picture a sample
+    let numbers: Vec<u8> = gaps.iter().map(|gap| gap.1).collect();
+    assert!(numbers.windows(2).all(|pair| pair[1] == (pair[0] + 1) % 12), "one picture per sample, in order: {numbers:?}");
+    running.shutdown().await.unwrap();
+}
+
+/// Two cameras under one wildcard subscription, each with its own decoder holding its own picture: a picture still
+/// goes out with its own sample's timing, and neither camera's waiting sample is thrown away because the other's
+/// decoder ran ahead of its number (one queue of fed samples for both keys did exactly that, and the pictures whose
+/// sample had been dropped were counted as encoding errors instead of being sent).
+#[tokio::test(flavor = "multi_thread")]
+async fn two_cameras_under_one_subscription_each_keep_their_own_timing() {
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let running = Server::builder().session(session.clone()).encoding(Held).build().await.unwrap().bind("127.0.0.1:0").await.unwrap();
+    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions::default()).await.unwrap();
+    let options = SubscribeOptions { encoding: Some("test-held".into()), min_quality: Some(1.0), max_hz: Some(60.0), ..Default::default() };
+    let mut cameras = client.subscribe("camera/*/image", options).await.unwrap();
+    // different rates, so each key's decoder is at its own point in its own stream — and both well inside what this
+    // loop gets through, since a stream-decoded subscription is never thinned: fed more than it can send, the queues
+    // back up and the picker favours one key, which would starve the other for reasons this test is not about
+    let putters: Vec<_> = [("camera/front/image", 100u64), ("camera/rear/image", 150)]
+        .into_iter()
+        .map(|(key, interval)| {
+            let session = session.clone();
+            tokio::spawn(async move {
+                for number in 1u8.. {
+                    session.put(key, held_sample(number % 12)).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(interval)).await;
+                }
+            })
+        })
+        .collect();
+    let mut gaps: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let enough = |gaps: &BTreeMap<String, Vec<f64>>| gaps.len() == 2 && gaps.values().all(|measured| measured.len() >= 4);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !enough(&gaps) && std::time::Instant::now() < deadline {
+        if let Message::VideoInfo(info) = timeout(Duration::from_secs(5), cameras.recv()).await.expect("a message").expect("subscription open") {
+            let (Some(stamp), Some(received_ms)) = (info.stamp, info.received_ms) else { panic!("the picture's stamp and the sample's arrival") };
+            gaps.entry(info.key.clone()).or_default().push(received_ms - stamp * 1000.0);
+        }
+    }
+    for putter in putters {
+        putter.abort();
+    }
+    let counts: Vec<(&String, usize)> = gaps.iter().map(|(key, gaps)| (key, gaps.len())).collect();
+    // (not how the picks are split between the two: a subscription that is never thinned and is fed more than its loop
+    // sends favours one key, which is older than any of this and the same with a stateless encoding's read-ahead)
+    assert!(enough(&gaps), "both cameras keep sending: {counts:?}");
+    for (key, measured) in &gaps {
+        // its own sample's arrival, not the newest sample's of this key or of the other one
+        let worst = measured.iter().copied().fold(0.0f64, f64::max);
+        assert!(worst < 45.0, "{key}: a picture was sent with a stamp {worst:.0} ms before the arrival the gateway reported: {measured:?}");
+    }
+    let stats = client.stats().await.unwrap();
+    let errors: u64 = stats["channels"].as_array().unwrap().iter().map(|channel| channel["stats"]["encodingErrors"].as_u64().unwrap_or_default()).sum();
+    assert_eq!(errors, 0, "a picture whose sample had been dropped would be counted here: {}", stats["channels"][0]["stats"]);
     running.shutdown().await.unwrap();
 }
