@@ -437,6 +437,30 @@ impl DecodedFrame {
     }
 }
 
+/// Decodes a stream whose frames depend on the frames before them (inter-frame prediction), keeping the state that
+/// dependency needs.
+///
+/// [`MessageEncoding::decode`] sees one sample, may be called for several at once, and shares its result with every
+/// frontend watching the same key, so it cannot hold a decoder's state — which is why a codec that decodes each sample
+/// on its own can only ever show keyframes. An encoding that needs the state returns one of these from
+/// [`stream_decoder`](MessageEncoding::stream_decoder). The gateway then makes one **per subscription**, feeds it
+/// **every** sample of the stream **in arrival order** on the blocking pool, and shares its frames with nobody: two
+/// subscriptions are at different points in the stream, so one decoder could not serve both.
+pub trait StreamDecoder: Send {
+    /// Decodes one sample, which follows every sample given to this decoder before it.
+    ///
+    /// `Ok(None)` means there is nothing to show yet, which is normal: the decoder is waiting for a keyframe, or the
+    /// sample completed no picture (parameter sets on their own). An `Err` is a stream the decoder could not follow;
+    /// the gateway reports it and carries on, and the decoder is expected to have put itself back into
+    /// [`resync`](Self::resync)'s state if what follows is now unusable.
+    fn decode(&mut self, sample: &EncodingSample<'_>) -> Result<Option<DecodedFrame>>;
+
+    /// Samples were lost before the next one: the queue dropped them while this subscription was behind, or it is
+    /// starting. What comes next may refer to pictures this decoder never saw, so show nothing until the stream can be
+    /// picked up again — at the next keyframe, for a video codec.
+    fn resync(&mut self);
+}
+
 /// A message encoding a subscription picks by name (subscribe option `encoding`).
 ///
 /// Implementations must be cheap to call from several threads at once: the gateway calls
@@ -498,6 +522,19 @@ pub trait MessageEncoding: Send + Sync {
     /// one (H.264: openh264; AV1: rav1e, feature `av1`); those take [`DecodedFrame::Video`].
     fn video_encoder(&self, format: VideoFormat) -> Option<Box<dyn VideoEncoder>> {
         let _ = format;
+        None
+    }
+
+    /// A [`StreamDecoder`] for `channel`, when this encoding's frames depend on the frames before them and
+    /// [`decode`](Self::decode) therefore cannot show most of them (H.265 and H.264 with predicted frames: one keyframe
+    /// a second plays, the other twenty-nine are lost).
+    ///
+    /// Default `None`: every sample is decoded on its own, shared across frontends and decoded several at a time.
+    /// Returning `Some` costs that sharing and that concurrency for this subscription, and asks the gateway not to thin
+    /// the stream, since a decoder cannot be fed a subset — so return `None` for a channel that does not need it, such
+    /// as one the gateway passes through without decoding.
+    fn stream_decoder(&self, channel: Channel) -> Option<Box<dyn StreamDecoder>> {
+        let _ = channel;
         None
     }
 

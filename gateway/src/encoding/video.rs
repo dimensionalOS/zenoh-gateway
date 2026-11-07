@@ -227,7 +227,11 @@ pub(crate) fn to_i420(image: &VideoImage, width: u32, height: u32) -> Vec<u8> {
 }
 
 /// The video format a [`VideoEncoder`] produces; the gateway negotiates it and packetizes its frames.
+///
+/// `#[non_exhaustive]`: match it with a `_` arm. A new format is additive for everything downstream that way, which
+/// adding H.265 to a closed enum was not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum VideoFormat {
     /// H.264 constrained baseline, Annex B access units.
     H264,
