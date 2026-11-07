@@ -38,12 +38,30 @@ pub const DEFAULT_RELIABLE_MAX_BACKLOG: Duration = Duration::from_secs(2);
 const STRICT_PRIORITY: u8 = 2;
 /// Samples a stream-decoded key may queue, whatever `delivery` says (`latest` keeps one).
 ///
-/// Such a stream's decoder has to see every sample, and the loop that feeds it cannot read one while it is encoding the
-/// last picture — an encode is several times a decode (27 ms against 6 ms for 720p H.265 to H.264 on a loaded machine),
-/// so with room for one sample the queue drops whatever arrives during an encode, and each drop costs the picture until
-/// the publisher's next keyframe. A few samples of room cover an encode; the loop then decodes its way back to the
-/// newest and encodes only that, so the backlog costs no latency.
-pub(crate) const STREAM_DECODE_BACKLOG: usize = 8;
+/// Such a stream's decoder has to see every sample, so a sample dropped from this queue costs it every picture until
+/// the publisher's next keyframe — about a second on a robot camera. Room to ride out a stall is worth much more here
+/// than on a stream whose frames stand alone, which is why `latest`'s single slot is overridden.
+///
+/// **It is also this stream's latency floor.** The send loop decodes its way back to the newest sample and encodes
+/// only that (`media::catch_up_backlog`), so a queue that drains costs nothing — but where
+/// decoding one frame takes about as long as one frame interval (31.5 ms against 33.3 for 720p H.265 in software on an
+/// RK3588), there is no spare capacity to drain it with, a queue that fills stays full, and its depth is added to the
+/// age of every picture: eight frames is ~266 ms. Shallower drops a sample as soon as the loop is away that long.
+///
+/// `ZW_STREAM_DECODE_BACKLOG` sets it, so the trade can be measured on the machine that has to make it rather than
+/// guessed at here.
+pub(crate) fn stream_decode_backlog() -> usize {
+    static BACKLOG: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BACKLOG.get_or_init(|| backlog_from(std::env::var("ZW_STREAM_DECODE_BACKLOG").ok()))
+}
+
+/// Eight by default; one at the least, since `latest`'s own single slot is a dropped sample per stall and zero cannot
+/// be what anyone meant. Anything unparseable is the default rather than an error: a stream that fell back to
+/// keyframes because of a typo in a unit file would be a long afternoon.
+fn backlog_from(set: Option<String>) -> usize {
+    const DEFAULT: usize = 8;
+    set.and_then(|value| value.trim().parse::<usize>().ok()).map_or(DEFAULT, |backlog| backlog.max(1))
+}
 
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -751,7 +769,7 @@ impl SubShared {
             state.payload_bytes = ewma(state.payload_bytes, payload_len as f64);
             if let Some(cap) = self.delivery.queue {
                 let stream_decoded = self.stream_decoded.load(Ordering::Relaxed);
-                let cap = if stream_decoded { cap.max(STREAM_DECODE_BACKLOG) } else { cap };
+                let cap = if stream_decoded { cap.max(stream_decode_backlog()) } else { cap };
                 let away = queue.last_taken.map(|taken| Instant::now().duration_since(taken).as_secs_f64() * 1000.0);
                 while queue.items.len() > cap {
                     state.stats.unqueue(&queue.items.pop_front().unwrap());
@@ -1247,6 +1265,18 @@ pub async fn send_small_frame(dc: &Arc<dyn DataChannel>, key: &str, timestamp_ms
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The depth of a stream-decoded key's queue is that stream's latency floor where its decode leaves no spare
+    /// capacity to drain with, so it is set on the machine that has to make the trade — and a typo in a unit file
+    /// must not be the thing that decides it.
+    #[test]
+    fn the_stream_decode_backlog_can_be_set_but_never_to_nothing() {
+        assert_eq!(backlog_from(None), 8, "the default");
+        assert_eq!(backlog_from(Some(" 2 ".into())), 2, "set, whitespace and all");
+        assert_eq!(backlog_from(Some("0".into())), 1, "zero would queue nothing: a dropped sample per stall");
+        assert_eq!(backlog_from(Some("four".into())), 8, "unparseable falls back rather than breaking the stream");
+        assert_eq!(backlog_from(Some(String::new())), 8, "and so does empty");
+    }
 
     fn shared(opts: &str) -> SubShared {
         let registry = Arc::new(EncodingRegistry::new([]).unwrap());

@@ -1156,6 +1156,34 @@ async fn a_dropped_sample_says_how_long_its_consumer_was_away() {
     running.shutdown().await.unwrap();
 }
 
+/// Collects the gateway's own log lines, so a test can read what it reports rather than only what it returns.
+struct Collected(std::sync::Mutex<Vec<String>>);
+
+static COLLECTED: std::sync::OnceLock<&'static Collected> = std::sync::OnceLock::new();
+
+impl log::Log for Collected {
+    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        self.0.lock().unwrap().push(format!("{}", record.args()));
+    }
+
+    fn flush(&self) {}
+}
+
+/// The gateway's log lines so far, and a logger installed on the first call.
+fn logged() -> Vec<String> {
+    let collected = COLLECTED.get_or_init(|| {
+        let collected: &'static Collected = Box::leak(Box::new(Collected(std::sync::Mutex::new(Vec::new()))));
+        let _ = log::set_logger(collected);
+        log::set_max_level(log::LevelFilter::Info);
+        collected
+    });
+    collected.0.lock().unwrap().clone()
+}
+
 /// A fast stream decode and a slow encode, which is the shape a robot showed: 4 ms of decode and encode in the stats
 /// and 25-72 ms of wall clock an iteration. The loop then takes samples slower than the publisher sends them, the
 /// key's queue saturates, and every arrival drops one — and for a stream decoder a dropped sample is a gap in the
@@ -1215,6 +1243,7 @@ impl zenoh_gateway::VideoEncoder for SlowEncoder {
 /// publisher into a quarter of the frames lost and a freeze a second.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_loop_that_cannot_keep_up_skips_encodes_rather_than_dropping_samples() {
+    logged();
     let session = zenoh::open(isolated_config()).await.unwrap();
     let server = Server::builder().session(session.clone()).encoding(FastStream).video_encoder(|| Box::new(SlowEncoder(zenoh_gateway::H264Encoder::default())));
     let running = server.build().await.unwrap().bind("127.0.0.1:0").await.unwrap();
@@ -1233,7 +1262,7 @@ async fn a_loop_that_cannot_keep_up_skips_encodes_rather_than_dropping_samples()
     });
     next_video(&mut camera).await;
     let mut frames = 1;
-    let until = std::time::Instant::now() + Duration::from_secs(4);
+    let until = std::time::Instant::now() + Duration::from_secs(6);
     while std::time::Instant::now() < until {
         if timeout(Duration::from_millis(500), camera.recv()).await.is_ok() {
             frames += 1;
@@ -1242,6 +1271,11 @@ async fn a_loop_that_cannot_keep_up_skips_encodes_rather_than_dropping_samples()
     putter.abort();
     let stats = client.stats().await.unwrap();
     let of = |name: &str| stats["channels"][0]["stats"][name].as_f64().unwrap_or_default();
+    // the profile line is the only thing that says where this loop's wall clock went, so it has to actually reach a
+    // log in a running loop and not just in its own unit test
+    let profile: Vec<String> = logged().into_iter().filter(|line| line.contains("iterations/s")).collect();
+    assert!(profile.iter().any(|line| line.contains("elsewhere")), "the send loop reports where its time went: {profile:?}");
+    eprintln!("PROFILE ON THIS MACHINE: {}", profile.last().expect("a line"));
     let (dropped, resyncs, skips) = (of("droppedQueue"), of("streamResyncs"), of("catchUpSkips"));
     assert!(skips > 0.0, "a 50 ms encode against a 30 Hz publisher has to catch up: {}", stats["channels"][0]["stats"]);
     assert_eq!(dropped, 0.0, "catching up is what keeps samples from being dropped: {}", stats["channels"][0]["stats"]);

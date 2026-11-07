@@ -251,7 +251,7 @@ async fn subscription_stats(client: &Client, key: &str) -> String {
         format!("  the send loop was away up to {} ms when a sample was dropped", stat["worstConsumerGapMs"]),
         // pictures decoded to keep the stream whole and not encoded: the frames a loop behind its publisher gives up
         // instead of giving up the stream until the next keyframe
-        format!("  caught up (decoded, not encoded): {}", stat["catchUpSkips"]),
+        format!("  caught up (decoded, not encoded): {}   queued now: {}", stat["catchUpSkips"], stat["queued"]),
     ]
     .join("\n")
 }
