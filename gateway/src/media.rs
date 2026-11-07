@@ -1714,10 +1714,12 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         profile.iterations += 1;
         profile.pick += stage.elapsed();
         let stage = Instant::now();
-        // nothing decodes ahead of a stream decoder here: the read-ahead path takes samples through the per-sample
-        // `decode`, which cannot decode a predicted frame, and takes them off the queue, leaving the decoder a gap to
-        // resync over. Its own thread could be given several samples at once instead, since it takes them in order and
-        // keeps its state — worth doing, and a change to how the pictures pair with their samples rather than a knob
+        // nothing decodes ahead of a stream decoder: the read-ahead path takes samples through the per-sample `decode`,
+        // which cannot decode a predicted frame, and takes them off the queue, leaving the decoder a gap to resync
+        // over. Its own thread could be given several at once instead, since it keeps its state and takes them in
+        // order — but only a decoder slow against the frame interval would gain by it: where one frame costs 13 ms of
+        // a 33 ms interval the loop is idle for the rest anyway, and the overlap it would buy is the encode, under a
+        // millisecond. Measure before building it
         let depth = if stream_decoded { 0 } else { decode_ahead(decode_ms, encode_ms) };
         let finished = picking_while(finish_decode(task, shared.codecs.encode_timeout), &mut ahead, depth.saturating_sub(1), &shared, &codec).await;
         profile.decode += stage.elapsed();
