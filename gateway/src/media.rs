@@ -1506,12 +1506,6 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                 continue;
             }
         };
-        // A stream decoder has to see every sample, but only the newest picture is worth encoding: decoding is several
-        // times cheaper than encoding, so when samples are already waiting the loop decodes its way up to the newest
-        // and encodes that. The frames skipped here were decoded, which is all the reference chain needs.
-        if stream_decoded && shared.has_queued() {
-            continue;
-        }
         let source = match &*decoded {
             DecodedFrame::Video(image) => (image.width(), image.height()),
             // (a frame the encoder renders itself: its size once it has encoded one, no floor before)
