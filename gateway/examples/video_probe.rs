@@ -245,6 +245,10 @@ async fn subscription_stats(client: &Client, key: &str) -> String {
         format!("  picture: {}x{}   decode {} ms   encode {} ms", field("videoWidth"), field("videoHeight"), field("decodeMs"), field("encodeMs")),
         format!("  the allocator granted: {} bytes/s at {} Hz", channel["allocation"]["budgetBytesPerSec"], channel["allocation"]["hz"]),
         format!("  cpuScaleCap: {}   quality: {}", stat["cpuScaleCap"], stat["quality"]),
+        format!("  pacerWaits: {}   pacedMs: {}   droppedQueue: {}", stat["pacerWaits"], stat["pacedMs"], stat["droppedQueue"]),
+        // what the send loop was away doing when a sample had to be dropped: a dropped sample costs a stream-decoded
+        // stream every picture until the publisher's next keyframe, so this is the number that explains a low rate
+        format!("  the send loop was away up to {} ms when a sample was dropped", stat["worstConsumerGapMs"]),
     ]
     .join("\n")
 }

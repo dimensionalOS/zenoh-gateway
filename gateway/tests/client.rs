@@ -1081,3 +1081,77 @@ async fn two_cameras_under_one_subscription_each_keep_their_own_timing() {
     assert_eq!(errors, 0, "a picture whose sample had been dropped would be counted here: {}", stats["channels"][0]["stats"]);
     running.shutdown().await.unwrap();
 }
+
+/// A stream-decoded encoding whose decode is slower than the publisher's interval, so the send loop falls behind and
+/// the queue has to drop samples — the chain that costs such a stream every picture until the publisher's next
+/// keyframe. The decoder reports a resync per gap, as a real one does.
+struct SlowStream;
+
+static SLOW_STREAM_RESYNCS: AtomicUsize = AtomicUsize::new(0);
+
+impl MessageEncoding for SlowStream {
+    fn name(&self) -> &str {
+        "test-slow-stream"
+    }
+
+    fn output(&self) -> EncodingOutput {
+        EncodingOutput::Video
+    }
+
+    fn stream_decoder(&self, channel: Channel) -> Option<Box<dyn StreamDecoder>> {
+        matches!(channel, Channel::Video(_)).then(|| Box::new(SlowOne) as Box<dyn StreamDecoder>)
+    }
+
+    fn decode(&self, _sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
+        anyhow::bail!("test-slow-stream decodes as a stream")
+    }
+}
+
+struct SlowOne;
+
+impl StreamDecoder for SlowOne {
+    fn decode(&mut self, sample: &EncodingSample<'_>, _frame_id: u64) -> Result<Option<DecodedFrame>> {
+        // longer than the publisher's interval: the queue fills while this runs
+        std::thread::sleep(Duration::from_millis(300));
+        let number = sample.payload[0];
+        Ok(Some(DecodedFrame::Video(VideoImage::rgb8(160, 120, [number, 40, 90].repeat(160 * 120))?.with_header(1_000.0, "slow"))))
+    }
+
+    fn resync(&mut self) {
+        SLOW_STREAM_RESYNCS.fetch_add(1, SeqCst);
+    }
+}
+
+/// When a stream-decoded key has to drop a sample, the stats say how long its consumer had been away — because that
+/// is the only thing that explains the drop, and a drop costs this kind of stream the pictures until the publisher's
+/// next keyframe. Without it, a stream sitting at two thirds of its rate looks like a decoder that is merely slow.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_sample_says_how_long_its_consumer_was_away() {
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let running = Server::builder().session(session.clone()).encoding(SlowStream).build().await.unwrap().bind("127.0.0.1:0").await.unwrap();
+    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions::default()).await.unwrap();
+    let options = SubscribeOptions { encoding: Some("test-slow-stream".into()), min_quality: Some(1.0), max_hz: Some(30.0), ..Default::default() };
+    let mut camera = client.subscribe("camera/front", options).await.unwrap();
+    let before = SLOW_STREAM_RESYNCS.load(SeqCst);
+    let putter = tokio::spawn({
+        let session = session.clone();
+        async move {
+            for number in 1u8.. {
+                session.put("camera/front", vec![number % 200, 1, 2, 3]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(33)).await;
+            }
+        }
+    });
+    // frames do keep coming, slowly: a 300 ms decode cannot pass ~3 fps
+    next_video(&mut camera).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    putter.abort();
+    let stats = client.stats().await.unwrap();
+    let of = |name: &str| stats["channels"][0]["stats"][name].as_f64().unwrap_or_default();
+    let (dropped, resyncs, away) = (of("droppedQueue"), of("streamResyncs"), of("worstConsumerGapMs"));
+    assert!(dropped > 0.0, "a 300 ms decode against a 30 Hz publisher has to drop samples: {}", stats["channels"][0]["stats"]);
+    assert!(resyncs > 0.0 && SLOW_STREAM_RESYNCS.load(SeqCst) > before, "each gap makes the decoder start over: {resyncs} resyncs");
+    // the decode itself, which is what the loop was away doing
+    assert!(away >= 200.0, "the drop should say the consumer was away ~300 ms, said {away:.0} ms");
+    running.shutdown().await.unwrap();
+}
