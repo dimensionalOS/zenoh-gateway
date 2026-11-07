@@ -997,6 +997,33 @@ fn start_stream_decode(worker: &mut StreamWorker, key: String, item: subscriptio
     Decoding { key, item, task: DecodeTask::Stream(receiver), frame_id }
 }
 
+/// The profile an H.264 stream actually says it is: `(profile_idc, constraint flags, level_idc)` from the first
+/// sequence parameter set in an Annex-B access unit.
+///
+/// The gateway offers `profile-level-id=42e01f` — constrained baseline, level 3.1 — and a receiver that agreed to
+/// that may refuse or fail on anything more. What an encoder emits is its own business, though: `x264enc` on its
+/// defaults emits High, and a caps string that failed to parse once today left it on those defaults with nothing but
+/// the frame rate to say so. So the stream is read rather than trusted, once per session.
+fn h264_profile(access_unit: &[u8]) -> Option<(u8, u8, u8)> {
+    let mut at = 0;
+    while let Some(found) = access_unit.get(at..).and_then(|rest| rest.windows(3).position(|window| window == [0, 0, 1])) {
+        at += found + 3;
+        // nal_unit_type 7 is a sequence parameter set; profile_idc, the constraint flags and level_idc follow its header
+        if access_unit.get(at).is_some_and(|header| header & 0x1f == 7) {
+            let sps = access_unit.get(at + 1..at + 4)?;
+            return Some((sps[0], sps[1], sps[2]));
+        }
+    }
+    None
+}
+
+/// Whether a receiver that agreed to constrained baseline can take this stream: profile_idc 66 with
+/// `constraint_set1_flag`, or any profile that sets it (a stream may be High-numbered and still constrained-baseline
+/// conformant, which is what that flag is for).
+fn takes_constrained_baseline((profile_idc, constraints, _): (u8, u8, u8)) -> bool {
+    profile_idc == 66 || constraints & 0x40 != 0
+}
+
 /// Resolution-scale steps the CPU governor moves by.
 const CPU_STEP: f64 = 0.1;
 /// Share of the frame interval an encode may take before the picture steps down.
@@ -1658,6 +1685,8 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
     // when a picture was last encoded, which is what paces a stream-decoded subscription: its samples are not paced
     // (the decoder sees all of them), so the rate the viewer gets is held here instead
     let mut last_encode: Option<Instant> = None;
+    // whether the stream's own profile has been read and reported yet (H.264 only, once)
+    let mut profile_reported = false;
     // where this loop's wall clock goes (`Profile`), reported every `PROFILE_FRAMES` iterations
     let (mut profile, mut profile_since) = (Profile::default(), Instant::now());
     let (mut decode_ms, mut encode_ms): (Option<f64>, Option<f64>) = (None, None);
@@ -1817,6 +1846,24 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         shared.record_video_timing(decode_ms, outcome.encode_ms, outcome.scale_cap);
         for logged in outcome.frames {
             let frame = &logged.frame;
+            // what the stream says it is, against what was offered for it. Read from the first parameter set that
+            // goes out rather than assumed: a browser that agreed to constrained baseline is entitled to refuse
+            // anything else, and an encoder left on its defaults emits something else without saying so
+            if !profile_reported && format == VideoFormat::H264 {
+                if let Some(profile) = h264_profile(&frame.data) {
+                    let (profile_idc, constraints, level) = profile;
+                    let (name, level) = (format!("profile_idc {profile_idc}, constraints {constraints:#04x}"), format!("level {}.{}", level / 10, level % 10));
+                    if takes_constrained_baseline(profile) {
+                        log::info!("video track {}: H.264 {name}, {level} — a receiver offered constrained baseline can take it", track.mid);
+                    } else {
+                        log::warn!(
+                            "video track {}: H.264 {name}, {level} — the gateway offered constrained baseline (profile-level-id=42e01f) and this is not it, so a browser may refuse or fail to decode it. An encoder on its defaults is the usual reason",
+                            track.mid
+                        );
+                    }
+                    profile_reported = true;
+                }
+            }
             shared.note_video_source(logged.source.0, logged.source.1);
             let now = Instant::now();
             let duration = last_write.map_or(crate::secs(1.0 / hz.max(0.1)), |previous| now.duration_since(previous).max(Duration::from_millis(1)));
@@ -1859,6 +1906,44 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
 
 #[cfg(test)]
 mod tests {
+    /// What the built-in encoder actually emits, against what the gateway offers for it
+    /// (`profile-level-id=42e01f`, constrained baseline level 3.1). Firefox is strict about this and has no H.265 at
+    /// all, so it is the one browser the re-encoded path exists for — a profile it will not take is the difference
+    /// between a picture and a black box, and nothing in a frame rate would say so.
+    #[test]
+    fn the_built_in_encoder_emits_what_the_gateway_offers() {
+        use crate::encoding::{DecodedFrame, VideoEncoder, VideoImage, VideoTarget};
+        let picture = VideoImage::i420(320, 240, vec![128; 320 * 240 * 3 / 2]).unwrap();
+        let frame = DecodedFrame::Video(picture);
+        let mut encoder = crate::encoding::H264Encoder::default();
+        let encoded = (0..4).find_map(|_| encoder.encode(&frame, &VideoTarget::new(320, 240, 1_000_000, 30.0)).unwrap()).expect("an access unit");
+        let profile = super::h264_profile(&encoded.data).expect("its parameter set");
+        assert!(super::takes_constrained_baseline(profile), "openh264 emits {profile:?}, which a receiver offered constrained baseline cannot be assumed to take");
+        // and specifically: baseline, since that is what it is configured for
+        // measured: (66, 0xc0, level) — baseline with constraint_set0 and constraint_set1 both set, which is
+        // precisely constrained baseline, so what is offered and what is emitted agree
+        assert_eq!((profile.0, profile.1 & 0x40), (66, 0x40), "openh264 emits constrained baseline, not merely baseline");
+    }
+
+    /// The reader finds the parameter set wherever it is, and the verdict is about what a receiver can take rather
+    /// than about the number: a stream may be High-numbered and still constrained-baseline conformant, which is what
+    /// the constraint flag is for.
+    #[test]
+    fn a_stream_is_judged_by_what_a_receiver_can_take() {
+        // 4-byte start code, SPS (type 7), then profile_idc, constraints, level_idc
+        let constrained = [0, 0, 0, 1, 0x67, 66, 0xe0, 31];
+        assert_eq!(super::h264_profile(&constrained), Some((66, 0xe0, 31)));
+        assert!(super::takes_constrained_baseline((66, 0xe0, 31)), "constrained baseline 3.1, which is what is offered");
+        assert!(super::takes_constrained_baseline((66, 0x00, 31)), "baseline without the flag: still profile_idc 66");
+        assert!(super::takes_constrained_baseline((100, 0x40, 31)), "High-numbered but the constraint flag says it is conformant");
+        assert!(!super::takes_constrained_baseline((100, 0x00, 31)), "High, which is what an encoder left on its defaults emits");
+        // a 3-byte start code and a parameter set after other units is still found
+        let later = [0, 0, 0, 1, 0x09, 0x10, 0, 0, 1, 0x67, 100, 0x00, 40];
+        assert_eq!(super::h264_profile(&later), Some((100, 0x00, 40)));
+        // and a unit with no parameter set at all says so
+        assert_eq!(super::h264_profile(&[0, 0, 0, 1, 0x41, 0x9a, 0x00]), None);
+    }
+
     /// The profile line exists to name the time **no stat accounts for**, so its arithmetic is the whole of its value:
     /// a loop reporting 22 ms of decode and 0.4 ms of encode while taking 45 ms an iteration has 21 ms elsewhere, and
     /// that is the number to go and look for.
