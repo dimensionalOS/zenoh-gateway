@@ -1252,3 +1252,81 @@ async fn a_loop_that_cannot_keep_up_skips_encodes_rather_than_dropping_samples()
     assert!(frames > 20, "only {frames} frames in 4 s: skipping encodes must not starve the viewer");
     running.shutdown().await.unwrap();
 }
+
+/// A stream decoder whose first samples fail, counting how many decoders the encoding was asked for.
+struct FallibleStream;
+
+static FALLIBLE_DECODERS: AtomicUsize = AtomicUsize::new(0);
+static FALLIBLE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+impl MessageEncoding for FallibleStream {
+    fn name(&self) -> &str {
+        "test-fallible-stream"
+    }
+
+    fn output(&self) -> EncodingOutput {
+        EncodingOutput::Video
+    }
+
+    fn stream_decoder(&self, channel: Channel) -> Option<Box<dyn StreamDecoder>> {
+        matches!(channel, Channel::Video(_)).then(|| {
+            FALLIBLE_DECODERS.fetch_add(1, SeqCst);
+            Box::new(FallibleOne) as Box<dyn StreamDecoder>
+        })
+    }
+
+    fn decode(&self, _sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
+        anyhow::bail!("test-fallible-stream decodes as a stream")
+    }
+}
+
+struct FallibleOne;
+
+impl StreamDecoder for FallibleOne {
+    fn decode(&mut self, sample: &EncodingSample<'_>, _frame_id: u64) -> Result<Option<DecodedFrame>> {
+        // the first few samples are a stream this decoder cannot follow, then it can
+        if FALLIBLE_CALLS.fetch_add(1, SeqCst) < 3 {
+            anyhow::bail!("not something this decoder can read");
+        }
+        let number = sample.payload[0];
+        Ok(Some(DecodedFrame::Video(VideoImage::rgb8(160, 120, [number, 40, 90].repeat(160 * 120))?.with_header(1_000.0, "fallible"))))
+    }
+
+    fn resync(&mut self) {}
+}
+
+/// A decode that fails does not cost the stream its decoder. The decoder lives on its stream's own thread and is
+/// never handed out, so a failure is one frame reported and nothing else — where a decoder passed to a task per
+/// frame was simply gone when that task returned an error, and the next sample had none to use.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_decode_does_not_cost_the_stream_its_decoder() {
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let running = Server::builder().session(session.clone()).encoding(FallibleStream).build().await.unwrap().bind("127.0.0.1:0").await.unwrap();
+    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions::default()).await.unwrap();
+    let options = SubscribeOptions { encoding: Some("test-fallible-stream".into()), min_quality: Some(1.0), max_hz: Some(30.0), ..Default::default() };
+    let mut camera = client.subscribe("camera/front", options).await.unwrap();
+    let putter = tokio::spawn({
+        let session = session.clone();
+        async move {
+            for number in 1u8.. {
+                session.put("camera/front", vec![number % 200, 1, 2, 3]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(33)).await;
+            }
+        }
+    });
+    // the stream recovers on its own: the frames after the failures arrive
+    let mut frames = 0;
+    let until = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < until {
+        if timeout(Duration::from_millis(500), camera.recv()).await.is_ok() {
+            frames += 1;
+        }
+    }
+    putter.abort();
+    assert!(frames > 10, "only {frames} messages after three failed decodes");
+    assert_eq!(FALLIBLE_DECODERS.load(SeqCst), 1, "one decoder for the stream, however many of its samples failed");
+    let stats = client.stats().await.unwrap();
+    let errors = stats["channels"][0]["stats"]["encodingErrors"].as_u64().unwrap_or_default();
+    assert!((1..=4).contains(&errors), "the failures are reported, and only those: {errors}");
+    running.shutdown().await.unwrap();
+}

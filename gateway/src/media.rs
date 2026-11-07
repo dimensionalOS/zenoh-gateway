@@ -845,39 +845,118 @@ pub(crate) struct FrameTimes {
 /// What one sample's decode gave: the frame (`None` from a [`StreamDecoder`] that is resyncing, or from a sample that
 /// completes no picture), whether it was another frontend's, its message header when the frame cannot carry one itself
 /// (a picture gets its header in `decode_shared`, while a frame an encoder renders or passes through has nowhere to put
-/// it), and the stream decoder back, since it was lent to the blocking task.
-type DecodeOutcome = std::result::Result<(Option<Arc<DecodedFrame>>, bool, Option<MessageHeader>, Option<Box<dyn StreamDecoder>>), String>;
+/// it), and which sample the picture belongs to ([`StreamDecoder::last_frame_id`], `None` from a decode that holds
+/// nothing back).
+type DecodeOutcome = std::result::Result<(Option<Arc<DecodedFrame>>, bool, Option<MessageHeader>, Option<u64>), String>;
 
-/// A picked frame and its decode, running on the blocking pool.
+/// (what came of the sample, milliseconds it took, its identity across frontends: key + payload hash)
+type Decoded = (DecodeOutcome, f64, u64);
+
+/// A picked frame and its decode, on the blocking pool or on its stream's own thread.
 pub struct Decoding {
     pub key: String,
     pub item: subscription::Pending,
     /// the number this sample was given, to match the picture a [`StreamDecoder`] gives back to its own sample
     pub frame_id: u64,
-    /// (what came of the sample, milliseconds it took, its identity across frontends: key + payload hash)
-    pub task: tokio::task::JoinHandle<(DecodeOutcome, f64, u64)>,
+    pub task: DecodeTask,
 }
 
-/// A decode's frame, whether it was another frontend's, the ms it took and the sample's identity; or why there is none.
-/// Given up after `timeout` (`ServerBuilder::encode_timeout`): a hung decoder keeps only its blocking thread.
-pub async fn finish_decode(task: tokio::task::JoinHandle<(DecodeOutcome, f64, u64)>, timeout: Duration) -> std::result::Result<(Option<Arc<DecodedFrame>>, bool, f64, u64, Option<MessageHeader>, Option<Box<dyn StreamDecoder>>), String> {
-    match tokio::time::timeout(timeout, task).await {
-        Ok(Ok((Ok((decoded, reused, header, decoder)), ms, hash))) => Ok((decoded, reused, ms, hash, header, decoder)),
+/// Where a decode is running.
+pub enum DecodeTask {
+    /// the blocking pool, which shares a sample's decode between frontends and may run several at once
+    Pool(tokio::task::JoinHandle<Decoded>),
+    /// its stream's own thread ([`StreamWorker`]), which owns the decoder
+    Stream(tokio::sync::oneshot::Receiver<Decoded>),
+}
+
+/// A decode's frame, whether it was another frontend's, the ms it took, the sample's identity and which sample the
+/// picture is; or why there is none.
+///
+/// Given up after `timeout` (`ServerBuilder::encode_timeout`): a hung decoder keeps only its own thread.
+pub async fn finish_decode(task: DecodeTask, timeout: Duration) -> std::result::Result<(Option<Arc<DecodedFrame>>, bool, f64, u64, Option<MessageHeader>, Option<u64>), String> {
+    let finished = match task {
+        DecodeTask::Pool(task) => tokio::time::timeout(timeout, task).await.map(|joined| joined.map_err(|error| format!("decoder task failed: {error}"))),
+        // the thread is the stream's own and outlives this: a sender dropped without answering is a decoder that
+        // panicked, which ends the stream rather than the subscription
+        DecodeTask::Stream(answer) => tokio::time::timeout(timeout, answer).await.map(|received| received.map_err(|_| "the stream's decoder thread stopped".to_owned())),
+    };
+    match finished {
+        Ok(Ok((Ok((decoded, reused, header, picture_id)), ms, hash))) => Ok((decoded, reused, ms, hash, header, picture_id)),
         Ok(Ok((Err(error), _, _))) => Err(error),
-        Ok(Err(error)) => Err(format!("decoder task failed: {error}")),
+        Ok(Err(error)) => Err(error),
         Err(_) => Err(format!("decode took over {timeout:?}: skipped")),
     }
 }
 
-/// Starts decoding a picked sample.
+/// A stream's decoder on its own thread, fed samples over a channel.
 ///
-/// With `decoder`, this stream's [`StreamDecoder`] decodes the sample instead of the encoding's
-/// [`decode`](MessageEncoding::decode): its frames depend on the frames before it, so it is lent to the blocking task
-/// and handed back in the outcome, nothing is shared with other frontends (their decoders are at other points in the
-/// stream), and the caller must feed it every sample of the key in arrival order. `frame_id` numbers those samples (it
-/// is ignored without a `decoder`): a decoder that holds frames returns an earlier sample's picture and says which with
-/// [`StreamDecoder::last_frame_id`], so the caller can send it with that sample's stamp and timing.
-pub fn start_decode(shared: &SubShared, codec: &Arc<dyn MessageEncoding>, key: String, item: subscription::Pending, decoder: Option<Box<dyn StreamDecoder>>, frame_id: u64) -> Decoding {
+/// A [`StreamDecoder`] is serial and belongs to one subscription, so it needs no pool: it was handed to a fresh
+/// `spawn_blocking` for every sample, thirty times a second, which cost a dispatch and a join per frame and — worse —
+/// left the work on whichever core the pool happened to wake. On a robot with four cores reserved for it, the
+/// scheduler put every one of the gateway's hot threads on **one** of them while three sat idle, and 11 ms of decode
+/// took 30 ms of wall clock. Its own thread is a steady load the scheduler can balance, and it has a **stable name**
+/// (`vdec<n>`, logged with its key) that a unit file or a script can pin, which a pool thread never had.
+///
+/// It also owns the decoder outright. Nothing is lent per frame, and a decode that fails no longer loses it.
+struct StreamWorker {
+    jobs: std::sync::mpsc::Sender<StreamJob>,
+    /// `key_seq` of the last sample sent to it, so a gap in arrivals can be told from a sample this loop skipped
+    last_fed: u64,
+}
+
+/// One sample for a [`StreamWorker`], with where to put what it makes of it.
+struct StreamJob {
+    key: String,
+    payload: Vec<u8>,
+    encoding: crate::zenoh::bytes::Encoding,
+    frame_id: u64,
+    /// samples were lost before this one: the decoder starts over (it shows nothing until a keyframe)
+    resync: bool,
+    answer: tokio::sync::oneshot::Sender<Decoded>,
+}
+
+impl StreamWorker {
+    /// Starts a thread owning `decoder`, named for `key`.
+    fn spawn(decoder: Box<dyn StreamDecoder>, codec: Arc<dyn MessageEncoding>, key: &str) -> Self {
+        static THREADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let (jobs, queue) = std::sync::mpsc::channel::<StreamJob>();
+        // short, because Linux keeps 15 characters of a thread name and the point is for a script to find it
+        let name = format!("vdec{}", THREADS.fetch_add(1, Ordering::Relaxed));
+        log::info!("{key}: decoding on thread {name}");
+        let spawned = std::thread::Builder::new().name(name.clone()).spawn(move || {
+            let mut decoder = decoder;
+            // ends when the subscription drops the sender
+            while let Ok(job) = queue.recv() {
+                let started = Instant::now();
+                let sample = EncodingSample::new(&job.key, &job.payload, &job.encoding);
+                let hash = registry::sample_hash(&sample);
+                if job.resync {
+                    decoder.resync();
+                }
+                let outcome = match decoder.decode(&sample, job.frame_id) {
+                    // which sample the picture is, asked here where the decoder lives (`None`: the one just fed)
+                    Ok(frame) => Ok((frame.map(Arc::new), false, codec.header(&sample), Some(decoder.last_frame_id().unwrap_or(job.frame_id)))),
+                    Err(error) => Err(format!("{error:#}")),
+                };
+                // (a receiver dropped is a frame given up on: the loop moved past it)
+                let _ = job.answer.send((outcome, started.elapsed().as_secs_f64() * 1000.0, hash));
+            }
+            log::debug!("{name}: the subscription closed, the decoder goes with it");
+        });
+        match spawned {
+            Ok(_) => {}
+            // (the thread is detached: the decoder's own teardown runs on it)
+            Err(error) => log::error!("{key}: no thread for its decoder ({error}); it will decode on the blocking pool instead"),
+        }
+        StreamWorker { jobs, last_fed: 0 }
+    }
+}
+
+/// Starts decoding a picked sample on the blocking pool, where its result is shared with every frontend that gets
+/// this sample through this encoding ([`decode_shared`](registry::EncodingRegistry::decode_shared)).
+///
+/// A stateful encoding's stream does not come through here: it has its own thread ([`start_stream_decode`]).
+pub fn start_decode(shared: &SubShared, codec: &Arc<dyn MessageEncoding>, key: String, item: subscription::Pending, frame_id: u64) -> Decoding {
     let payload = item.payload.to_bytes().into_owned();
     let (hash_key, encoding, codecs, codec, channel) = (key.clone(), item.encoding.clone(), shared.codecs.clone(), codec.clone(), shared.channel);
     let task = tokio::task::spawn_blocking(move || {
@@ -886,23 +965,36 @@ pub fn start_decode(shared: &SubShared, codec: &Arc<dyn MessageEncoding>, key: S
         let hash = registry::sample_hash(&sample);
         // the header is read here, on the blocking pool, where the payload already is: a frame that is not a picture has
         // nowhere to keep its header, so the step that sends it takes this one
-        let header = || codec.header(&sample);
-        let outcome = match decoder {
-            Some(mut decoder) => match decoder.decode(&sample, frame_id) {
-                Ok(frame) => Ok((frame.map(Arc::new), false, header(), Some(decoder))),
-                Err(error) => Err(format!("{error:#}")),
-            },
-            None => {
-                let (decoded, reused) = codecs.decode_shared(&*codec, &sample, hash, channel);
-                decoded.map(|decoded| {
-                    let own_header = (!matches!(&*decoded, DecodedFrame::Video(_))).then(header).flatten();
-                    (Some(decoded), reused, own_header, None)
-                })
-            }
-        };
+        let (decoded, reused) = codecs.decode_shared(&*codec, &sample, hash, channel);
+        let outcome = decoded.map(|decoded| {
+            let own_header = (!matches!(&*decoded, DecodedFrame::Video(_))).then(|| codec.header(&sample)).flatten();
+            (Some(decoded), reused, own_header, None)
+        });
         (outcome, started.elapsed().as_secs_f64() * 1000.0, hash)
     });
-    Decoding { key, item, task, frame_id }
+    Decoding { key, item, task: DecodeTask::Pool(task), frame_id }
+}
+
+/// Sends a picked sample to its stream's own decoder thread.
+///
+/// Such a decoder's frames depend on the frames before them, so it must be given every sample of its key in arrival
+/// order and its pictures are shared with nobody (another subscription's decoder is at another point in the stream).
+/// `frame_id` numbers those samples: a decoder that holds frames returns an earlier sample's picture and says which,
+/// so the caller can send it with that sample's stamp and timing.
+fn start_stream_decode(worker: &mut StreamWorker, key: String, item: subscription::Pending, frame_id: u64, resync: bool) -> Decoding {
+    let (answer, receiver) = tokio::sync::oneshot::channel();
+    let job = StreamJob {
+        key: key.clone(),
+        payload: item.payload.to_bytes().into_owned(),
+        encoding: item.encoding.clone(),
+        frame_id,
+        resync,
+        answer,
+    };
+    worker.last_fed = item.key_seq;
+    // a closed channel is a thread that stopped; `finish_decode` reports it when the answer never comes
+    let _ = worker.jobs.send(job);
+    Decoding { key, item, task: DecodeTask::Stream(receiver), frame_id }
 }
 
 /// Resolution-scale steps the CPU governor moves by.
@@ -1518,7 +1610,7 @@ async fn picking_while<T>(work: impl Future<Output = T>, ahead: &mut VecDeque<De
         }
         let (picked, wake_at) = shared.pick(Instant::now());
         if let Some((key, item)) = picked {
-            ahead.push_back(start_decode(shared, codec, key, item, None, 0));
+            ahead.push_back(start_decode(shared, codec, key, item, 0));
             continue;
         }
         tokio::select! {
@@ -1533,7 +1625,7 @@ async fn picking_while<T>(work: impl Future<Output = T>, ahead: &mut VecDeque<De
 /// one decodes and encodes ([`decode_ahead`]), in order, so the slower stage's throughput sets the rate, not the two
 /// in series (a 1920x1536 jpeg on a Jetson Orin core, ~16 ms + ~20 ms, could not keep up with 30 Hz) nor one decode.
 ///
-/// A [`StreamDecoder`] cannot be read ahead of (it must be fed every sample in order, one at a time), so there the
+/// A [`StreamDecoder`] cannot be read ahead of here (it must be fed every sample in order, one at a time), so there the
 /// overlap comes from the decoder itself holding a frame: it takes a sample and gives back an earlier sample's picture,
 /// which decoded while this loop encoded the one before it. Each picture is therefore sent with the stamp, timing and
 /// seq of its **own** sample — the [`Fed`] queue — and not of the sample that was pushed in to get it out.
@@ -1549,7 +1641,8 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
     // made here so that asking whether the encoding wants one costs no decoder: making a libde265 one starts threads.
     let mut first_decoder = codec.stream_decoder(shared.channel);
     let stream_decoded = first_decoder.is_some();
-    let mut stream_decoders: HashMap<String, (Box<dyn StreamDecoder>, u64)> = HashMap::new();
+    // one decoder thread per key, each owning its decoder for the life of this subscription
+    let mut workers: HashMap<String, StreamWorker> = HashMap::new();
     // per key, the samples given to its decoder whose picture has not come out yet, oldest first, and the number the
     // next sample gets: a decoder that holds a frame gives back an earlier sample's picture, which is sent with that
     // sample's stamp. Per key because each key has its own decoder, each at its own point in its own stream: one queue
@@ -1589,41 +1682,42 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                     shared.wait_for_data(wake_at).await;
                     continue;
                 };
-                // a stream decode takes this key's decoder with it, and tells it when samples were lost on the way
-                let decoder = stream_decoded.then(|| {
-                    // the first key takes the decoder made at subscribe; another key, or one whose decoder a failed
-                    // decode kept (it is handed back with every outcome but an error), asks the encoding for a new one,
-                    // which starts over at the next keyframe exactly as a resync does
-                    let fresh = || {
-                        let made = first_decoder.take().or_else(|| codec.stream_decoder(shared.channel));
-                        if made.is_none() {
-                            // (an encoding that gave one at subscribe and none now: without one, this stream falls back
-                            // to decoding each sample on its own, which for a stream of predicted frames shows almost none)
-                            log::warn!("{key}: {} gave no stream decoder for a stream it decodes statefully", codec.name());
+                // a stream decode goes to this key's own thread, which owns its decoder
+                if stream_decoded && !workers.contains_key(&key) {
+                    // the first key takes the decoder made at subscribe; another key asks the encoding for its own
+                    match first_decoder.take().or_else(|| codec.stream_decoder(shared.channel)) {
+                        Some(decoder) => {
+                            workers.insert(key.clone(), StreamWorker::spawn(decoder, codec.clone(), &key));
                         }
-                        (made, 0)
-                    };
-                    let (decoder, last_fed) = stream_decoders.remove(&key).map_or_else(fresh, |(decoder, last_fed)| (Some(decoder), last_fed));
-                    let mut decoder = decoder?;
-                    // key_seq numbers this key's samples as they arrive, so a jump is samples the queue dropped before
-                    // this loop read them: what follows may refer to pictures the decoder never saw
-                    if last_fed != 0 && item.key_seq != last_fed + 1 {
-                        decoder.resync();
-                        shared.record_stream_resync();
+                        // (an encoding that gave one at subscribe and none now: without one this stream falls back to
+                        // decoding each sample on its own, which for a stream of predicted frames shows almost none)
+                        None => log::warn!("{key}: {} gave no stream decoder for a stream it decodes statefully", codec.name()),
                     }
-                    Some(decoder)
-                }).flatten();
+                }
                 next_fed_id += 1;
-                start_decode(&shared, &codec, key, item, decoder, next_fed_id - 1)
+                let frame_id = next_fed_id - 1;
+                match workers.get_mut(&key) {
+                    Some(worker) => {
+                        // key_seq numbers this key's samples as they arrive, so a jump is samples the queue dropped
+                        // before this loop read them: what follows may refer to pictures the decoder never saw
+                        let resync = worker.last_fed != 0 && item.key_seq != worker.last_fed + 1;
+                        if resync {
+                            shared.record_stream_resync();
+                        }
+                        start_stream_decode(worker, key, item, frame_id, resync)
+                    }
+                    None => start_decode(&shared, &codec, key, item, frame_id),
+                }
             }
         };
         let Decoding { key, item, task, frame_id } = decoding;
         profile.iterations += 1;
         profile.pick += stage.elapsed();
         let stage = Instant::now();
-        // a stream decoder is fed one sample at a time, in order, so nothing may decode ahead of it: a read-ahead
-        // decode would both take the sample through the per-sample `decode` (which cannot decode a predicted frame) and
-        // take it off the queue, leaving the decoder a gap to resync over
+        // nothing decodes ahead of a stream decoder here: the read-ahead path takes samples through the per-sample
+        // `decode`, which cannot decode a predicted frame, and takes them off the queue, leaving the decoder a gap to
+        // resync over. Its own thread could be given several samples at once instead, since it takes them in order and
+        // keeps its state — worth doing, and a change to how the pictures pair with their samples rather than a knob
         let depth = if stream_decoded { 0 } else { decode_ahead(decode_ms, encode_ms) };
         let finished = picking_while(finish_decode(task, shared.codecs.encode_timeout), &mut ahead, depth.saturating_sub(1), &shared, &codec).await;
         profile.decode += stage.elapsed();
@@ -1632,17 +1726,14 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             profile_since = Instant::now();
         }
         let (decoded, taken) = match finished {
-            Ok((decoded, reused, ms, hash, header, decoder)) => {
+            Ok((decoded, reused, ms, hash, header, picture_id)) => {
                 if !reused {
                     decode_ms = Some(ewma(decode_ms, ms));
                 }
                 let this = Fed { frame_id, key, timestamp_ms: item.timestamp_ms, received_ms: item.received_ms, seq: item.seq, hash, header, sample: subscription::sample_meta(&item) };
-                match decoder {
-                    // the decoder comes back whatever it made of the sample, and has now been fed it
-                    Some(decoder) => {
-                        // which sample this picture is, asked before the decoder is put away (`None`: the one just fed)
-                        let picture_id = decoder.last_frame_id().unwrap_or(frame_id);
-                        stream_decoders.insert(this.key.clone(), (decoder, item.key_seq));
+                match picture_id {
+                    // a stream decode: the picture is the sample its decoder named, which may not be the one just fed
+                    Some(picture_id) => {
                         let waiting = fed.entry(this.key.clone()).or_default();
                         waiting.push_back(this);
                         while waiting.len() > FED_MAX {
