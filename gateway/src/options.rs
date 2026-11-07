@@ -397,7 +397,9 @@ mod tests {
         assert_eq!(resolve(r#"{"encoding":"mic"}"#).unwrap().1, "audio-opus");
         assert!(resolve(r#"{"encoding":"camera","channel":"video-vp8"}"#).unwrap_err().contains("no video-vp8 encoder"));
         assert!(resolve(r#"{"encoding":"camera","channel":"data"}"#).unwrap_err().contains("not on channel data"), "by default only its own channel");
-        assert!(resolve(r#"{"encoding":"camera","channel":"video-h265"}"#).unwrap_err().contains("unknown channel"));
+        // H.265 is only ever passed through, so a server reaches it through the encoding's own encoder or not at all
+        assert!(resolve(r#"{"encoding":"camera","channel":"video-h265"}"#).unwrap_err().contains("no video-h265 encoder"));
+        assert!(resolve(r#"{"encoding":"camera","channel":"video-h266"}"#).unwrap_err().contains("unknown channel"));
         assert!(resolve(r#"{"encoding":"table","encodeOptions":{"format":"x"}}"#).unwrap_err().contains("takes no encodeOptions"));
         assert_eq!(resolve(r#"{"encoding":"table","encodeOptions":{"quality":0.5}}"#).unwrap().1, "data", "quality is always allowed");
         assert_eq!(resolve(r#"{"encoding":"flexible","channel":"data","encodeOptions":{"format":"a"}}"#).unwrap(), (Some("flexible".into()), "data", EncodingOutput::Data));

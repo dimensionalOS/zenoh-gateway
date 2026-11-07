@@ -237,6 +237,9 @@ pub enum VideoFormat {
     Vp9,
     /// AV1 temporal units (OBUs with size fields).
     Av1,
+    /// H.265/HEVC, Annex B access units. Only ever passed through, never encoded here: see
+    /// [`passthrough_only`](Self::passthrough_only).
+    H265,
 }
 
 impl VideoFormat {
@@ -247,7 +250,21 @@ impl VideoFormat {
             VideoFormat::Vp8 => "video/VP8",
             VideoFormat::Vp9 => "video/VP9",
             VideoFormat::Av1 => "video/AV1",
+            VideoFormat::H265 => "video/H265",
         }
+    }
+
+    /// Whether the gateway only ever forwards this format's frames as they arrived. There is no software H.265
+    /// encoder here; an encoding supplies one that passes already-encoded access units through
+    /// ([`MessageEncoding::video_encoder`](crate::MessageEncoding::video_encoder)), so every frame of such a stream
+    /// comes from the source's own encoder and carries its reference chain.
+    ///
+    /// The gateway therefore neither thins the stream to the granted frame rate
+    /// ([`key_interval`](crate::subscription::SubShared)) nor scales its pictures ([`VideoPolicy`]): dropping or
+    /// resizing a frame it did not encode would break the picture until the source's next keyframe, which it cannot
+    /// ask for. Such a stream takes the bits the source sends or none.
+    pub fn passthrough_only(self) -> bool {
+        matches!(self, VideoFormat::H265)
     }
 }
 

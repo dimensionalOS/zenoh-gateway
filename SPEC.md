@@ -288,7 +288,7 @@ connect (`control` op `encodings` → `{encodings: [{name, output}]}`, output on
 `"audio"`, `"fields"` or `"data"`, as `z.encodings`); the gateway refuses an unknown name (`rejected` event, listing the
 known names).
 
-Channels: `video-h264`, `video-vp8`, `video-vp9`, `video-av1` (a WebRTC video track of that format, `sub.mediaStream`),
+Channels: `video-h264`, `video-vp8`, `video-vp9`, `video-av1`, `video-h265` (a WebRTC video track of that format, `sub.mediaStream`),
 `audio-opus` (an Opus audio track), `data` (the subscription's data channel). Unset, the encoding's output decides:
 pictures on `video-h264`, sound on `audio-opus`, anything else on `data`. A video channel needs an encoder of its
 format: the encoding's own, the server's (`ServerBuilder::video_encoder`), or a built-in one (H.264: openh264; AV1:
@@ -394,11 +394,16 @@ on one is rejected, `"none"` accepted, the encoding's default ignored.
 pipelined encoder has nothing out yet. `target` carries the granted bitrate (encode at it) and frame rate, the even
 output size the video policy and CPU governor picked, the allocator's quality, and whether this frame must be a
 keyframe (a viewer joined or sent PLI/FIR). `VideoTarget::new(width, height, bitrate, fps)` makes one to try an
-encoder. The gateway negotiates the format (it offers all four),
+encoder. The gateway negotiates the format (it offers all five),
 packetizes (webrtc-rs payloaders), paces (GCC), measures the frames for the allocator and sends the
 per-frame metadata. Built in: `H264Encoder` (openh264, constrained baseline) for `video-h264`, and with feature `av1`
 (default) rav1e for `video-av1` (speed 10, low latency, tiles across up to 8 cores; rav1e still holds 3 frames, so its
-frames come ~100 ms late at 30 Hz).
+frames come ~100 ms late at 30 Hz). Nothing is built in for `video-h265`: it is passthrough-only
+(`VideoFormat::passthrough_only`), so it needs an encoding whose `video_encoder` forwards access units the publisher
+already encoded (zenoh-dimos-codecs' `H265Passthrough`, for `foxglove_msgs/CompressedVideo`). The gateway neither thins
+such a stream to the granted frame rate nor scales its pictures — it did not encode them, and dropping or resizing one
+would break the picture until the publisher's next keyframe — so it is reserved at the rate the publisher sends, and
+only a browser with an HEVC decoder can ask for it (the client's `playableChannel` picks).
 
 A hardware encoder plugs in for its format as `ServerBuilder::video_encoder(factory)` (called once to ask the format;
 one per format), or for one encoding as its `video_encoder(format)` (which wins). [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs)' `encoders` module has

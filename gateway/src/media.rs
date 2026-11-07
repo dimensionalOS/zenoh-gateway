@@ -33,14 +33,16 @@ use webrtc::peer_connection::{PeerConnection, RTCSessionDescription};
 use webrtc::rtp_transceiver::RtpSender;
 
 /// Every format a track can have, with the payload type the gateway offers it at.
-const FORMATS: [(&str, u8); 5] = [("video/H264", 102), ("video/VP8", 96), ("video/VP9", 98), ("video/AV1", 45), (OPUS, 111)];
+/// (`video/H265` at 126, the payload type the webrtc fork's own default codecs use for it; the browser's answer decides
+/// the payload type actually sent, see `negotiated_payload_type`.)
+const FORMATS: [(&str, u8); 6] = [("video/H264", 102), ("video/VP8", 96), ("video/VP9", 98), ("video/AV1", 45), ("video/H265", 126), (OPUS, 111)];
 const OPUS: &str = "audio/opus";
 /// Google Congestion Control bounds, bits/s. It starts where the link estimator starts (`allocator::INITIAL_ESTIMATE`,
 /// 512 kbit/s), since video is allocated no more than that estimate. The ceiling is only a sanity bound (at 50 Mbit/s it
 /// capped 8 HD cameras on an idle link): the link estimate and 1.5 x what video sent bound what video gets.
 const GCC_MIN_BPS: f64 = 50_000.0;
 const GCC_MAX_BPS: f64 = 2_000_000_000.0;
-/// Video RTP's clock (H.264, VP8, VP9 and AV1 all run at 90 kHz).
+/// Video RTP's clock (H.264, H.265, VP8, VP9 and AV1 all run at 90 kHz).
 const VIDEO_CLOCK_RATE: f64 = 90_000.0;
 /// The pacer's rate as a multiple of the GCC estimate (see `ReportingEstimator::target_bitrate`).
 const PACING_FACTOR: f64 = 2.5;
@@ -91,6 +93,10 @@ fn rtp_codec(mime: &str) -> RTCRtpCodec {
         // constrained baseline, what openh264 produces and every browser decodes
         "video/H264" => "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
         "video/VP9" => "profile-id=0",
+        // H.265 is passed through, so the gateway has no profile, level or tier of its own to assert: an empty fmtp
+        // answers whatever the browser offered (Chrome offers level-id/profile-id/tier-flag/tx-mode) rather than
+        // claiming something the source's bitstream might not be
+        "video/H265" => "",
         _ => "",
     };
     RTCRtpCodec { mime_type: mime.to_owned(), clock_rate: 90_000, channels: 0, sdp_fmtp_line: sdp_fmtp_line.to_owned(), rtcp_feedback: vec![feedback("ccm", "fir"), feedback("nack", ""), feedback("nack", "pli")] }
@@ -836,7 +842,9 @@ pub(crate) struct FrameTimes {
 }
 
 /// A decoded frame and whether another frontend's decode was reused, or the decode error.
-type DecodeOutcome = std::result::Result<(Arc<DecodedFrame>, bool), String>;
+/// (the frame, whether it was another frontend's, and its message header when the frame cannot carry one itself: a
+/// picture gets its header in `decode_shared`, while a frame an encoder renders or passes through has nowhere to put it)
+type DecodeOutcome = std::result::Result<(Arc<DecodedFrame>, bool, Option<MessageHeader>), String>;
 
 /// A picked frame and its decode, running on the blocking pool.
 pub struct Decoding {
@@ -848,9 +856,9 @@ pub struct Decoding {
 
 /// A decode's frame, whether it was another frontend's, the ms it took and the sample's identity; or why there is none.
 /// Given up after `timeout` (`ServerBuilder::encode_timeout`): a hung decoder keeps only its blocking thread.
-pub async fn finish_decode(task: tokio::task::JoinHandle<(DecodeOutcome, f64, u64)>, timeout: Duration) -> std::result::Result<(Arc<DecodedFrame>, bool, f64, u64), String> {
+pub async fn finish_decode(task: tokio::task::JoinHandle<(DecodeOutcome, f64, u64)>, timeout: Duration) -> std::result::Result<(Arc<DecodedFrame>, bool, f64, u64, Option<MessageHeader>), String> {
     match tokio::time::timeout(timeout, task).await {
-        Ok(Ok((Ok((decoded, reused)), ms, hash))) => Ok((decoded, reused, ms, hash)),
+        Ok(Ok((Ok((decoded, reused, header)), ms, hash))) => Ok((decoded, reused, ms, hash, header)),
         Ok(Ok((Err(error), _, _))) => Err(error),
         Ok(Err(error)) => Err(format!("decoder task failed: {error}")),
         Err(_) => Err(format!("decode took over {timeout:?}: skipped")),
@@ -866,7 +874,13 @@ pub fn start_decode(shared: &SubShared, codec: &Arc<dyn MessageEncoding>, key: S
         let sample = EncodingSample::new(&hash_key, &payload, &encoding);
         let hash = registry::sample_hash(&sample);
         let (decoded, reused) = codecs.decode_shared(&*codec, &sample, hash, channel);
-        (decoded.map(|decoded| (decoded, reused)), started.elapsed().as_secs_f64() * 1000.0, hash)
+        // read here, on the blocking pool, where the payload already is: a frame that is not a picture has nowhere to
+        // keep its header, so the step that sends it takes this one
+        let decoded = decoded.map(|decoded| {
+            let header = (!matches!(&*decoded, DecodedFrame::Video(_))).then(|| codec.header(&sample)).flatten();
+            (decoded, reused, header)
+        });
+        (decoded, started.elapsed().as_secs_f64() * 1000.0, hash)
     });
     Decoding { key, item, task }
 }
@@ -1203,6 +1217,8 @@ impl Drop for Member {
 /// A picked, decoded sample to encode.
 struct Input {
     decoded: Arc<DecodedFrame>,
+    /// the sample's message header, for a frame that cannot carry one itself (a picture keeps its own)
+    header: Option<MessageHeader>,
     timestamp_ms: f64,
     received_ms: f64,
     hash: u64,
@@ -1240,7 +1256,8 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
             state.source = (image.width(), image.height());
             (true, image.message_header().cloned())
         } else {
-            (false, None)
+            // a passed-through or rendered frame: its header came with the decode, since the frame has nowhere to keep one
+            (false, input.header.clone())
         };
         let grants: Vec<(f64, f64, f64, bool)> = session.grants.lock().values().copied().collect();
         let starting_up = grants.iter().any(|grant| grant.3);
@@ -1432,12 +1449,12 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         let Decoding { key, item, task } = decoding;
         let depth = decode_ahead(decode_ms, encode_ms);
         let finished = picking_while(finish_decode(task, shared.codecs.encode_timeout), &mut ahead, depth - 1, &shared, &codec).await;
-        let (decoded, hash) = match finished {
-            Ok((decoded, reused, ms, hash)) => {
+        let (decoded, hash, decoded_header) = match finished {
+            Ok((decoded, reused, ms, hash, header)) => {
                 if !reused {
                     decode_ms = Some(ewma(decode_ms, ms));
                 }
-                (decoded, hash)
+                (decoded, hash, header)
             }
             Err(error) => {
                 shared.record_encoding_error(&error);
@@ -1458,7 +1475,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             (member.next_seq, member.synced) = (None, false);
         }
         member.session = Some(session.clone());
-        let input = Input { decoded, timestamp_ms: item.timestamp_ms, received_ms: item.received_ms, hash, quality, keyframe_requested: track.keyframe_requested.swap(false, Ordering::AcqRel), sample: subscription::sample_meta(&item) };
+        let input = Input { decoded, header: decoded_header, timestamp_ms: item.timestamp_ms, received_ms: item.received_ms, hash, quality, keyframe_requested: track.keyframe_requested.swap(false, Ordering::AcqRel), sample: subscription::sample_meta(&item) };
         let stepping = step(session, &mut member, input, shared.codecs.clone(), codec.clone());
         let outcome = picking_while(stepping, &mut ahead, depth, &shared, &codec).await;
         encode_ms = outcome.encode_ms.or(encode_ms);
@@ -1768,7 +1785,7 @@ mod tests {
             for (index, viewer) in viewers.iter_mut().enumerate() {
                 let session = sessions.place(viewer.session.take(), viewer.id, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), grants[index]);
                 viewer.session = Some(session.clone());
-                let input = Input { decoded: picture.clone(), timestamp_ms: sample as f64 * 33.0, received_ms: sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false, sample: None };
+                let input = Input { decoded: picture.clone(), header: None, timestamp_ms: sample as f64 * 33.0, received_ms: sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false, sample: None };
                 let step = step(session, viewer, input, codecs.clone(), codec.clone()).await;
                 sent[index].extend(step.frames.iter().map(|frame| (frame.seq, frame.frame.keyframe, frame.encoded_by)));
             }
@@ -1805,7 +1822,7 @@ mod tests {
             let picture = VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap().with_header(100.0 + sample as f64 * 0.5, frame_id);
             let session = codecs.video_sessions.place(viewer.session.take(), 0, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (4e6, 30.0, 4e6, false));
             viewer.session = Some(session.clone());
-            let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), timestamp_ms: sample as f64 * 33.0, received_ms: sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false, sample: Some(("image/raw".into(), Some(vec![9]))) };
+            let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), header: None, timestamp_ms: sample as f64 * 33.0, received_ms: sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false, sample: Some(("image/raw".into(), Some(vec![9]))) };
             sent.extend(step(session, &mut viewer, input, codecs.clone(), codec.clone()).await.frames);
         }
         codecs.video_sessions.leave(viewer.session.as_ref().unwrap(), 0);
@@ -1873,7 +1890,7 @@ mod tests {
             let picture = VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap().with_header(100.0 + sample as f64, "cam");
             let session = codecs.video_sessions.place(viewer.session.take(), 0, ("lagging", VideoFormat::H264, "cam0"), VideoPolicy::default(), (4e6, 30.0, 4e6, false));
             viewer.session = Some(session.clone());
-            let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), timestamp_ms: sample as f64 * 33.0, received_ms: 1000.0 + sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false, sample: None };
+            let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), header: None, timestamp_ms: sample as f64 * 33.0, received_ms: 1000.0 + sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false, sample: None };
             sent.extend(step(session, &mut viewer, input, codecs.clone(), codec.clone()).await.frames);
         }
         codecs.video_sessions.leave(viewer.session.as_ref().unwrap(), 0);
@@ -1935,7 +1952,7 @@ mod tests {
             let picture = VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap().with_header(100.0 + sample as f64, "cam");
             let session = codecs.video_sessions.place(viewer.session.take(), 0, ("bursty", VideoFormat::H264, "cam0"), VideoPolicy::default(), (4e6, 30.0, 4e6, false));
             viewer.session = Some(session.clone());
-            let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), timestamp_ms: sample as f64 * 33.0, received_ms: sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false, sample: None };
+            let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), header: None, timestamp_ms: sample as f64 * 33.0, received_ms: sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false, sample: None };
             sent.push(step(session, &mut viewer, input, codecs.clone(), codec.clone()).await.frames.iter().map(|frame| frame.header.as_ref().unwrap().stamp()).collect::<Vec<_>>());
         }
         codecs.video_sessions.leave(viewer.session.as_ref().unwrap(), 0);
@@ -1999,7 +2016,7 @@ mod tests {
         let picture = VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap().with_header(100.0, "cam");
         let session = codecs.video_sessions.place(None, 0, (name, VideoFormat::H264, "cam0"), VideoPolicy::default(), (4e6, fps, 4e6, false));
         viewer.session = Some(session.clone());
-        let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), timestamp_ms: 0.0, received_ms: 0.0, hash: 0, quality: 1.0, keyframe_requested: false, sample: None };
+        let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), header: None, timestamp_ms: 0.0, received_ms: 0.0, hash: 0, quality: 1.0, keyframe_requested: false, sample: None };
         let started = Instant::now();
         let out = step(session, &mut viewer, input, codecs.clone(), codec).await;
         codecs.video_sessions.leave(viewer.session.as_ref().unwrap(), 0);

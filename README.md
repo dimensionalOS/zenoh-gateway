@@ -108,7 +108,7 @@ The gateway checks options: an unknown name or a bad value rejects the subscript
 | `minQuality` | 0 | the least quality the allocator picks for an encoded stream (the most is `encodeOptions.quality`) |
 | `qualityToHzTradeoff` | 0.5 (video: 1) | 0 = keep quality, drop Hz; 1 = keep Hz, drop quality (video: keep the frame rate and spend fewer bits per frame, a coarser quantizer at the same size) |
 | `encoding` | none (raw bytes) | a name from `z.encodings` (see [Encodings and channels](#encodings-and-channels)); the gateway rejects unknown names, listing them |
-| `channel` | from the encoding's output: pictures `"video-h264"`, sound `"audio-opus"`, else `"data"` | what the messages travel on: `"video-h264"`, `"video-vp8"`, `"video-vp9"`, `"video-av1"`, `"audio-opus"` or `"data"` |
+| `channel` | from the encoding's output: pictures `"video-h264"`, sound `"audio-opus"`, else `"data"` | what the messages travel on: `"video-h264"`, `"video-vp8"`, `"video-vp9"`, `"video-av1"`, `"video-h265"`, `"audio-opus"` or `"data"` |
 | `encodeOptions` | `{}` | passed to the encoding (each documents its own); `quality` (0–1, default 1) is the most the allocator picks, lowered when bandwidth is short |
 | `compress` | the encoding's (none without one) | `"zstd"` or `"none"`: zstd-compress each data-channel message (raw topics too); the client decompresses, so `msg.bytes` is always plain. Rejected on video and audio channels |
 | `maxBitrate` | the server's (~0.3 bit/pixel at the source's size and rate) | video channels: most bits/s the stream asks for; it encodes at what the allocator grants |
@@ -164,7 +164,7 @@ encodeOptions: { quality: 0.8 } })`. There is no auto-detection and none is buil
 types: the application registers encodings (e.g. [zenoh-dimos-codecs](https://github.com/jeff-hykin/zenoh-dimos-codecs),
 one per message type). No encoding = raw bytes, rate is the only degradation.
 
-- **video channels** (`video-h264` default, `video-av1`, `video-vp8`, `video-vp9`): the encoding hands the gateway
+- **video channels** (`video-h264` default, `video-av1`, `video-vp8`, `video-vp9`, `video-h265`): the encoding hands the gateway
   pictures, which it encodes at the bitrate the allocator grants (full size unless that is under 0.05 bit/pixel) and
   sends on a video track (`sub.mediaStream`, `msg.video`). Built-in encoders: H.264 (openh264) and AV1 (rav1e, feature
   `av1`, on by default; ~3 frames of added latency). The server can plug in others per format
