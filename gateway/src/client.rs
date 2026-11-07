@@ -129,8 +129,8 @@ pub struct SubscribeOptions {
     pub quality_to_hz_tradeoff: Option<f64>,
     /// a message encoding the gateway registered ([`Client::encodings`])
     pub encoding: Option<String>,
-    /// `video-h264`, `video-vp8`, `video-vp9`, `video-av1`, `audio-opus` or `data` (default: where the encoding's
-    /// output goes)
+    /// `video-h264`, `video-vp8`, `video-vp9`, `video-av1`, `video-h265`, `audio-opus` or `data` (default: where the
+    /// encoding's output goes)
     pub channel: Option<String>,
     /// passed to the encoding; `quality` there (0..1) is the most the allocator may pick
     pub encode_options: Option<serde_json::Map<String, Value>>,
