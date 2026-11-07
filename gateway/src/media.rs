@@ -1270,6 +1270,70 @@ struct Fed {
     sample: crate::frame::SampleMeta,
 }
 
+/// Samples of one key waiting to be picked before the send loop spends a frame catching up: it decodes the picture (so
+/// the stream's reference chain stays whole) and does not encode it, which costs this one frame and saves the stream.
+///
+/// Half of [`STREAM_DECODE_BACKLOG`](crate::subscription::STREAM_DECODE_BACKLOG), not "anything queued": at 30 Hz a
+/// sample is almost always queued, and skipping the encode whenever one was sent **nothing at all** (2337 samples
+/// received, 0 frames encoded). Half leaves the loop encoding every frame at its rate and catching up only when it has
+/// fallen far enough behind that the queue is about to drop a sample — which for a stream decoder is a gap in the
+/// reference chain and the pictures until the publisher's next keyframe, about a second on a robot camera.
+const CATCH_UP_BACKLOG: usize = crate::subscription::STREAM_DECODE_BACKLOG / 2;
+
+/// Where a video send loop's wall clock goes, logged every `PROFILE_FRAMES` iterations.
+///
+/// A loop whose stats said 22 ms of decode and 0.4 ms of encode was taking 45 ms an iteration, and nothing in the
+/// stats could say what the other 22 ms were. These are the stages, in the order the loop runs them, each measured as
+/// wall clock and not as work: waiting for a blocking task and doing the work in it are the same thing to a stats
+/// counter, and quite different to a frame rate.
+#[derive(Default)]
+struct Profile {
+    iterations: u64,
+    /// picking a sample off the queue (and the wait for one to be there)
+    pick: Duration,
+    /// the decode task, from spawning it to having its frame: a blocking pull inside it is counted here too
+    decode: Duration,
+    /// the encode session's turn with the picture
+    encode: Duration,
+    /// writing frames to the RTP track
+    write: Duration,
+    /// the per-frame metadata on the data channel
+    send: Duration,
+}
+
+impl Profile {
+    /// What is reported, as a value so the arithmetic can be tested rather than only read in a log:
+    /// `camera/front: 22.1 iterations/s, 45.2 ms each: pick 0.2, decode 22.4, encode 0.4, write 1.1, send 0.2,
+    /// elsewhere 20.9`. "Elsewhere" is the point of the line — it is the part no stat accounts for.
+    fn line(&self, key: &str, over: Duration) -> String {
+        let each = |stage: Duration| stage.as_secs_f64() * 1000.0 / self.iterations.max(1) as f64;
+        let (pick, decode, encode, write, send) = (each(self.pick), each(self.decode), each(self.encode), each(self.write), each(self.send));
+        let interval = over.as_secs_f64() * 1000.0 / self.iterations.max(1) as f64;
+        let rate = self.iterations as f64 / over.as_secs_f64().max(f64::MIN_POSITIVE);
+        format!(
+            "{key}: {rate:.1} iterations/s, {interval:.1} ms each: pick {pick:.1}, decode {decode:.1}, encode {encode:.1}, write {write:.1}, send {send:.1}, elsewhere {:.1}",
+            interval - pick - decode - encode - write - send
+        )
+    }
+
+    fn report(&mut self, key: &str, over: Duration) {
+        log::info!("video {}", self.line(key, over));
+        *self = Profile::default();
+    }
+}
+
+/// Iterations between profile lines: ~5 s at 30 Hz, often enough to see a stall move and rare enough to read.
+const PROFILE_FRAMES: u64 = 150;
+
+/// A picture this much before its due time is taken as due: frames arrive a little early or late, and holding one back
+/// for a millisecond costs a whole interval (libwebrtc's frame-rate controller allows the same half-interval slack).
+const CATCH_UP_EARLY: Duration = Duration::from_millis(2);
+
+/// Pictures in a row the loop may decode without encoding one. Catching up only works while decoding is the cheaper
+/// stage; where it is not (a decoder slower than the publisher), the backlog never drains and without this the viewer
+/// would be sent nothing at all. One frame in this many always goes out.
+const CATCH_UP_RUN: u64 = 8;
+
 /// Samples waiting for their picture before the oldest is given up unstamped: a decoder that holds frames holds one or
 /// two, so this is only ever reached by one that holds pictures back indefinitely (one waiting for a keyframe, whose
 /// samples complete no picture at all and never will) — and there it keeps a stream that is showing nothing from
@@ -1490,6 +1554,13 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         // so the allocator stops thinning this stream: a decoder cannot be fed a subset of it
         shared.note_stream_decoded();
     }
+    // pictures decoded and not encoded since the last one that was, bounded by `CATCH_UP_RUN`
+    let mut catching_up: u64 = 0;
+    // when a picture was last encoded, which is what paces a stream-decoded subscription: its samples are not paced
+    // (the decoder sees all of them), so the rate the viewer gets is held here instead
+    let mut last_encode: Option<Instant> = None;
+    // where this loop's wall clock goes (`Profile`), reported every `PROFILE_FRAMES` iterations
+    let (mut profile, mut profile_since) = (Profile::default(), Instant::now());
     let (mut decode_ms, mut encode_ms): (Option<f64>, Option<f64>) = (None, None);
     // one frame at the granted rate: what may still wait in the RTP pacer when the next frame is encoded
     let mut frame_interval = Duration::ZERO;
@@ -1503,6 +1574,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             tokio::time::sleep((behind - frame_interval).min(frame_interval.max(Duration::from_millis(1)))).await;
             continue;
         }
+        let stage = Instant::now();
         let decoding = match ahead.pop_front() {
             Some(decoding) => decoding,
             None => {
@@ -1540,11 +1612,19 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             }
         };
         let Decoding { key, item, task, frame_id } = decoding;
+        profile.iterations += 1;
+        profile.pick += stage.elapsed();
+        let stage = Instant::now();
         // a stream decoder is fed one sample at a time, in order, so nothing may decode ahead of it: a read-ahead
         // decode would both take the sample through the per-sample `decode` (which cannot decode a predicted frame) and
         // take it off the queue, leaving the decoder a gap to resync over
         let depth = if stream_decoded { 0 } else { decode_ahead(decode_ms, encode_ms) };
         let finished = picking_while(finish_decode(task, shared.codecs.encode_timeout), &mut ahead, depth.saturating_sub(1), &shared, &codec).await;
+        profile.decode += stage.elapsed();
+        if profile.iterations >= PROFILE_FRAMES {
+            profile.report(&key, profile_since.elapsed());
+            profile_since = Instant::now();
+        }
         let (decoded, taken) = match finished {
             Ok((decoded, reused, ms, hash, header, decoder)) => {
                 if !reused {
@@ -1590,6 +1670,28 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             }
         };
         let Fed { key, timestamp_ms, received_ms, seq, hash, header: decoded_header, sample: sample_meta, .. } = taken;
+        // A stream-decoded key is fed every sample, so this is where its rate is held and where it catches up. The
+        // picture is decoded (the chain is whole) and goes no further when either:
+        //  - it is not due yet: the granted rate, which `pick` no longer spaces this key by, or
+        //  - this key's queue is about to start dropping samples, each of which would cost the stream the pictures
+        //    until the publisher's next keyframe. Giving up this one frame is the cheap end of that trade.
+        // `CATCH_UP_RUN` keeps the viewer from being starved where catching up cannot work (a decoder slower than the
+        // publisher): one picture in that many is encoded whatever the backlog says.
+        if stream_decoded && catching_up < CATCH_UP_RUN {
+            // `maxHz`, which is what used to space this key's samples — so the rate the viewer gets is the rate it got
+            // before, and the only pictures newly given up are the ones given up to keep a sample from being dropped.
+            // (Not the grant's rate: a stream-decoded subscription never followed that, and starting now would change
+            // what a constrained link sends by more than the measurement this is part of could tell apart.)
+            let interval = shared.min_interval().unwrap_or_default();
+            let now = Instant::now();
+            let due = last_encode.is_none_or(|previous| now.duration_since(previous) + CATCH_UP_EARLY >= interval);
+            if !due || shared.backlog(&key) >= CATCH_UP_BACKLOG {
+                catching_up += 1;
+                shared.record_catch_up();
+                continue;
+            }
+        }
+        (catching_up, last_encode) = (0, Some(Instant::now()));
         let source = match &*decoded {
             DecodedFrame::Video(image) => (image.width(), image.height()),
             // (a frame the encoder renders itself: its size once it has encoded one, no floor before)
@@ -1606,7 +1708,9 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         member.session = Some(session.clone());
         let input = Input { decoded, header: decoded_header, timestamp_ms, received_ms, hash, quality, keyframe_requested: track.keyframe_requested.swap(false, Ordering::AcqRel), sample: sample_meta };
         let stepping = step(session, &mut member, input, shared.codecs.clone(), codec.clone());
+        let stage = Instant::now();
         let outcome = picking_while(stepping, &mut ahead, depth, &shared, &codec).await;
+        profile.encode += stage.elapsed();
         encode_ms = outcome.encode_ms.or(encode_ms);
         if let Some(error) = &outcome.error {
             shared.record_encoding_error(error);
@@ -1621,7 +1725,10 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             if !track.is_current() {
                 break;
             }
-            let written = match track.write(frame.data.clone(), duration, shared.tuning().playout_delay, Some(logged.timestamp_ms), frame.keyframe).await {
+            let stage = Instant::now();
+            let writing = track.write(frame.data.clone(), duration, shared.tuning().playout_delay, Some(logged.timestamp_ms), frame.keyframe).await;
+            profile.write += stage.elapsed();
+            let written = match writing {
                 Ok(written) => written,
                 Err(error) => {
                     if !warned_write {
@@ -1637,7 +1744,10 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             let meta = metadata(frame, logged.source, quality, &written, times, logged.header.as_ref().filter(|_| shared.sends_header()).map(|header| (header, &logged.sample)));
             let shared_encode = logged.encoded_by != member.id;
             shared.record_video_frame(frame.data.len(), (frame.width, frame.height), quality, frame.keyframe, shared_encode, track.keyframe_requests.load(Ordering::Relaxed));
-            if subscription::send_small_frame(&dc, &key, logged.timestamp_ms, seq, next_frame_id, 0, &meta).await.is_err() && shared.is_closed() {
+            let stage = Instant::now();
+            let sent = subscription::send_small_frame(&dc, &key, logged.timestamp_ms, seq, next_frame_id, 0, &meta).await;
+            profile.send += stage.elapsed();
+            if sent.is_err() && shared.is_closed() {
                 break;
             }
             next_frame_id = next_frame_id.wrapping_add(1);
@@ -1650,6 +1760,27 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
 
 #[cfg(test)]
 mod tests {
+    /// The profile line exists to name the time **no stat accounts for**, so its arithmetic is the whole of its value:
+    /// a loop reporting 22 ms of decode and 0.4 ms of encode while taking 45 ms an iteration has 21 ms elsewhere, and
+    /// that is the number to go and look for.
+    #[test]
+    fn the_profile_line_accounts_for_every_millisecond_of_an_iteration() {
+        use std::time::Duration;
+        let profile = super::Profile {
+            iterations: 100,
+            pick: Duration::from_millis(20),
+            decode: Duration::from_millis(2_240),
+            encode: Duration::from_millis(40),
+            write: Duration::from_millis(110),
+            send: Duration::from_millis(20),
+        };
+        let line = profile.line("camera/front", Duration::from_millis(4_520));
+        assert_eq!(line, "camera/front: 22.1 iterations/s, 45.2 ms each: pick 0.2, decode 22.4, encode 0.4, write 1.1, send 0.2, elsewhere 20.9");
+        // an empty window says so rather than dividing by it
+        let line = super::Profile::default().line("camera/front", Duration::ZERO);
+        assert!(line.starts_with("camera/front: ") && !line.contains("NaN"), "{line}");
+    }
+
     #[test]
     fn abs_capture_time_is_ntp_with_a_zero_offset() {
         use rtc::shared::marshal::Marshal;

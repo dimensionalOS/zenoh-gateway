@@ -1123,3 +1123,98 @@ async fn a_dropped_sample_says_how_long_its_consumer_was_away() {
     assert!(away >= 200.0, "the drop should say the consumer was away ~300 ms, said {away:.0} ms");
     running.shutdown().await.unwrap();
 }
+
+/// A fast stream decode and a slow encode, which is the shape a robot showed: 4 ms of decode and encode in the stats
+/// and 25-72 ms of wall clock an iteration. The loop then takes samples slower than the publisher sends them, the
+/// key's queue saturates, and every arrival drops one — and for a stream decoder a dropped sample is a gap in the
+/// reference chain, which costs every picture until the publisher's next keyframe.
+struct FastStream;
+
+static FAST_STREAM_RESYNCS: AtomicUsize = AtomicUsize::new(0);
+
+impl MessageEncoding for FastStream {
+    fn name(&self) -> &str {
+        "test-fast-stream"
+    }
+
+    fn output(&self) -> EncodingOutput {
+        EncodingOutput::Video
+    }
+
+    fn stream_decoder(&self, channel: Channel) -> Option<Box<dyn StreamDecoder>> {
+        matches!(channel, Channel::Video(_)).then(|| Box::new(FastOne) as Box<dyn StreamDecoder>)
+    }
+
+    fn decode(&self, _sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
+        anyhow::bail!("test-fast-stream decodes as a stream")
+    }
+}
+
+struct FastOne;
+
+impl StreamDecoder for FastOne {
+    fn decode(&mut self, sample: &EncodingSample<'_>, _frame_id: u64) -> Result<Option<DecodedFrame>> {
+        let number = sample.payload[0];
+        Ok(Some(DecodedFrame::Video(VideoImage::rgb8(160, 120, [number, 40, 90].repeat(160 * 120))?.with_header(1_000.0, "fast"))))
+    }
+
+    fn resync(&mut self) {
+        FAST_STREAM_RESYNCS.fetch_add(1, SeqCst);
+    }
+}
+
+/// openh264 with an encode that takes longer than the publisher's interval.
+struct SlowEncoder(zenoh_gateway::H264Encoder);
+
+impl zenoh_gateway::VideoEncoder for SlowEncoder {
+    fn format(&self) -> zenoh_gateway::VideoFormat {
+        self.0.format()
+    }
+
+    fn encode(&mut self, frame: &DecodedFrame, target: &zenoh_gateway::VideoTarget) -> Result<Option<zenoh_gateway::EncodedVideo>> {
+        std::thread::sleep(Duration::from_millis(50));
+        self.0.encode(frame, target)
+    }
+}
+
+/// A stream-decoded subscription whose loop cannot keep up **must not let a sample be dropped**: it decodes the
+/// backlog to keep the reference chain whole and skips encoding those pictures, so the viewer sees fewer frames
+/// instead of seeing nothing until the publisher's next keyframe. Dropping instead turned a loop 10% slower than its
+/// publisher into a quarter of the frames lost and a freeze a second.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_loop_that_cannot_keep_up_skips_encodes_rather_than_dropping_samples() {
+    let session = zenoh::open(isolated_config()).await.unwrap();
+    let server = Server::builder().session(session.clone()).encoding(FastStream).video_encoder(|| Box::new(SlowEncoder(zenoh_gateway::H264Encoder::default())));
+    let running = server.build().await.unwrap().bind("127.0.0.1:0").await.unwrap();
+    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions::default()).await.unwrap();
+    let options = SubscribeOptions { encoding: Some("test-fast-stream".into()), min_quality: Some(1.0), max_hz: Some(30.0), ..Default::default() };
+    let mut camera = client.subscribe("camera/front", options).await.unwrap();
+    let before = FAST_STREAM_RESYNCS.load(SeqCst);
+    let putter = tokio::spawn({
+        let session = session.clone();
+        async move {
+            for number in 1u8.. {
+                session.put("camera/front", vec![number % 200, 1, 2, 3]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(33)).await;
+            }
+        }
+    });
+    next_video(&mut camera).await;
+    let mut frames = 1;
+    let until = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < until {
+        if timeout(Duration::from_millis(500), camera.recv()).await.is_ok() {
+            frames += 1;
+        }
+    }
+    putter.abort();
+    let stats = client.stats().await.unwrap();
+    let of = |name: &str| stats["channels"][0]["stats"][name].as_f64().unwrap_or_default();
+    let (dropped, resyncs, skips) = (of("droppedQueue"), of("streamResyncs"), of("catchUpSkips"));
+    assert!(skips > 0.0, "a 50 ms encode against a 30 Hz publisher has to catch up: {}", stats["channels"][0]["stats"]);
+    assert_eq!(dropped, 0.0, "catching up is what keeps samples from being dropped: {}", stats["channels"][0]["stats"]);
+    assert_eq!((resyncs, FAST_STREAM_RESYNCS.load(SeqCst) - before), (0.0, 0), "and a sample that is never dropped is a decoder that never starts over");
+    // and the viewer is still being sent frames, at what the encode sustains rather than nothing
+    assert!(frames > 20, "only {frames} frames in 4 s: skipping encodes must not starve the viewer");
+    running.shutdown().await.unwrap();
+}
