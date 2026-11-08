@@ -27,8 +27,7 @@ const ACK_DELAY: Duration = Duration::from_millis(50);
 const MIN_SAMPLE_TIME: Duration = Duration::from_millis(10 * ACK_DELAY.as_millis() as u64);
 /// The time one rate sample covers at least: a round of the link model must last this long, or a probe round's extra
 /// is averaged with the rounds around it and never shows.
-pub const SAMPLE_SPAN: Duration =
-    Duration::from_millis(MIN_SAMPLE_TIME.as_millis() as u64 + ACK_DELAY.as_millis() as u64);
+pub const SAMPLE_SPAN: Duration = Duration::from_millis(MIN_SAMPLE_TIME.as_millis() as u64 + ACK_DELAY.as_millis() as u64);
 /// A frame sent with at most this much in flight queued behind (almost) nothing of ours: its round trip is the path's.
 const QUIET_BYTES: usize = 8 * 1024;
 /// Acks are remembered this long to sample a rate over (longer than any round trip worth sampling over).
@@ -125,10 +124,7 @@ pub struct SendGate {
 
 impl Default for SendGate {
     fn default() -> Self {
-        SendGate::new(
-            crate::allocator::DEFAULT_STALE_AFTER,
-            crate::allocator::DEFAULT_INITIAL_BANDWIDTH,
-        )
+        SendGate::new(crate::allocator::DEFAULT_STALE_AFTER, crate::allocator::DEFAULT_INITIAL_BANDWIDTH)
     }
 }
 
@@ -184,8 +180,7 @@ impl Path {
     fn refill(&mut self, now: Instant) {
         // at most one chunk's worth saved up while idle, so an idle frontend can't burst
         let capacity = chunk_for(self.rate) as f64;
-        self.tokens = (self.tokens + self.rate * now.duration_since(self.refilled).as_secs_f64())
-            .min(capacity);
+        self.tokens = (self.tokens + self.rate * now.duration_since(self.refilled).as_secs_f64()).min(capacity);
         self.refilled = now;
     }
 
@@ -196,24 +191,13 @@ impl Path {
     /// Also forgets any frame, reliable ones too, the page hasn't acked in `stale_after`: a page that stopped acking
     /// without disconnecting must not hold the window (and every bulk sender) shut forever.
     fn expire_lost(&mut self, now: Instant, stale_after: Duration) {
-        let high_rtt = self
-            .rtts
-            .iter()
-            .map(|(_, rtt)| *rtt)
-            .reduce(f64::max)
-            .unwrap_or(0.0);
+        let high_rtt = self.rtts.iter().map(|(_, rtt)| *rtt).reduce(f64::max).unwrap_or(0.0);
         let timeout = crate::secs(2.0 * high_rtt / 1000.0).max(MIN_LOSS_TIMEOUT) + ACK_DELAY;
-        self.stalled |= self
-            .frames
-            .values()
-            .any(|frame| now.duration_since(frame.sent_at) > stale_after);
+        self.stalled |= self.frames.values().any(|frame| now.duration_since(frame.sent_at) > stale_after);
         let lost: Vec<u64> = self
             .frames
             .iter()
-            .filter(|(_, frame)| {
-                (frame.lossy && now.duration_since(frame.sent_at) > timeout)
-                    || now.duration_since(frame.sent_at) > stale_after
-            })
+            .filter(|(_, frame)| (frame.lossy && now.duration_since(frame.sent_at) > timeout) || now.duration_since(frame.sent_at) > stale_after)
             .map(|(order, _)| *order)
             .collect();
         for order in lost {
@@ -279,38 +263,20 @@ impl SendGate {
     pub fn take_round(&self) -> RoundSamples {
         let mut path = self.path.lock();
         let now = Instant::now();
-        while path
-            .rtts
-            .front()
-            .is_some_and(|(at, _)| now.duration_since(*at) > RTT_WINDOW)
-        {
+        while path.rtts.front().is_some_and(|(at, _)| now.duration_since(*at) > RTT_WINDOW) {
             path.rtts.pop_front();
         }
         let drained = path.in_flight <= path.window.max(2 * self.chunk_bytes());
-        let mut recent: Vec<f64> = path
-            .rtts
-            .iter()
-            .filter(|(at, _)| now.duration_since(*at) <= TYPICAL_RTT_WINDOW)
-            .map(|(_, rtt)| *rtt)
-            .collect();
+        let mut recent: Vec<f64> = path.rtts.iter().filter(|(at, _)| now.duration_since(*at) <= TYPICAL_RTT_WINDOW).map(|(_, rtt)| *rtt).collect();
         recent.sort_by(f64::total_cmp);
         let typical_rtt_ms = recent.get(recent.len() / 2).copied();
-        while path
-            .quiet_rtts
-            .front()
-            .is_some_and(|(at, _)| now.duration_since(*at) > RTT_WINDOW)
-        {
+        while path.quiet_rtts.front().is_some_and(|(at, _)| now.duration_since(*at) > RTT_WINDOW) {
             path.quiet_rtts.pop_front();
         }
         let mut quiet: Vec<f64> = path.quiet_rtts.iter().map(|(_, rtt)| *rtt).collect();
         quiet.sort_by(f64::total_cmp);
         let path_rtt_ms = quiet.get(quiet.len() / 2).copied();
-        RoundSamples {
-            drained,
-            typical_rtt_ms,
-            path_rtt_ms,
-            ..std::mem::take(&mut path.round)
-        }
+        RoundSamples { drained, typical_rtt_ms, path_rtt_ms, ..std::mem::take(&mut path.round) }
     }
 
     /// The right to send one message bigger than a bulk chunk, held until it is sent whole; waiters get it in arrival
@@ -337,12 +303,7 @@ impl SendGate {
     /// takes the mark from the bulk frame that was): what it delivers is its own rate. Ahead of bulk in SCTP, strict
     /// frames kept arriving while a step down left bulk stuck in SCTP's loss recovery, and read as the link they dragged
     /// the estimate to their own 7 KB/s, under which bulk got no budget and never probed again.
-    pub fn strict_frame_sent(
-        &self,
-        stream: usize,
-        bytes: usize,
-        lifetime: Option<Duration>,
-    ) -> u64 {
+    pub fn strict_frame_sent(&self, stream: usize, bytes: usize, lifetime: Option<Duration>) -> u64 {
         self.sent(stream, bytes, lifetime, true)
     }
 
@@ -356,24 +317,8 @@ impl SendGate {
         path.next += 1;
         let quiet = path.in_flight <= QUIET_BYTES;
         path.in_flight += bytes;
-        let (link_limited, latency_limited) = if strict {
-            (false, false)
-        } else {
-            (
-                std::mem::take(&mut path.held),
-                std::mem::take(&mut path.held_by_target),
-            )
-        };
-        let frame = Frame {
-            stream,
-            bytes,
-            lossy,
-            lifetime,
-            sent_at: now,
-            link_limited,
-            latency_limited,
-            quiet,
-        };
+        let (link_limited, latency_limited) = if strict { (false, false) } else { (std::mem::take(&mut path.held), std::mem::take(&mut path.held_by_target)) };
+        let frame = Frame { stream, bytes, lossy, lifetime, sent_at: now, link_limited, latency_limited, quiet };
         path.frames.insert(order, frame);
         order
     }
@@ -389,9 +334,7 @@ impl SendGate {
             if let Some(frame) = path.remove(order) {
                 // (an abandoned lossy frame wasn't delivered: counted, a jittery link's abandoned backlog read as
                 // megabytes delivered, the estimate grew 11x the link, and more was sent to be abandoned)
-                if frame.lifetime.is_some_and(|lifetime| {
-                    now.duration_since(frame.sent_at) > lifetime + ACK_DELAY
-                }) {
+                if frame.lifetime.is_some_and(|lifetime| now.duration_since(frame.sent_at) > lifetime + ACK_DELAY) {
                     newest = Some(order);
                     continue;
                 }
@@ -401,8 +344,7 @@ impl SendGate {
                 if frame.quiet {
                     path.quiet_rtts.push_back((now, rtt));
                 }
-                path.round.min_rtt_ms =
-                    Some(path.round.min_rtt_ms.map_or(rtt, |least| least.min(rtt)));
+                path.round.min_rtt_ms = Some(path.round.min_rtt_ms.map_or(rtt, |least| least.min(rtt)));
                 newest_acked = Some(frame);
             }
             newest = Some(order);
@@ -412,33 +354,17 @@ impl SendGate {
         // late acks read up to 2x the link); link-limited when the newest frame it covers was held back by the link
         let acked_total = path.acked_total;
         path.ack_history.push_back((now, acked_total));
-        while path
-            .ack_history
-            .front()
-            .is_some_and(|(at, _)| now.duration_since(*at) > ACK_HISTORY)
-        {
+        while path.ack_history.front().is_some_and(|(at, _)| now.duration_since(*at) > ACK_HISTORY) {
             path.ack_history.pop_front();
         }
         if let Some(frame) = &newest_acked {
-            let min_rtt = path
-                .rtts
-                .iter()
-                .map(|(_, rtt)| *rtt)
-                .reduce(f64::min)
-                .unwrap_or(0.0)
-                / 1000.0;
+            let min_rtt = path.rtts.iter().map(|(_, rtt)| *rtt).reduce(f64::min).unwrap_or(0.0) / 1000.0;
             let span = min_rtt.max(MIN_SAMPLE_TIME.as_secs_f64());
-            let start = path
-                .ack_history
-                .iter()
-                .rev()
-                .find(|(at, _)| now.duration_since(*at).as_secs_f64() >= span)
-                .copied();
+            let start = path.ack_history.iter().rev().find(|(at, _)| now.duration_since(*at).as_secs_f64() >= span).copied();
             if let Some((at, acked_then)) = start {
                 // (over the time plus the ack delay: what this ack covers may have arrived that much earlier, and the highest
                 // sample wins, so the unpadded time read the link 1.3x fast on a 500 kbit/s link)
-                let rate = (acked_total - acked_then) as f64
-                    / (now.duration_since(at) + ACK_DELAY).as_secs_f64();
+                let rate = (acked_total - acked_then) as f64 / (now.duration_since(at) + ACK_DELAY).as_secs_f64();
                 let slot = match (frame.link_limited, frame.latency_limited) {
                     (true, _) => &mut path.round.link_limited_rate,
                     (false, true) => &mut path.round.latency_limited_rate,
@@ -460,14 +386,8 @@ impl SendGate {
             let extra = (path.epoch_acked - expected).clamp(0.0, path.window as f64);
             path.round.extra_acked = path.round.extra_acked.max(extra);
         }
-        if let Some((newest, stream)) = newest.zip(newest_acked.as_ref().map(|frame| frame.stream))
-        {
-            let lost: Vec<u64> = path
-                .frames
-                .range(..newest)
-                .filter(|(_, frame)| frame.lossy && frame.stream == stream)
-                .map(|(order, _)| *order)
-                .collect();
+        if let Some((newest, stream)) = newest.zip(newest_acked.as_ref().map(|frame| frame.stream)) {
+            let lost: Vec<u64> = path.frames.range(..newest).filter(|(_, frame)| frame.lossy && frame.stream == stream).map(|(order, _)| *order).collect();
             for order in lost {
                 path.remove(order);
             }
@@ -546,12 +466,7 @@ impl SendGate {
     /// A closed channel's frames.
     pub fn forget(&self, stream: usize) {
         let mut path = self.path.lock();
-        let orders: Vec<u64> = path
-            .frames
-            .iter()
-            .filter(|(_, frame)| frame.stream == stream)
-            .map(|(order, _)| *order)
-            .collect();
+        let orders: Vec<u64> = path.frames.iter().filter(|(_, frame)| frame.stream == stream).map(|(order, _)| *order).collect();
         for order in orders {
             path.remove(order);
         }
@@ -579,18 +494,10 @@ mod tests {
         let later = gate.frame_sent(2, 1000, Some(Duration::from_secs(1)));
         assert_eq!(gate.in_flight(), 3100);
         gate.frames_acked([acked]);
-        assert_eq!(
-            gate.in_flight(),
-            1100,
-            "the lossy frame before it was lost; the reliable one still waits for its own ack"
-        );
+        assert_eq!(gate.in_flight(), 1100, "the lossy frame before it was lost; the reliable one still waits for its own ack");
         assert_eq!(gate.acked_total(), 1000, "a lost frame isn't delivered");
         gate.frames_acked([lost]);
-        assert_eq!(
-            gate.in_flight(),
-            1100,
-            "a late ack of a passed frame changes nothing"
-        );
+        assert_eq!(gate.in_flight(), 1100, "a late ack of a passed frame changes nothing");
         gate.frames_acked([reliable]);
         gate.frames_dropped([later]);
         assert_eq!(gate.in_flight(), 0);
@@ -605,10 +512,7 @@ mod tests {
         let strict = gate.strict_frame_sent(1, 100, None);
         assert!(!gate.path.lock().frames[&strict].link_limited);
         let bulk = gate.frame_sent(2, 1000, None);
-        assert!(
-            gate.path.lock().frames[&bulk].link_limited,
-            "the mark stays for the bulk frame that waited"
-        );
+        assert!(gate.path.lock().frames[&bulk].link_limited, "the mark stays for the bulk frame that waited");
     }
 
     #[test]
@@ -618,11 +522,7 @@ mod tests {
         std::thread::sleep(ACK_DELAY + Duration::from_millis(10));
         let delivered = gate.frame_sent(1, 500, Some(Duration::from_secs(1)));
         gate.frames_acked([abandoned, delivered]);
-        assert_eq!(
-            gate.acked_total(),
-            500,
-            "the page's cumulative ack passed over it; SCTP had given up on it"
-        );
+        assert_eq!(gate.acked_total(), 500, "the page's cumulative ack passed over it; SCTP had given up on it");
         assert_eq!(gate.in_flight(), 0);
     }
 
@@ -632,11 +532,7 @@ mod tests {
         gate.frame_sent(1, 1000, Some(Duration::from_secs(1)));
         let other = gate.frame_sent(2, 1000, Some(Duration::from_secs(1)));
         gate.frames_acked([other]);
-        assert_eq!(
-            gate.in_flight(),
-            1000,
-            "channel 1 acks on its own timer: its frame isn't lost yet"
-        );
+        assert_eq!(gate.in_flight(), 1000, "channel 1 acks on its own timer: its frame isn't lost yet");
     }
 
     #[test]
@@ -646,42 +542,20 @@ mod tests {
         gate.frame_sent(2, 100, None);
         let mut path = gate.path.lock();
         path.expire_lost(Instant::now() + MIN_LOSS_TIMEOUT / 2, gate.stale_after);
-        assert_eq!(
-            path.in_flight, 200,
-            "younger than the loss timeout: maybe still queued"
-        );
-        path.expire_lost(
-            Instant::now() + MIN_LOSS_TIMEOUT + ACK_DELAY + Duration::from_millis(1),
-            gate.stale_after,
-        );
-        assert_eq!(
-            path.in_flight, 100,
-            "the lossy tail is lost; the reliable frame waits (SCTP resends it)"
-        );
+        assert_eq!(path.in_flight, 200, "younger than the loss timeout: maybe still queued");
+        path.expire_lost(Instant::now() + MIN_LOSS_TIMEOUT + ACK_DELAY + Duration::from_millis(1), gate.stale_after);
+        assert_eq!(path.in_flight, 100, "the lossy tail is lost; the reliable frame waits (SCTP resends it)");
         assert!(!path.stalled);
-        path.expire_lost(
-            Instant::now() + gate.stale_after + Duration::from_millis(1),
-            gate.stale_after,
-        );
-        assert_eq!(
-            path.in_flight, 0,
-            "unacked past stale_after: forgotten, the page stopped answering"
-        );
-        assert!(
-            path.stalled,
-            "and the page is judged to have stopped reading"
-        );
+        path.expire_lost(Instant::now() + gate.stale_after + Duration::from_millis(1), gate.stale_after);
+        assert_eq!(path.in_flight, 0, "unacked past stale_after: forgotten, the page stopped answering");
+        assert!(path.stalled, "and the page is judged to have stopped reading");
     }
 
     #[tokio::test]
     async fn bulk_waits_for_the_window_and_strict_turns() {
         // a window under two chunks counts as two chunks (8 KB at this rate)
         let gate = std::sync::Arc::new(gate(1e6, 2000));
-        assert_eq!(
-            gate.wait_bulk_turn(5000).await,
-            Duration::ZERO,
-            "an empty window always admits one frame"
-        );
+        assert_eq!(gate.wait_bulk_turn(5000).await, Duration::ZERO, "an empty window always admits one frame");
         let first = gate.frame_sent(1, 5000, None);
         tokio::time::sleep(Duration::from_millis(10)).await;
         let waiting = tokio::spawn({
@@ -693,12 +567,7 @@ mod tests {
         gate.frames_acked([first]);
         assert!(waiting.await.unwrap() >= Duration::from_millis(15));
         let turn = gate.strict_turn();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), gate.wait_bulk_turn(10))
-                .await
-                .is_err(),
-            "bulk waits while strict sends"
-        );
+        assert!(tokio::time::timeout(Duration::from_millis(20), gate.wait_bulk_turn(10)).await.is_err(), "bulk waits while strict sends");
         drop(turn);
         assert_eq!(gate.wait_bulk_turn(10).await, Duration::ZERO);
     }

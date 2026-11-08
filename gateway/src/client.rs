@@ -31,7 +31,6 @@ pub use api::*;
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
 use log::warn;
-use parking_lot::Mutex;
 use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp::Packet;
@@ -44,16 +43,14 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
-use webrtc::data_channel::{
-    DataChannel, DataChannelEvent, RTCDataChannelInit, RTCDataChannelState,
-};
+use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit, RTCDataChannelState};
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
-    RTCIceGatheringState, RTCIceServer, RTCIceTransportPolicy, RTCPeerConnectionState,
-    RTCSessionDescription, SettingEngineBuilder,
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer,
+    RTCIceTransportPolicy, RTCPeerConnectionState, RTCSessionDescription, SettingEngineBuilder,
 };
 use webrtc::rtp_transceiver::RtpTransceiver;
 
@@ -96,13 +93,7 @@ pub struct ClientOptions {
 
 impl Default for ClientOptions {
     fn default() -> Self {
-        ClientOptions {
-            token: None,
-            ice_servers: None,
-            relay_only: false,
-            heartbeat_hz: 0.0,
-            heartbeat_misses: 3,
-        }
+        ClientOptions { token: None, ice_servers: None, relay_only: false, heartbeat_hz: 0.0, heartbeat_misses: 3 }
     }
 }
 
@@ -382,11 +373,7 @@ impl Clock {
         if self.samples.len() > CLOCK_WINDOW {
             self.samples.pop_front();
         }
-        self.offset_ms = self
-            .samples
-            .iter()
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|sample| sample.0);
+        self.offset_ms = self.samples.iter().min_by(|a, b| a.1.total_cmp(&b.1)).map(|sample| sample.0);
         self.rtt_ms = Some(rtt);
     }
 }
@@ -400,8 +387,7 @@ impl Ending {
     }
 
     fn end(&self, reason: String) {
-        self.0
-            .send_if_modified(|current| current.is_none() && current.replace(reason).is_none());
+        self.0.send_if_modified(|current| current.is_none() && current.replace(reason).is_none());
     }
 
     fn reason(&self) -> Option<String> {
@@ -410,11 +396,7 @@ impl Ending {
 
     async fn wait(&self) -> String {
         let mut ended = self.0.subscribe();
-        ended
-            .wait_for(Option::is_some)
-            .await
-            .map(|reason| reason.clone().unwrap_or_default())
-            .unwrap_or_default()
+        ended.wait_for(Option::is_some).await.map(|reason| reason.clone().unwrap_or_default()).unwrap_or_default()
     }
 }
 
@@ -453,14 +435,8 @@ struct MediaSlot {
 impl MediaSlot {
     async fn request_keyframe(&self) -> Result<()> {
         let track = self.track.get().context("no video has arrived yet")?;
-        let pli = PictureLossIndication {
-            sender_ssrc: 0,
-            media_ssrc: self.ssrc.load(Ordering::Relaxed),
-        };
-        track
-            .write_rtcp(vec![Box::new(pli)])
-            .await
-            .map_err(|error| anyhow!("{error}"))
+        let pli = PictureLossIndication { sender_ssrc: 0, media_ssrc: self.ssrc.load(Ordering::Relaxed) };
+        track.write_rtcp(vec![Box::new(pli)]).await.map_err(|error| anyhow!("{error}"))
     }
 }
 
@@ -501,11 +477,7 @@ impl Shared {
         self.set_state(ConnectionState::Lost);
         self.requests.lock().clear();
         for endpoint in self.endpoints.lock().values() {
-            if let Some(publisher) = endpoint
-                .publisher
-                .as_ref()
-                .filter(|publisher| publisher.deadman_armed.load(Ordering::Acquire))
-            {
+            if let Some(publisher) = endpoint.publisher.as_ref().filter(|publisher| publisher.deadman_armed.load(Ordering::Acquire)) {
                 publisher.trip("disconnected".into());
             }
         }
@@ -521,15 +493,8 @@ impl Shared {
         let id = message["id"].as_u64().unwrap_or_default();
         let Some(event) = message["event"].as_str() else {
             // an unnamed lease learns its group from the reply
-            if let Some((group, ending)) = self
-                .pending_leases
-                .lock()
-                .remove(&id)
-                .filter(|_| message["ok"] == true)
-                && let Some(previous) = self.leases.lock().insert(
-                    message["group"].as_str().map_or(group, str::to_owned),
-                    ending,
-                )
+            if let Some((group, ending)) = self.pending_leases.lock().remove(&id).filter(|_| message["ok"] == true)
+                && let Some(previous) = self.leases.lock().insert(message["group"].as_str().map_or(group, str::to_owned), ending)
             {
                 previous.end("renewed".into());
             }
@@ -560,11 +525,7 @@ impl Shared {
             // revoked
             "closed" => return self.lost(),
             "leaseLost" => {
-                if let Some(lease) = self
-                    .leases
-                    .lock()
-                    .remove(message["group"].as_str().unwrap_or_default())
-                {
+                if let Some(lease) = self.leases.lock().remove(message["group"].as_str().unwrap_or_default()) {
                     lease.end(reason);
                 }
                 return;
@@ -578,11 +539,7 @@ impl Shared {
         match event {
             "accepted" | "rejected" => {
                 if let Some(accepted) = endpoint.accepted.take() {
-                    let _ = accepted.send(if event == "accepted" {
-                        Ok(())
-                    } else {
-                        Err(reason)
-                    });
+                    let _ = accepted.send(if event == "accepted" { Ok(()) } else { Err(reason) });
                 }
             }
             "tripped" => {
@@ -610,9 +567,7 @@ impl PeerConnectionEventHandler for Handler {
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         match state {
             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => self.shared.lost(),
-            RTCPeerConnectionState::Disconnected => {
-                self.shared.set_state(ConnectionState::Degraded)
-            }
+            RTCPeerConnectionState::Disconnected => self.shared.set_state(ConnectionState::Degraded),
             RTCPeerConnectionState::Connected => self.shared.set_state(ConnectionState::Connected),
             _ => {}
         }
@@ -684,8 +639,7 @@ impl Drop for PendingRequest<'_> {
 
 impl Inner {
     async fn request(&self, body: Value, timeout: Duration) -> Result<Value> {
-        self.request_as(self.next_id.fetch_add(1, Ordering::Relaxed), body, timeout)
-            .await
+        self.request_as(self.next_id.fetch_add(1, Ordering::Relaxed), body, timeout).await
     }
 
     /// [`Inner::request`] with the caller's id (taken from `next_id`).
@@ -695,23 +649,11 @@ impl Inner {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.shared.requests.lock().insert(id, reply_tx);
         // however this ends (a failed send, the timeout, the caller dropping it), the entry goes
-        let _pending = PendingRequest {
-            requests: &self.shared.requests,
-            id,
-        };
-        self.control
-            .send_text(&body.to_string())
-            .await
-            .map_err(|error| anyhow!("{op}: {error}"))?;
+        let _pending = PendingRequest { requests: &self.shared.requests, id };
+        self.control.send_text(&body.to_string()).await.map_err(|error| anyhow!("{op}: {error}"))?;
         let reply = tokio::time::timeout(timeout, reply_rx).await;
-        let reply = reply
-            .map_err(|_| anyhow!("{op} timed out"))?
-            .map_err(|_| anyhow!("{op}: connection lost"))?;
-        ensure!(
-            reply["ok"] == true,
-            "zenoh-gateway: {}",
-            reply["error"].as_str().unwrap_or("error")
-        );
+        let reply = reply.map_err(|_| anyhow!("{op} timed out"))?.map_err(|_| anyhow!("{op}: connection lost"))?;
+        ensure!(reply["ok"] == true, "zenoh-gateway: {}", reply["error"].as_str().unwrap_or("error"));
         Ok(reply)
     }
 
@@ -722,115 +664,47 @@ impl Inner {
             (clock.offset_ms, clock.rtt_ms)
         };
         let t0 = now_ms();
-        let reply = self
-            .request(
-                json!({"op": "ping", "t0": t0, "offsetMs": offset, "rttMs": rtt}),
-                PING_TIMEOUT,
-            )
-            .await?;
-        self.shared.clock.lock().add(
-            t0,
-            reply["t1"].as_f64().unwrap_or(f64::NAN),
-            reply["t2"].as_f64().unwrap_or(f64::NAN),
-            now_ms(),
-        );
+        let reply = self.request(json!({"op": "ping", "t0": t0, "offsetMs": offset, "rttMs": rtt}), PING_TIMEOUT).await?;
+        self.shared.clock.lock().add(t0, reply["t1"].as_f64().unwrap_or(f64::NAN), reply["t2"].as_f64().unwrap_or(f64::NAN), now_ms());
         Ok(())
     }
 
     /// A recvonly transceiver bound to a gateway track of `codec` (a channel name): a free one, or a new one
     /// renegotiated over `control` (SPEC "Video").
-    async fn media_slot(
-        &self,
-        codec: &str,
-        kind: RtpCodecKind,
-        reuse: bool,
-    ) -> Result<Arc<MediaSlot>> {
+    async fn media_slot(&self, codec: &str, kind: RtpCodecKind, reuse: bool) -> Result<Arc<MediaSlot>> {
         let free = reuse.then(|| {
             let mut free = self.free_slots.lock();
-            free.iter()
-                .position(|slot| slot.codec == codec)
-                .map(|index| free.remove(index))
+            free.iter().position(|slot| slot.codec == codec).map(|index| free.remove(index))
         });
         if let Some(slot) = free.flatten() {
             return Ok(slot);
         }
         let _negotiating = self.negotiation.lock().await;
-        let init = RTCRtpTransceiverInit {
-            direction: RTCRtpTransceiverDirection::Recvonly,
-            streams: vec![],
-            send_encodings: vec![],
-        };
-        let transceiver = self
-            .connection
-            .add_transceiver_from_kind(kind, Some(init))
-            .await?;
+        let init = RTCRtpTransceiverInit { direction: RTCRtpTransceiverDirection::Recvonly, streams: vec![], send_encodings: vec![] };
+        let transceiver = self.connection.add_transceiver_from_kind(kind, Some(init)).await?;
         let offer = self.connection.create_offer(None).await?;
         self.connection.set_local_description(offer).await?;
-        let offer = self
-            .connection
-            .local_description()
-            .await
-            .context("no local description")?;
-        let reply = self
-            .request(
-                json!({"op": "renegotiate", "channel": codec, "sdp": offer}),
-                OPEN_TIMEOUT,
-            )
-            .await?;
-        self.connection
-            .set_remote_description(serde_json::from_value(reply["sdp"].clone())?)
-            .await?;
-        let mid = transceiver
-            .mid()
-            .await?
-            .context("the transceiver has no mid")?;
-        ensure!(
-            reply["mid"] == mid.as_str(),
-            "gateway bound mid {}, expected {mid}",
-            reply["mid"]
-        );
-        let slot = Arc::new(MediaSlot {
-            mid,
-            codec: codec.to_owned(),
-            transceiver,
-            track: OnceLock::new(),
-            ssrc: AtomicU32::new(0),
-            sink: Mutex::new(None),
-        });
+        let offer = self.connection.local_description().await.context("no local description")?;
+        let reply = self.request(json!({"op": "renegotiate", "channel": codec, "sdp": offer}), OPEN_TIMEOUT).await?;
+        self.connection.set_remote_description(serde_json::from_value(reply["sdp"].clone())?).await?;
+        let mid = transceiver.mid().await?.context("the transceiver has no mid")?;
+        ensure!(reply["mid"] == mid.as_str(), "gateway bound mid {}, expected {mid}", reply["mid"]);
+        let slot = Arc::new(MediaSlot { mid, codec: codec.to_owned(), transceiver, track: OnceLock::new(), ssrc: AtomicU32::new(0), sink: Mutex::new(None) });
         self.shared.media.lock().push(slot.clone());
         Ok(slot)
     }
 
     /// Opens a `sub`/`pub` channel, runs `task` on its events, and waits until the gateway accepted
     /// it and it is open here (the gateway's `accepted` can beat the channel's own open).
-    async fn open_endpoint<F>(
-        &self,
-        label: Value,
-        init: RTCDataChannelInit,
-        publisher: Option<Arc<PubState>>,
-        task: impl FnOnce(Arc<dyn DataChannel>, oneshot::Sender<()>) -> F,
-    ) -> Result<Arc<dyn DataChannel>>
+    async fn open_endpoint<F>(&self, label: Value, init: RTCDataChannelInit, publisher: Option<Arc<PubState>>, task: impl FnOnce(Arc<dyn DataChannel>, oneshot::Sender<()>) -> F) -> Result<Arc<dyn DataChannel>>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let (id, key) = (
-            label["id"].as_u64().unwrap_or_default(),
-            label["key"].as_str().unwrap_or_default().to_owned(),
-        );
+        let (id, key) = (label["id"].as_u64().unwrap_or_default(), label["key"].as_str().unwrap_or_default().to_owned());
         let (accepted_tx, accepted_rx) = oneshot::channel();
-        self.shared.endpoints.lock().insert(
-            id,
-            Endpoint {
-                accepted: Some(accepted_tx),
-                publisher,
-            },
-        );
+        self.shared.endpoints.lock().insert(id, Endpoint { accepted: Some(accepted_tx), publisher });
         let opened = async {
-            let channel = self
-                .connection
-                .create_data_channel(&label.to_string(), Some(init))
-                .await
-                .map_err(|error| anyhow!("creating the channel: {error}"))?;
+            let channel = self.connection.create_data_channel(&label.to_string(), Some(init)).await.map_err(|error| anyhow!("creating the channel: {error}"))?;
             let (opened_tx, opened_rx) = oneshot::channel();
             tokio::spawn(task(channel.clone(), opened_tx));
             let ready = async {
@@ -839,9 +713,7 @@ impl Inner {
                     Ok(Err(reason)) => bail!("gateway rejected {key}: {reason}"),
                     Err(_) => bail!("connection lost"),
                 }
-                opened_rx
-                    .await
-                    .map_err(|_| anyhow!("{key}: channel closed before opening"))
+                opened_rx.await.map_err(|_| anyhow!("{key}: channel closed before opening"))
             };
             match tokio::time::timeout(OPEN_TIMEOUT, ready).await {
                 Ok(Ok(())) => Ok(channel),
@@ -850,17 +722,12 @@ impl Inner {
                     // the next channel may get this one's stream id: open it only once this one is closed, or the
                     // stream's reset can land on the new channel and close it before it opens
                     let closed = async {
-                        while !matches!(
-                            channel.ready_state().await,
-                            Ok(RTCDataChannelState::Closed) | Err(_)
-                        ) {
+                        while !matches!(channel.ready_state().await, Ok(RTCDataChannelState::Closed) | Err(_)) {
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                     };
                     let _ = tokio::time::timeout(Duration::from_secs(2), closed).await;
-                    Err(failed
-                        .unwrap_or_else(|_| Err(anyhow!("{key}: opening timed out")))
-                        .unwrap_err())
+                    Err(failed.unwrap_or_else(|_| Err(anyhow!("{key}: opening timed out"))).unwrap_err())
                 }
             }
         };
@@ -899,126 +766,54 @@ impl Client {
     /// Signals like the browser (non-trickle `POST <url>/offer`), opens `control` (and the heartbeat
     /// channel), fetches the encodings and takes a few clock samples before returning.
     pub async fn connect(url: &str, options: ClientOptions) -> Result<Client> {
-        let signalling = Signalling::Http {
-            url: url.trim_end_matches('/').to_owned(),
-            http: reqwest::Client::new(),
-        };
+        let signalling = Signalling::Http { url: url.trim_end_matches('/').to_owned(), http: reqwest::Client::new() };
         Self::connect_with(signalling, options).await
     }
 
     /// [`connect`](Self::connect), signalling over zenoh instead of HTTP: queries `zenoh-gateway/<name>/offer` (and `/ice`)
     /// through `session`, which must reach a server built with `ServerBuilder::zenoh_signalling(name)` (e.g. a robot
     /// whose zenoh dialled out to this side). The media then flows over WebRTC as usual (SPEC "Signalling over zenoh").
-    pub async fn connect_zenoh(
-        session: &zenoh::Session,
-        name: &str,
-        options: ClientOptions,
-    ) -> Result<Client> {
-        Self::connect_with(
-            Signalling::Zenoh {
-                session: session.clone(),
-                name: name.to_owned(),
-            },
-            options,
-        )
-        .await
+    pub async fn connect_zenoh(session: &zenoh::Session, name: &str, options: ClientOptions) -> Result<Client> {
+        Self::connect_with(Signalling::Zenoh { session: session.clone(), name: name.to_owned() }, options).await
     }
 
     async fn connect_with(signalling: Signalling, options: ClientOptions) -> Result<Client> {
         let (state, _) = watch::channel(ConnectionState::Connecting);
-        let shared = Arc::new(Shared {
-            requests: Mutex::default(),
-            endpoints: Mutex::default(),
-            clock: Mutex::default(),
-            state,
-            gathered: Notify::new(),
-            media: Mutex::default(),
-            leases: Mutex::default(),
-            pending_leases: Mutex::default(),
-            api_routes: Mutex::default(),
-            api_early: Mutex::default(),
-        });
+        let shared = Arc::new(Shared { requests: Mutex::default(), endpoints: Mutex::default(), clock: Mutex::default(), state, gathered: Notify::new(), media: Mutex::default(), leases: Mutex::default(), pending_leases: Mutex::default(), api_routes: Mutex::default(), api_early: Mutex::default() });
         let (ice_servers, server_relay_only) = match &options.ice_servers {
             Some(servers) => (servers.clone(), false),
             None => signalling.ice_servers(options.token.as_deref()).await?,
         };
-        let ice_servers = ice_servers
-            .into_iter()
-            .map(|server| RTCIceServer {
-                urls: server.urls,
-                username: server.username,
-                credential: server.credential,
-            })
-            .collect();
-        let policy = if options.relay_only || server_relay_only {
-            RTCIceTransportPolicy::Relay
-        } else {
-            RTCIceTransportPolicy::All
-        };
-        let (media_engine, interceptors, _) =
-            media::media_setup(crate::allocator::DEFAULT_INITIAL_BANDWIDTH)?;
+        let ice_servers = ice_servers.into_iter().map(|server| RTCIceServer { urls: server.urls, username: server.username, credential: server.credential }).collect();
+        let policy = if options.relay_only || server_relay_only { RTCIceTransportPolicy::Relay } else { RTCIceTransportPolicy::All };
+        let (media_engine, interceptors, _) = media::media_setup(crate::allocator::DEFAULT_INITIAL_BANDWIDTH)?;
         let connection: Arc<dyn PeerConnection> = Arc::new(
             PeerConnectionBuilder::new()
-                .with_configuration(
-                    RTCConfigurationBuilder::new()
-                        .with_ice_servers(ice_servers)
-                        .with_ice_transport_policy(policy)
-                        .build(),
-                )
-                .with_setting_engine(
-                    SettingEngineBuilder::new()
-                        .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_MESSAGE_SIZE))
-                        .build(),
-                )
+                .with_configuration(RTCConfigurationBuilder::new().with_ice_servers(ice_servers).with_ice_transport_policy(policy).build())
+                .with_setting_engine(SettingEngineBuilder::new().with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_MESSAGE_SIZE)).build())
                 .with_media_engine(media_engine)
                 .with_interceptor_registry(interceptors)
-                .with_handler(Arc::new(Handler {
-                    shared: shared.clone(),
-                }))
+                .with_handler(Arc::new(Handler { shared: shared.clone() }))
                 .with_udp_addrs(vec!["0.0.0.0:0".to_owned(), "127.0.0.1:0".to_owned()])
                 .build()
                 .await?,
         );
         let connected = async {
-            let control = connection
-                .create_data_channel("control", Some(channel_init(Delivery::Reliable, None)))
-                .await?;
+            let control = connection.create_data_channel("control", Some(channel_init(Delivery::Reliable, None))).await?;
             let (control_open_tx, control_open_rx) = oneshot::channel();
-            tokio::spawn(run_control(
-                control.clone(),
-                shared.clone(),
-                control_open_tx,
-            ));
+            tokio::spawn(run_control(control.clone(), shared.clone(), control_open_tx));
             let heartbeat_paused = Arc::new(AtomicBool::new(false));
             if options.heartbeat_hz > 0.0 {
                 let label = json!({"type": "heartbeat", "opts": {"hz": options.heartbeat_hz, "misses": options.heartbeat_misses}});
-                let channel = connection
-                    .create_data_channel(
-                        &label.to_string(),
-                        Some(channel_init(Delivery::Latest, None)),
-                    )
-                    .await?;
-                tokio::spawn(run_heartbeat(
-                    channel,
-                    shared.clone(),
-                    heartbeat_paused.clone(),
-                    options.heartbeat_hz,
-                ));
+                let channel = connection.create_data_channel(&label.to_string(), Some(channel_init(Delivery::Latest, None))).await?;
+                tokio::spawn(run_heartbeat(channel, shared.clone(), heartbeat_paused.clone(), options.heartbeat_hz));
             }
             let offer = connection.create_offer(None).await?;
             connection.set_local_description(offer).await?;
             let _ = tokio::time::timeout(GATHER_TIMEOUT, shared.gathered.notified()).await;
-            let offer = connection
-                .local_description()
-                .await
-                .context("no local description")?;
-            connection
-                .set_remote_description(signalling.offer(options.token.as_deref(), &offer).await?)
-                .await?;
-            tokio::time::timeout(OPEN_TIMEOUT, control_open_rx)
-                .await
-                .map_err(|_| anyhow!("control channel open timed out"))?
-                .map_err(|_| anyhow!("control channel closed before opening"))?;
+            let offer = connection.local_description().await.context("no local description")?;
+            connection.set_remote_description(signalling.offer(options.token.as_deref(), &offer).await?).await?;
+            tokio::time::timeout(OPEN_TIMEOUT, control_open_rx).await.map_err(|_| anyhow!("control channel open timed out"))?.map_err(|_| anyhow!("control channel closed before opening"))?;
             let mut inner = Inner {
                 connection: connection.clone(),
                 control,
@@ -1030,12 +825,7 @@ impl Client {
                 free_slots: Mutex::default(),
                 heartbeat_paused,
             };
-            inner.encodings = serde_json::from_value(
-                inner
-                    .request(json!({"op": "encodings"}), PING_TIMEOUT)
-                    .await?["encodings"]
-                    .take(),
-            )?;
+            inner.encodings = serde_json::from_value(inner.request(json!({"op": "encodings"}), PING_TIMEOUT).await?["encodings"].take())?;
             // the gateway needs a clock offset before the first put
             for _ in 0..INITIAL_CLOCK_PINGS {
                 inner.ping().await?;
@@ -1066,13 +856,7 @@ impl Client {
 
     /// Resolves once the connection is [`ConnectionState::Lost`] (reconnecting is the caller's job).
     pub async fn closed(&self) {
-        let _ = self
-            .inner
-            .shared
-            .state
-            .subscribe()
-            .wait_for(|state| *state == ConnectionState::Lost)
-            .await;
+        let _ = self.inner.shared.state.subscribe().wait_for(|state| *state == ConnectionState::Lost).await;
     }
 
     /// Gateway clock minus this client's (unix ms), from the lowest-RTT recent sample.
@@ -1089,33 +873,18 @@ impl Client {
     /// publishers that put meanwhile, 0 lists liveliness tokens only.
     pub async fn list_topics(&self, filter: &str, probe_ms: Option<u64>) -> Result<Vec<Topic>> {
         let probe_ms = probe_ms.unwrap_or(600);
-        let mut reply = self
-            .inner
-            .request(
-                json!({"op": "listTopics", "key": filter, "probeMs": probe_ms}),
-                Duration::from_millis(probe_ms + 5000),
-            )
-            .await?;
+        let mut reply = self.inner.request(json!({"op": "listTopics", "key": filter, "probeMs": probe_ms}), Duration::from_millis(probe_ms + 5000)).await?;
         Ok(serde_json::from_value(reply["topics"].take())?)
     }
 
     /// A zenoh query through the gateway (see [`Client::get_with`] for options).
     pub async fn get(&self, key: &str, timeout: Duration) -> Result<Vec<GetReply>> {
-        self.get_with(
-            key,
-            GetOptions {
-                timeout: Some(timeout),
-                ..Default::default()
-            },
-        )
-        .await
+        self.get_with(key, GetOptions { timeout: Some(timeout), ..Default::default() }).await
     }
 
     /// The gateway's stats for this connection (`channels`, `clock`, `heartbeat`, `bandwidth`; SPEC "Bandwidth allocation").
     pub async fn stats(&self) -> Result<Value> {
-        self.inner
-            .request(json!({"op": "stats"}), PING_TIMEOUT)
-            .await
+        self.inner.request(json!({"op": "stats"}), PING_TIMEOUT).await
     }
 
     /// Stops (or resumes) sending heartbeats, so the gateway fires this client's deadmen; for testing deadman wiring.
@@ -1127,13 +896,7 @@ impl Client {
     /// refusing). Video and audio channels first renegotiate a track (or reuse a closed subscription's).
     pub async fn subscribe(&self, key: &str, options: SubscribeOptions) -> Result<Subscription> {
         let inner = &self.inner;
-        let output = options.encoding.as_ref().map(|name| {
-            inner
-                .encodings
-                .iter()
-                .find(|info| &info.name == name)
-                .map_or("data", |info| info.output.as_str())
-        });
+        let output = options.encoding.as_ref().map(|name| inner.encodings.iter().find(|info| &info.name == name).map_or("data", |info| info.output.as_str()));
         let channel = options.channel.clone().unwrap_or_else(|| match output {
             Some("video") => "video-h264".to_owned(),
             Some("audio") => "audio-opus".to_owned(),
@@ -1146,14 +909,7 @@ impl Client {
         } else {
             None
         };
-        let kind = media_kind.map(|kind| {
-            if kind == RtpCodecKind::Video {
-                "video"
-            } else {
-                "audio"
-            }
-            .to_owned()
-        });
+        let kind = media_kind.map(|kind| if kind == RtpCodecKind::Video { "video" } else { "audio" }.to_owned());
         // a reused track can still be held by the gateway for a moment after its last subscription closed
         for reuse in [true, false] {
             let slot = match media_kind {
@@ -1161,9 +917,7 @@ impl Client {
                 None => None,
             };
             match self.subscribe_on(key, &options, kind.clone(), slot).await {
-                Err(error)
-                    if reuse && media_kind.is_some() && error.to_string().contains("in use") =>
-                {
+                Err(error) if reuse && media_kind.is_some() && error.to_string().contains("in use") => {
                     continue;
                 }
                 result => return result,
@@ -1172,13 +926,7 @@ impl Client {
         unreachable!("the second attempt returns")
     }
 
-    async fn subscribe_on(
-        &self,
-        key: &str,
-        options: &SubscribeOptions,
-        kind: Option<String>,
-        slot: Option<Arc<MediaSlot>>,
-    ) -> Result<Subscription> {
+    async fn subscribe_on(&self, key: &str, options: &SubscribeOptions, kind: Option<String>, slot: Option<Arc<MediaSlot>>) -> Result<Subscription> {
         let inner = &self.inner;
         let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
         let mut label = json!({"type": "sub", "key": key, "id": id, "opts": options_json(options)});
@@ -1190,30 +938,9 @@ impl Client {
             *slot.sink.lock() = Some(packets_tx);
             packets = Some(packets_rx);
         }
-        let task = SubscriptionTask {
-            kind,
-            slot: slot.clone(),
-            messages: messages_tx,
-            packets,
-            client: Arc::downgrade(inner),
-        };
-        match inner
-            .open_endpoint(
-                label,
-                channel_init(options.delivery.unwrap_or_default(), options.max_age),
-                None,
-                |channel, opened| task.run(channel, opened),
-            )
-            .await
-        {
-            Ok(channel) => Ok(Subscription {
-                key: key.to_owned(),
-                id,
-                messages,
-                channel,
-                slot,
-                client: Arc::downgrade(inner),
-            }),
+        let task = SubscriptionTask { kind, slot: slot.clone(), messages: messages_tx, packets, client: Arc::downgrade(inner) };
+        match inner.open_endpoint(label, channel_init(options.delivery.unwrap_or_default(), options.max_age), None, |channel, opened| task.run(channel, opened)).await {
+            Ok(channel) => Ok(Subscription { key: key.to_owned(), id, messages, channel, slot, client: Arc::downgrade(inner) }),
             // the channel's task frees the slot when it ends
             Err(error) => Err(error),
         }
@@ -1224,85 +951,34 @@ impl Client {
         let inner = &self.inner;
         let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
         let delivery = options.delivery.unwrap_or_default();
-        let state = Arc::new(PubState {
-            tripped: Ending::new(),
-            deadman_armed: AtomicBool::new(false),
-            last: Mutex::new(None),
-            blocked: Mutex::new(None),
-        });
+        let state = Arc::new(PubState { tripped: Ending::new(), deadman_armed: AtomicBool::new(false), last: Mutex::new(None), blocked: Mutex::new(None) });
         let task_state = state.clone();
         let label = json!({"type": "pub", "key": key, "id": id, "opts": options_json(&options)});
-        let channel = inner
-            .open_endpoint(
-                label,
-                channel_init(delivery, None),
-                Some(state.clone()),
-                |channel, opened| run_publisher_channel(channel, opened, task_state),
-            )
-            .await?;
-        let repeat = options.repeat_ms.map(|ms| {
-            tokio::spawn(repeat_puts(
-                channel.clone(),
-                state.clone(),
-                delivery,
-                Duration::from_millis(ms.max(1)),
-            ))
-        });
-        Ok(Publisher {
-            key: key.to_owned(),
-            id,
-            channel,
-            state,
-            delivery,
-            repeat,
-            client: Arc::downgrade(inner),
-        })
+        let channel = inner.open_endpoint(label, channel_init(delivery, None), Some(state.clone()), |channel, opened| run_publisher_channel(channel, opened, task_state)).await?;
+        let repeat = options.repeat_ms.map(|ms| tokio::spawn(repeat_puts(channel.clone(), state.clone(), delivery, Duration::from_millis(ms.max(1)))));
+        Ok(Publisher { key: key.to_owned(), id, channel, state, delivery, repeat, client: Arc::downgrade(inner) })
     }
 
     /// Takes (or renews) the exclusive right to publish on `group`'s keys among the gateway's clients: the
     /// server's group, or `keys` for one it doesn't define (SPEC "Leases"). Needs a heartbeat; it ends
     /// when the heartbeat stops, at `max_seconds`, on disconnect, on [`Lease::release`] or by force-expiry.
-    pub async fn lease(
-        &self,
-        group: &str,
-        keys: Option<Vec<String>>,
-        max_seconds: Option<f64>,
-    ) -> Result<Lease> {
-        self.lease_with(LeaseOptions {
-            group: Some(group.to_owned()),
-            publish: keys.unwrap_or_default(),
-            max_seconds,
-            ..Default::default()
-        })
-        .await
+    pub async fn lease(&self, group: &str, keys: Option<Vec<String>>, max_seconds: Option<f64>) -> Result<Lease> {
+        self.lease_with(LeaseOptions { group: Some(group.to_owned()), publish: keys.unwrap_or_default(), max_seconds, ..Default::default() }).await
     }
 
     /// Takes a lease on keys to publish and keys to subscribe to (SPEC "Leases"): while held, the gateway drops other
     /// clients' puts on `publish` and ends their subscriptions to `subscribe`.
     pub async fn lease_with(&self, options: LeaseOptions) -> Result<Lease> {
-        ensure!(
-            self.inner.options.heartbeat_hz > 0.0,
-            "a lease needs a heartbeat (ClientOptions::heartbeat_hz)"
-        );
-        let (id, ending) = (
-            self.inner.next_id.fetch_add(1, Ordering::Relaxed),
-            Arc::new(Ending::new()),
-        );
+        ensure!(self.inner.options.heartbeat_hz > 0.0, "a lease needs a heartbeat (ClientOptions::heartbeat_hz)");
+        let (id, ending) = (self.inner.next_id.fetch_add(1, Ordering::Relaxed), Arc::new(Ending::new()));
         // registered by the control reader as it reads the reply (renewing a lease held before)
-        self.inner.shared.pending_leases.lock().insert(
-            id,
-            (options.group.clone().unwrap_or_default(), ending.clone()),
-        );
+        self.inner.shared.pending_leases.lock().insert(id, (options.group.clone().unwrap_or_default(), ending.clone()));
         let request = json!({"op": "lease", "group": options.group, "publish": options.publish, "subscribe": options.subscribe, "allowTakeover": options.allow_takeover, "maxSeconds": options.max_seconds, "timeoutMs": options.timeout_ms});
         let reply = self.inner.request_as(id, request, PING_TIMEOUT).await;
         self.inner.shared.pending_leases.lock().remove(&id);
         let reply = reply?;
         Ok(Lease {
-            group: reply["group"]
-                .as_str()
-                .map(str::to_owned)
-                .or(options.group)
-                .unwrap_or_default(),
+            group: reply["group"].as_str().map(str::to_owned).or(options.group).unwrap_or_default(),
             keys: serde_json::from_value(reply["keys"].clone())?,
             subscribe: serde_json::from_value(reply["subscribe"].clone()).unwrap_or_default(),
             timeout_ms: reply["timeoutMs"].as_f64(),
@@ -1314,10 +990,7 @@ impl Client {
 
     /// Ends another client's lease on `group` (needs the grant's force-expire right).
     pub async fn expire_lease(&self, group: &str) -> Result<()> {
-        self.inner
-            .request(json!({"op": "expireLease", "group": group}), PING_TIMEOUT)
-            .await
-            .map(drop)
+        self.inner.request(json!({"op": "expireLease", "group": group}), PING_TIMEOUT).await.map(drop)
     }
 
     /// Closes the connection: the gateway fires this client's armed deadmen ("disconnected").
@@ -1339,38 +1012,21 @@ fn options_json(options: &impl Serialize) -> Value {
 /// Delivery → data channel reliability (SPEC "Delivery → transport mapping").
 fn channel_init(delivery: Delivery, max_age_ms: Option<f64>) -> RTCDataChannelInit {
     match (delivery, max_age_ms) {
-        (Delivery::Reliable, _) => RTCDataChannelInit {
-            ordered: true,
-            ..Default::default()
-        },
-        (Delivery::Latest, Some(age)) => RTCDataChannelInit {
-            ordered: false,
-            max_packet_life_time: Some(age.round().clamp(1.0, 65535.0) as u16),
-            ..Default::default()
-        },
+        (Delivery::Reliable, _) => RTCDataChannelInit { ordered: true, ..Default::default() },
+        (Delivery::Latest, Some(age)) => RTCDataChannelInit { ordered: false, max_packet_life_time: Some(age.round().clamp(1.0, 65535.0) as u16), ..Default::default() },
         // as the JS client: a lost chunk is retransmitted for 1 s rather than losing its whole message
-        (Delivery::Latest, None) => RTCDataChannelInit {
-            ordered: false,
-            max_packet_life_time: Some(1000),
-            ..Default::default()
-        },
+        (Delivery::Latest, None) => RTCDataChannelInit { ordered: false, max_packet_life_time: Some(1000), ..Default::default() },
     }
 }
 
-async fn run_control(
-    channel: Arc<dyn DataChannel>,
-    shared: Arc<Shared>,
-    opened: oneshot::Sender<()>,
-) {
+async fn run_control(channel: Arc<dyn DataChannel>, shared: Arc<Shared>, opened: oneshot::Sender<()>) {
     let mut opened = Some(opened);
     while let Some(event) = channel.poll().await {
         match event {
             DataChannelEvent::OnOpen => {
                 let _ = opened.take().map(|opened| opened.send(()));
             }
-            DataChannelEvent::OnMessage(message) => {
-                shared.on_control_message(&String::from_utf8_lossy(&message.data))
-            }
+            DataChannelEvent::OnMessage(message) => shared.on_control_message(&String::from_utf8_lossy(&message.data)),
             DataChannelEvent::OnClose => break,
             _ => {}
         }
@@ -1380,12 +1036,7 @@ async fn run_control(
 }
 
 /// Beats `{t0, offsetMs, rttMs}`; each `{t0, t1, t2}` reply is a clock sample.
-async fn run_heartbeat(
-    channel: Arc<dyn DataChannel>,
-    shared: Arc<Shared>,
-    paused: Arc<AtomicBool>,
-    hz: f64,
-) {
+async fn run_heartbeat(channel: Arc<dyn DataChannel>, shared: Arc<Shared>, paused: Arc<AtomicBool>, hz: f64) {
     let mut ticker = tokio::time::interval(crate::secs(1.0 / hz).max(Duration::from_millis(1)));
     loop {
         tokio::select! {
@@ -1422,23 +1073,15 @@ async fn run_pinger(inner: Weak<Inner>) {
         let state = *inner.shared.state.borrow();
         match (state, inner.ping().await) {
             (ConnectionState::Lost, _) => break,
-            (ConnectionState::Degraded, Ok(())) => {
-                inner.shared.set_state(ConnectionState::Connected)
-            }
-            (ConnectionState::Connected, Err(_)) => {
-                inner.shared.set_state(ConnectionState::Degraded)
-            }
+            (ConnectionState::Degraded, Ok(())) => inner.shared.set_state(ConnectionState::Connected),
+            (ConnectionState::Connected, Err(_)) => inner.shared.set_state(ConnectionState::Degraded),
             _ => {}
         }
     }
 }
 
 /// A publisher's channel: its open, `{"blocked": reason | null}` from the gateway, its close.
-async fn run_publisher_channel(
-    channel: Arc<dyn DataChannel>,
-    opened: oneshot::Sender<()>,
-    state: Arc<PubState>,
-) {
+async fn run_publisher_channel(channel: Arc<dyn DataChannel>, opened: oneshot::Sender<()>, state: Arc<PubState>) {
     let mut opened = Some(opened);
     while let Some(event) = channel.poll().await {
         match event {
@@ -1482,11 +1125,7 @@ impl Subscription {
     /// Video codecs: asks the gateway for a keyframe (an RTCP PLI on the track, as a browser sends
     /// after loss; the client also sends one itself when it drops a frame). Fails before any video arrived.
     pub async fn request_keyframe(&self) -> Result<()> {
-        self.slot
-            .as_ref()
-            .context("not a video subscription")?
-            .request_keyframe()
-            .await
+        self.slot.as_ref().context("not a video subscription")?.request_keyframe().await
     }
 
     /// Changes the running subscription's options in place (same channel and track): any of maxHz, minQuality,
@@ -1494,12 +1133,7 @@ impl Subscription {
     /// keyframeIntervalMs, sceneChangeKeyframes, targetQp, maxQp, playoutDelay and encodeOptions.quality, as JSON (`null` puts one back to its default). Returns the options now in force.
     pub async fn update(&self, changes: Value) -> Result<Value> {
         let inner = self.client.upgrade().context("the client closed")?;
-        let mut reply = inner
-            .request(
-                json!({"op": "updateSubscription", "subId": self.id, "opts": changes}),
-                PING_TIMEOUT,
-            )
-            .await?;
+        let mut reply = inner.request(json!({"op": "updateSubscription", "subId": self.id, "opts": changes}), PING_TIMEOUT).await?;
         Ok(reply["opts"].take())
     }
 }
@@ -1507,10 +1141,7 @@ impl Subscription {
 impl futures::Stream for Subscription {
     type Item = Message;
 
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Message>> {
+    fn poll_next(self: std::pin::Pin<&mut Self>, context: &mut std::task::Context<'_>) -> std::task::Poll<Option<Message>> {
         self.get_mut().messages.poll_recv(context)
     }
 }
@@ -1562,13 +1193,8 @@ impl SubscriptionTask {
     async fn run(mut self, channel: Arc<dyn DataChannel>, opened: oneshot::Sender<()>) {
         let mut opened = Some(opened);
         let mut partials = BTreeMap::new();
-        let mut assembler = Assembler {
-            units: VecDeque::new(),
-            waiting_for_keyframe: true,
-            last_pli: Instant::now(),
-        };
-        let (mut consumed, mut unacked_bytes, mut ack_at) =
-            (0u32, 0usize, None::<tokio::time::Instant>);
+        let mut assembler = Assembler { units: VecDeque::new(), waiting_for_keyframe: true, last_pli: Instant::now() };
+        let (mut consumed, mut unacked_bytes, mut ack_at) = (0u32, 0usize, None::<tokio::time::Instant>);
         loop {
             let event = tokio::select! {
                 event = channel.poll() => match event {
@@ -1590,9 +1216,7 @@ impl SubscriptionTask {
                 Event::Ack => {
                     ack_at = None;
                     unacked_bytes = 0;
-                    let _ = channel
-                        .send(BytesMut::from(&consumed.to_le_bytes()[..]))
-                        .await;
+                    let _ = channel.send(BytesMut::from(&consumed.to_le_bytes()[..])).await;
                     None
                 }
                 Event::Frame(data) => {
@@ -1633,10 +1257,7 @@ impl SubscriptionTask {
     async fn on_packet(&self, packet: Packet, assembler: &mut Assembler) -> Option<Message> {
         let mime = media::format_of_payload_type(packet.header.payload_type)?;
         let Some(format) = video_format(mime) else {
-            return Some(Message::Audio(AudioPacket {
-                rtp_timestamp: packet.header.timestamp,
-                data: packet.payload.to_vec(),
-            }));
+            return Some(Message::Audio(AudioPacket { rtp_timestamp: packet.header.timestamp, data: packet.payload.to_vec() }));
         };
         let frame = assembler.push(packet, format);
         if assembler.waiting_for_keyframe
@@ -1663,27 +1284,12 @@ async fn next_packet(packets: &mut Option<mpsc::Receiver<Packet>>) -> Option<Pac
 
 /// A whole message (key, timestamp, flags, bytes) once all its chunks are here; incomplete older
 /// ones are dropped when a newer one completes or more than `MAX_PARTIALS` wait.
-fn reassemble(
-    partials: &mut BTreeMap<u32, Partial>,
-    header: &frame::FrameHeader<'_>,
-    chunk: &[u8],
-) -> Option<(String, f64, u8, Vec<u8>)> {
+fn reassemble(partials: &mut BTreeMap<u32, Partial>, header: &frame::FrameHeader<'_>, chunk: &[u8]) -> Option<(String, f64, u8, Vec<u8>)> {
     if header.chunk_count <= 1 {
-        return Some((
-            header.key.to_owned(),
-            header.timestamp_ms,
-            header.flags,
-            chunk.to_vec(),
-        ));
+        return Some((header.key.to_owned(), header.timestamp_ms, header.flags, chunk.to_vec()));
     }
     let count = header.chunk_count as usize;
-    let partial = partials.entry(header.seq).or_insert_with(|| Partial {
-        key: header.key.to_owned(),
-        timestamp_ms: header.timestamp_ms,
-        flags: header.flags,
-        chunks: vec![None; count],
-        received: 0,
-    });
+    let partial = partials.entry(header.seq).or_insert_with(|| Partial { key: header.key.to_owned(), timestamp_ms: header.timestamp_ms, flags: header.flags, chunks: vec![None; count], received: 0 });
     if let Some(slot @ None) = partial.chunks.get_mut(header.chunk_index as usize) {
         *slot = Some(chunk.to_vec());
         partial.received += 1;
@@ -1696,50 +1302,22 @@ fn reassemble(
     }
     let partial = partials.remove(&header.seq)?;
     partials.retain(|seq, _| *seq > header.seq);
-    Some((
-        partial.key,
-        partial.timestamp_ms,
-        partial.flags,
-        partial.chunks.into_iter().flatten().flatten().collect(),
-    ))
+    Some((partial.key, partial.timestamp_ms, partial.flags, partial.chunks.into_iter().flatten().flatten().collect()))
 }
 
 /// A whole data-channel message as what the subscription's channel makes of it (fields when the frame says so).
-fn to_message(
-    kind: Option<&str>,
-    key: String,
-    timestamp_ms: f64,
-    seq: u32,
-    flags: u8,
-    bytes: Vec<u8>,
-) -> Result<Option<Message>> {
+fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flags: u8, bytes: Vec<u8>) -> Result<Option<Message>> {
     let (header, sample, bytes) = match flags & frame::HEADER != 0 {
-        true => frame::split_header(&bytes)
-            .map(|(header, sample, rest)| (Some(header), sample, rest.to_vec()))
-            .context("bad message header")?,
+        true => frame::split_header(&bytes).map(|(header, sample, rest)| (Some(header), sample, rest.to_vec())).context("bad message header")?,
         false => (None, None, bytes),
     };
-    let bytes = if flags & frame::ZSTD != 0 {
-        zstd::decode_all(&bytes[..])?
-    } else {
-        bytes
-    };
+    let bytes = if flags & frame::ZSTD != 0 { zstd::decode_all(&bytes[..])? } else { bytes };
     Ok(match kind {
         Some("video") => {
-            ensure!(
-                bytes.len() >= media::METADATA_LEN_V1 && bytes[0] == 1,
-                "not a video metadata frame"
-            );
+            ensure!(bytes.len() >= media::METADATA_LEN_V1 && bytes[0] == 1, "not a video metadata frame");
             let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
             let float = |at: usize| f64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
-            let (header, sample) = match (bytes[1] & media::METADATA_FLAG_HEADER != 0)
-                .then(|| {
-                    bytes
-                        .get(media::METADATA_LEN..)
-                        .and_then(frame::decode_header)
-                })
-                .flatten()
-            {
+            let (header, sample) = match (bytes[1] & media::METADATA_FLAG_HEADER != 0).then(|| bytes.get(media::METADATA_LEN..).and_then(frame::decode_header)).flatten() {
                 Some((header, sample)) => (Some(header), sample),
                 None => (None, None),
             };
@@ -1757,9 +1335,7 @@ fn to_message(
                 encoded_bytes: word(24),
                 media_time_ms: (bytes.len() >= media::METADATA_LEN_V2).then(|| float(28)),
                 written_ms: (bytes.len() >= media::METADATA_LEN_V2).then(|| float(36)),
-                rtp_timestamp: (bytes.len() >= media::METADATA_LEN
-                    && bytes[1] & media::METADATA_FLAG_RTP != 0)
-                    .then(|| word(44)),
+                rtp_timestamp: (bytes.len() >= media::METADATA_LEN && bytes[1] & media::METADATA_FLAG_RTP != 0).then(|| word(44)),
                 received_ms: (bytes.len() >= media::METADATA_LEN).then(|| float(48)),
                 encoded_ms: (bytes.len() >= media::METADATA_LEN).then(|| float(56)),
                 stamp: header.as_ref().map(|header| header.stamp()),
@@ -1774,48 +1350,21 @@ fn to_message(
         _ => {
             let delete = flags & frame::DELETE != 0;
             let (encoding, attachment, bytes) = if flags & frame::META != 0 {
-                let (encoding, attachment, payload) =
-                    frame::decode_meta(&bytes).context("bad META header")?;
-                (
-                    Some(encoding.to_owned()),
-                    (!attachment.is_empty()).then(|| attachment.to_vec()),
-                    payload.to_vec(),
-                )
+                let (encoding, attachment, payload) = frame::decode_meta(&bytes).context("bad META header")?;
+                (Some(encoding.to_owned()), (!attachment.is_empty()).then(|| attachment.to_vec()), payload.to_vec())
             } else {
                 // an encoded message's came in its header
                 let (encoding, attachment) = sample.unzip();
                 (encoding, attachment.flatten(), bytes)
             };
-            let fields = if flags & frame::FIELDS != 0 && !delete {
-                Some(fields::parse(&bytes)?)
-            } else {
-                None
-            };
-            Some(Message::Data(DataMessage {
-                key,
-                bytes,
-                timestamp_ms,
-                seq,
-                fields,
-                delete,
-                encoding,
-                attachment,
-                header,
-            }))
+            let fields = if flags & frame::FIELDS != 0 && !delete { Some(fields::parse(&bytes)?) } else { None };
+            Some(Message::Data(DataMessage { key, bytes, timestamp_ms, seq, fields, delete, encoding, attachment, header }))
         }
     })
 }
 
 fn video_format(mime: &str) -> Option<VideoFormat> {
-    [
-        VideoFormat::H264,
-        VideoFormat::Vp8,
-        VideoFormat::Vp9,
-        VideoFormat::Av1,
-        VideoFormat::H265,
-    ]
-    .into_iter()
-    .find(|format| format.mime_type() == mime)
+    [VideoFormat::H264, VideoFormat::Vp8, VideoFormat::Vp9, VideoFormat::Av1, VideoFormat::H265].into_iter().find(|format| format.mime_type() == mime)
 }
 
 /// Annex-B start code, which [`H265Depacketizer`] puts in front of every NAL unit it rebuilds.
@@ -1938,32 +1487,18 @@ impl Assembler {
         self.units.drain(..=index);
         let keyframe = is_keyframe(format, &data);
         self.waiting_for_keyframe &= !keyframe;
-        (!self.waiting_for_keyframe).then(|| VideoFrame {
-            format,
-            data,
-            keyframe,
-            rtp_timestamp: timestamp,
-            received_at: Instant::now(),
-        })
+        (!self.waiting_for_keyframe).then(|| VideoFrame { format, data, keyframe, rtp_timestamp: timestamp, received_at: Instant::now() })
     }
 }
 
 /// The unit's frame once every packet from its first to its marker is here.
 fn complete(packets: &mut Vec<Packet>, format: VideoFormat) -> Option<Vec<u8>> {
-    let last = packets
-        .iter()
-        .find(|packet| packet.header.marker)?
-        .header
-        .sequence_number;
+    let last = packets.iter().find(|packet| packet.header.marker)?.header.sequence_number;
     let behind = |packet: &Packet| last.wrapping_sub(packet.header.sequence_number) as usize;
     packets.sort_by_key(|packet| std::cmp::Reverse(behind(packet)));
     packets.dedup_by_key(|packet| packet.header.sequence_number);
     let count = packets.len();
-    if packets
-        .iter()
-        .enumerate()
-        .any(|(index, packet)| behind(packet) != count - 1 - index)
-    {
+    if packets.iter().enumerate().any(|(index, packet)| behind(packet) != count - 1 - index) {
         return None;
     }
     let mut depacketizer: Box<dyn Depacketizer + Send> = match format {
@@ -1986,18 +1521,12 @@ fn complete(packets: &mut Vec<Packet>, format: VideoFormat) -> Option<Vec<u8>> {
 /// Decodable on its own: an H.264 IDR slice, an H.265 IRAP picture, a VP8/VP9 key frame, an AV1 sequence header.
 fn is_keyframe(format: VideoFormat, data: &[u8]) -> bool {
     match format {
-        VideoFormat::H264 => data
-            .windows(4)
-            .any(|window| window[..3] == [0, 0, 1] && window[3] & 0x1f == 5),
+        VideoFormat::H264 => data.windows(4).any(|window| window[..3] == [0, 0, 1] && window[3] & 0x1f == 5),
         // an IRAP picture: BLA (16-18), IDR (19, 20) or CRA (21)
-        VideoFormat::H265 => data.windows(4).any(|window| {
-            window[..3] == [0, 0, 1] && (16..=21).contains(&h265_nal_type(window[3]))
-        }),
+        VideoFormat::H265 => data.windows(4).any(|window| window[..3] == [0, 0, 1] && (16..=21).contains(&h265_nal_type(window[3]))),
         VideoFormat::Vp8 => data.first().is_some_and(|byte| byte & 1 == 0),
         // frame marker 0b10, profile 0-2, not show_existing_frame, frame_type 0
-        VideoFormat::Vp9 => data
-            .first()
-            .is_some_and(|byte| byte >> 6 == 2 && byte & 0x30 != 0x30 && byte & 0x0c == 0),
+        VideoFormat::Vp9 => data.first().is_some_and(|byte| byte >> 6 == 2 && byte & 0x30 != 0x30 && byte & 0x0c == 0),
         VideoFormat::Av1 => {
             let mut rest = data;
             while let Some(&header) = rest.first() {
@@ -2038,32 +1567,17 @@ pub struct Publisher {
     client: Weak<Inner>,
 }
 
-async fn send_put(
-    channel: &Arc<dyn DataChannel>,
-    delivery: Delivery,
-    payload: &[u8],
-    sent_at_ms: f64,
-) -> Result<()> {
-    if delivery == Delivery::Latest
-        && channel.outstanding_bytes().await.unwrap_or_default() > BACKED_UP_BYTES
-    {
+async fn send_put(channel: &Arc<dyn DataChannel>, delivery: Delivery, payload: &[u8], sent_at_ms: f64) -> Result<()> {
+    if delivery == Delivery::Latest && channel.outstanding_bytes().await.unwrap_or_default() > BACKED_UP_BYTES {
         return Ok(());
     }
     let mut frame = BytesMut::with_capacity(8 + payload.len());
     frame.extend_from_slice(&sent_at_ms.to_le_bytes());
     frame.extend_from_slice(payload);
-    channel
-        .send(frame)
-        .await
-        .map_err(|error| anyhow!("put: {error}"))
+    channel.send(frame).await.map_err(|error| anyhow!("put: {error}"))
 }
 
-async fn repeat_puts(
-    channel: Arc<dyn DataChannel>,
-    state: Arc<PubState>,
-    delivery: Delivery,
-    every: Duration,
-) {
+async fn repeat_puts(channel: Arc<dyn DataChannel>, state: Arc<PubState>, delivery: Delivery, every: Duration) {
     let mut ticker = tokio::time::interval(every);
     loop {
         ticker.tick().await;
@@ -2087,10 +1601,7 @@ impl Publisher {
 
     fn check(&self) -> Result<()> {
         match &self.state.tripped.reason() {
-            Some(reason) => bail!(
-                "publisher {} is tripped (deadman fired: {reason}); create a new publisher",
-                self.key
-            ),
+            Some(reason) => bail!("publisher {} is tripped (deadman fired: {reason}); create a new publisher", self.key),
             None => Ok(()),
         }
     }
@@ -2113,18 +1624,10 @@ impl Publisher {
     /// stops, it disconnects, or the gateway shuts down; then this publisher is tripped.
     pub async fn set_deadman(&self, bytes: impl AsRef<[u8]>) -> Result<()> {
         let inner = self.client.upgrade().context("the client is gone")?;
-        ensure!(
-            inner.options.heartbeat_hz > 0.0,
-            "set_deadman needs a heartbeat (ClientOptions::heartbeat_hz)"
-        );
+        ensure!(inner.options.heartbeat_hz > 0.0, "set_deadman needs a heartbeat (ClientOptions::heartbeat_hz)");
         self.check()?;
         let bytes = base64::engine::general_purpose::STANDARD.encode(bytes);
-        inner
-            .request(
-                json!({"op": "setDeadman", "pubId": self.id, "bytes": bytes}),
-                PING_TIMEOUT,
-            )
-            .await?;
+        inner.request(json!({"op": "setDeadman", "pubId": self.id, "bytes": bytes}), PING_TIMEOUT).await?;
         self.state.deadman_armed.store(true, Ordering::Release);
         Ok(())
     }
@@ -2132,12 +1635,7 @@ impl Publisher {
     /// Disarms the deadman.
     pub async fn clear_deadman(&self) -> Result<()> {
         let inner = self.client.upgrade().context("the client is gone")?;
-        inner
-            .request(
-                json!({"op": "clearDeadman", "pubId": self.id}),
-                PING_TIMEOUT,
-            )
-            .await?;
+        inner.request(json!({"op": "clearDeadman", "pubId": self.id}), PING_TIMEOUT).await?;
         self.state.deadman_armed.store(false, Ordering::Release);
         Ok(())
     }
@@ -2206,33 +1704,18 @@ impl Lease {
         let inner = self.client.upgrade().context("the client is gone")?;
         {
             let mut leases = inner.shared.leases.lock();
-            if leases
-                .get(&self.group)
-                .is_some_and(|held| Arc::ptr_eq(held, &self.ending))
-            {
+            if leases.get(&self.group).is_some_and(|held| Arc::ptr_eq(held, &self.ending)) {
                 leases.remove(&self.group);
             }
         }
-        inner
-            .request(
-                json!({"op": "releaseLease", "group": self.group}),
-                PING_TIMEOUT,
-            )
-            .await
-            .map(drop)
+        inner.request(json!({"op": "releaseLease", "group": self.group}), PING_TIMEOUT).await.map(drop)
     }
 }
 
 /// How [`Client`] reaches the server's signalling: HTTP, or zenoh queryables (SPEC "Signalling over zenoh").
 enum Signalling {
-    Http {
-        url: String,
-        http: reqwest::Client,
-    },
-    Zenoh {
-        session: zenoh::Session,
-        name: String,
-    },
+    Http { url: String, http: reqwest::Client },
+    Zenoh { session: zenoh::Session, name: String },
 }
 
 impl Signalling {
@@ -2241,13 +1724,7 @@ impl Signalling {
         let mut reply = match self {
             Signalling::Http { url, http } => {
                 let request = http.get(format!("{url}{}", crate::ICE_PATH));
-                let response = refuse_unauthorized(
-                    bearer(request, token)
-                        .send()
-                        .await
-                        .context("GET /zenoh-gateway/ice")?,
-                )
-                .await?;
+                let response = refuse_unauthorized(bearer(request, token).send().await.context("GET /zenoh-gateway/ice")?).await?;
                 // a server without the route (older) has none to offer
                 if !response.status().is_success() {
                     return Ok((Vec::new(), false));
@@ -2257,60 +1734,32 @@ impl Signalling {
             Signalling::Zenoh { .. } => self.query("ice", json!({"token": token})).await?,
         };
         let relay_only = reply["iceTransportPolicy"] == "relay";
-        Ok((
-            serde_json::from_value(reply["iceServers"].take())?,
-            relay_only,
-        ))
+        Ok((serde_json::from_value(reply["iceServers"].take())?, relay_only))
     }
 
     /// Sends the offer, returns the answer.
-    async fn offer(
-        &self,
-        token: Option<&str>,
-        offer: &RTCSessionDescription,
-    ) -> Result<RTCSessionDescription> {
+    async fn offer(&self, token: Option<&str>, offer: &RTCSessionDescription) -> Result<RTCSessionDescription> {
         match self {
             Signalling::Http { url, http } => {
-                let response = refuse_unauthorized(
-                    bearer(http.post(format!("{url}/offer")).json(offer), token)
-                        .send()
-                        .await
-                        .context("POST /offer")?,
-                )
-                .await?;
+                let response = refuse_unauthorized(bearer(http.post(format!("{url}/offer")).json(offer), token).send().await.context("POST /offer")?).await?;
                 let status = response.status();
-                ensure!(
-                    status.is_success(),
-                    "gateway refused the offer: {status} {}",
-                    response.text().await.unwrap_or_default()
-                );
+                ensure!(status.is_success(), "gateway refused the offer: {status} {}", response.text().await.unwrap_or_default());
                 Ok(response.json::<RTCSessionDescription>().await?)
             }
-            Signalling::Zenoh { .. } => Ok(serde_json::from_value(
-                self.query("offer", json!({"token": token, "offer": offer}))
-                    .await?,
-            )?),
+            Signalling::Zenoh { .. } => Ok(serde_json::from_value(self.query("offer", json!({"token": token, "offer": offer})).await?)?),
         }
     }
 
     /// One query on `zenoh-gateway/<name>/<op>`: the first reply's JSON; an error reply with status 401 is a refused token.
     async fn query(&self, op: &str, body: Value) -> Result<Value> {
-        let Signalling::Zenoh { session, name } = self else {
-            unreachable!("zenoh signalling only")
-        };
+        let Signalling::Zenoh { session, name } = self else { unreachable!("zenoh signalling only") };
         let key = format!("{}/{name}/{op}", crate::SIGNALLING_PREFIX);
-        let replies = session
-            .get(&key)
-            .payload(body.to_string())
-            .timeout(OPEN_TIMEOUT)
-            .await
-            .map_err(|error| anyhow!("querying {key}: {error}"))?;
+        let replies = session.get(&key).payload(body.to_string()).timeout(OPEN_TIMEOUT).await.map_err(|error| anyhow!("querying {key}: {error}"))?;
         let reply = replies.recv_async().await.map_err(|_| anyhow!("no zenoh-gateway server answered on {key} (is it built with zenoh_signalling({name:?}) and reachable over zenoh?)"))?;
         match reply.result() {
             Ok(sample) => Ok(serde_json::from_slice(&sample.payload().to_bytes())?),
             Err(error) => {
-                let error: Value =
-                    serde_json::from_slice(&error.payload().to_bytes()).unwrap_or_default();
+                let error: Value = serde_json::from_slice(&error.payload().to_bytes()).unwrap_or_default();
                 let reason = error["error"].as_str().unwrap_or("error");
                 if error["status"] == 401 {
                     bail!("gateway refused the token: {reason}");
@@ -2331,10 +1780,7 @@ fn bearer(request: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::Req
 /// A 401 is final: the token is refused (or was revoked).
 async fn refuse_unauthorized(response: reqwest::Response) -> Result<reqwest::Response> {
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        bail!(
-            "gateway refused the token: {}",
-            response.text().await.unwrap_or_default()
-        );
+        bail!("gateway refused the token: {}", response.text().await.unwrap_or_default());
     }
     Ok(response)
 }

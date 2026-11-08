@@ -3,25 +3,23 @@
 use crate::allocator::{self, LinkModel};
 use crate::api;
 use crate::auth::{Grant, Leases};
-use crate::encoding::Channel;
-use crate::encoding::registry::{EncodingRegistry, Resolved};
 use crate::ice::{self, IceServer};
-use crate::media::{self, MediaTrack, TrackClaim};
+use crate::encoding::registry::{EncodingRegistry, Resolved};
+use crate::encoding::Channel;
 use crate::options::{HeartbeatOpts, Label, PubOpts, SubOpts};
 use crate::pacing::SendGate;
 use crate::publisher::{self, PubShared};
 use crate::subscription::{self, SubShared, now_unix_ms};
+use crate::media::{self, MediaTrack, TrackClaim};
 use base64::Engine;
 use log::{debug, info, warn};
-use parking_lot::Mutex;
-use rtc::peer_connection::configuration::RTCIceServer;
-use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
@@ -29,6 +27,8 @@ use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
     RTCIceGatheringState, RTCPeerConnectionState, RTCSessionDescription, SettingEngineBuilder,
 };
+use rtc::peer_connection::configuration::RTCIceServer;
+use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
 use zenoh::qos::{CongestionControl, Priority, Reliability};
 
 /// Largest message we accept from (and advertise to) the browser; Chrome sends 256 KiB too.
@@ -292,10 +292,7 @@ impl PeerState {
             video_received: AtomicU64::new(0),
             video_brake: Mutex::new(None),
             video_delivery: Mutex::new(Default::default()),
-            bandwidth: Mutex::new(BandwidthStats {
-                cap_bytes_per_sec: config.max_bandwidth,
-                ..Default::default()
-            }),
+            bandwidth: Mutex::new(BandwidthStats { cap_bytes_per_sec: config.max_bandwidth, ..Default::default() }),
             gone: AtomicBool::new(false),
             gone_signal: tokio::sync::watch::Sender::new(false),
             ever_connected: AtomicBool::new(false),
@@ -310,31 +307,13 @@ impl PeerState {
 
     fn subscriptions(&self) -> Vec<Arc<SubShared>> {
         let channels = self.channels.lock();
-        channels
-            .values()
-            .filter_map(|entry| {
-                if let ChannelStats::Sub(shared) = &entry.stats {
-                    Some(shared.clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
+        channels.values().filter_map(|entry| if let ChannelStats::Sub(shared) = &entry.stats { Some(shared.clone()) } else { None }).collect()
     }
 
     /// Sizes of everything this frontend holds (each must stay flat while the page runs; growth is a resource not freed).
     fn memory_counts(&self) -> serde_json::Value {
-        let subscriptions: Vec<serde_json::Value> = self
-            .subscriptions()
-            .iter()
-            .map(|shared| shared.counts())
-            .collect();
-        let sum = |field: &str| {
-            subscriptions
-                .iter()
-                .map(|counts| counts[field].as_u64().unwrap_or(0))
-                .sum::<u64>()
-        };
+        let subscriptions: Vec<serde_json::Value> = self.subscriptions().iter().map(|shared| shared.counts()).collect();
+        let sum = |field: &str| subscriptions.iter().map(|counts| counts[field].as_u64().unwrap_or(0)).sum::<u64>();
         json!({
             "tracks": self.tracks.lock().len(),
             "channels": self.channels.lock().len(),
@@ -356,34 +335,21 @@ impl PeerState {
         let now = Instant::now();
         self.api.reap_queries();
         let subscriptions = self.subscriptions();
-        let usages: Vec<subscription::Usage> = subscriptions
-            .iter()
-            .map(|shared| shared.usage(interval_secs))
-            .collect();
+        let usages: Vec<subscription::Usage> = subscriptions.iter().map(|shared| shared.usage(interval_secs)).collect();
         let data_usages = || usages.iter().filter(|usage| !usage.on_track);
         let per_sec = |bytes: f64| bytes / interval_secs.max(1e-3);
         let sent = usages.iter().map(|usage| usage.bytes_sent).sum::<u64>() as f64;
-        let video_sent = usages
-            .iter()
-            .filter(|usage| usage.on_track)
-            .map(|usage| usage.bytes_sent)
-            .sum::<u64>() as f64;
+        let video_sent = usages.iter().filter(|usage| usage.on_track).map(|usage| usage.bytes_sent).sum::<u64>() as f64;
         let has_video = usages.iter().any(|usage| usage.on_track);
         let blocked_ms: f64 = data_usages().map(|usage| usage.blocked_ms).sum();
-        let active = data_usages()
-            .filter(|usage| usage.bytes_sent > 0 || usage.blocked_ms > 0.0)
-            .count();
+        let active = data_usages().filter(|usage| usage.bytes_sent > 0 || usage.blocked_ms > 0.0).count();
         let total_demand: f64 = usages.iter().map(|usage| usage.demand.wants()).sum();
         // (the gate counts each frame as it is on the wire: payload plus per-packet overhead)
         let acked_total = self.gate.acked_total();
-        let acked = acked_total
-            .saturating_sub(self.acked_total.swap(acked_total, Ordering::Relaxed))
-            as f64;
+        let acked = acked_total.saturating_sub(self.acked_total.swap(acked_total, Ordering::Relaxed)) as f64;
         // video got through as far as the browser's transport feedback says it arrived
         let video_received = self.video_rate.received_bytes();
-        let video_through = video_received
-            .saturating_sub(self.video_received.swap(video_received, Ordering::Relaxed))
-            as f64;
+        let video_through = video_received.saturating_sub(self.video_received.swap(video_received, Ordering::Relaxed)) as f64;
         let delivered = acked + video_through;
         let known_bandwidth = *self.known_bandwidth.lock();
         let link = {
@@ -391,19 +357,10 @@ impl PeerState {
             // video is held back by the link while it queues there (not by a cut, GCC's or its own brake's: those hold it
             // under the link, and counting their rounds as the link's speed lowered the bandwidth with every cut, a spiral)
             let delivery = self.video_rate.delivery();
-            let video_link_limited = delivery.is_some_and(|delivery| {
-                allocator::video_held_by_link(delivery.least_queue_ms, self.config.latency_target)
-            });
+            let video_link_limited = delivery.is_some_and(|delivery| allocator::video_held_by_link(delivery.least_queue_ms, self.config.latency_target));
             let round = self.gate.take_round();
             log::debug!(target: "zenoh_gateway::link", "peer {}: round {round:?} video {:?} link-limited {video_link_limited} delivered {:.0}", self.peer_id, delivery.map(|delivery| delivery.bytes_per_sec), per_sec(delivered));
-            link.update(
-                now,
-                interval_secs,
-                round,
-                delivery.map_or(0.0, |delivery| delivery.bytes_per_sec),
-                video_link_limited,
-                per_sec(delivered),
-            );
+            link.update(now, interval_secs, round, delivery.map_or(0.0, |delivery| delivery.bytes_per_sec), video_link_limited, per_sec(delivered));
             if let Some(cap) = self.config.max_bandwidth {
                 link.capped(cap);
             }
@@ -417,17 +374,9 @@ impl PeerState {
         // video gets the budget, but no more than its queue brake allows, nor GCC's target while GCC brakes
         let video_estimate = if has_video {
             let brake = self.video_cap(now, budget, per_sec(video_through));
-            let estimate = self
-                .video_rate
-                .gcc_limit_bytes_per_sec()
-                .unwrap_or(budget)
-                .min(brake.unwrap_or(budget));
+            let estimate = self.video_rate.gcc_limit_bytes_per_sec().unwrap_or(budget).min(brake.unwrap_or(budget));
             // (a known link: what the page said, in place of GCC's estimate and the brake's)
-            let estimate = if known_bandwidth.is_some() {
-                budget
-            } else {
-                estimate
-            };
+            let estimate = if known_bandwidth.is_some() { budget } else { estimate };
             // in startup, at most the startup gain times what video measurably delivered, as BBR's startup paces at its
             // gain times the delivery it measured (the budget is that times a first guess, 64 KB/s: video sent 15x a
             // 100 kbit/s link and its queue held even the page's requests for 13 s; nor, before any delivery is measured, the
@@ -435,8 +384,7 @@ impl PeerState {
             match (link.starting_up, self.video_rate.delivery()) {
                 // (never under the guess: a picture that compresses to little delivers little, and held to that its frame
                 // rate fell)
-                (true, Some(delivery)) => estimate
-                    .min((delivery.bytes_per_sec * link.gain).max(self.config.initial_bandwidth)),
+                (true, Some(delivery)) => estimate.min((delivery.bytes_per_sec * link.gain).max(self.config.initial_bandwidth)),
                 (true, None) => estimate.min(self.config.initial_bandwidth),
                 (false, _) => estimate,
             }
@@ -448,41 +396,22 @@ impl PeerState {
             // the link as data does (sized only for the bandwidth, video held its bitrate and never filled the link: stuck at
             // 93 KB/s on a 1 MB/s link)
             // (in startup: what video may send, which follows its own measured delivery)
-            let sized_for = if link.starting_up {
-                video_estimate
-            } else {
-                link.bandwidth_bytes_per_sec * link.gain.max(1.0)
-            };
+            let sized_for = if link.starting_up { video_estimate } else { link.bandwidth_bytes_per_sec * link.gain.max(1.0) };
             self.video_rate.set_size_ratio(sized_for / video_estimate);
             // (only while fresh feedback shows video isn't queued at the link: on a 100 kbit/s link the startup's guess, 15x
             // the link, grew the picture and its keyframes jammed the link for seconds)
-            let unqueued = self.video_rate.delivery().is_some_and(|delivery| {
-                !allocator::video_held_by_link(delivery.least_queue_ms, self.config.latency_target)
-            });
-            self.video_rate
-                .set_starting_up(link.starting_up && unqueued);
+            let unqueued = self.video_rate.delivery().is_some_and(|delivery| !allocator::video_held_by_link(delivery.least_queue_ms, self.config.latency_target));
+            self.video_rate.set_starting_up(link.starting_up && unqueued);
         }
         let is_video: Vec<bool> = usages.iter().map(|usage| usage.on_track).collect();
-        let demands: Vec<allocator::Demand> =
-            usages.into_iter().map(|usage| usage.demand).collect();
-        let reserved: f64 = demands
-            .iter()
-            .filter_map(|demand| demand.fixed_bytes_per_sec)
-            .sum();
-        let allocations =
-            allocate_within_video_cap(budget, video_estimate.min(budget), demands, &is_video);
-        let latency_target =
-            self.latency_target(&subscriptions, &allocations, link.bandwidth_bytes_per_sec);
+        let demands: Vec<allocator::Demand> = usages.into_iter().map(|usage| usage.demand).collect();
+        let reserved: f64 = demands.iter().filter_map(|demand| demand.fixed_bytes_per_sec).sum();
+        let allocations = allocate_within_video_cap(budget, video_estimate.min(budget), demands, &is_video);
+        let latency_target = self.latency_target(&subscriptions, &allocations, link.bandwidth_bytes_per_sec);
         let (window, latency_capped) = link.window(Some(latency_target));
         self.video_rate.pacer.set_queue_limit(latency_target);
-        self.gate
-            .configure(link.bandwidth_bytes_per_sec, budget, window, latency_capped);
-        let video_granted: f64 = allocations
-            .iter()
-            .zip(&is_video)
-            .filter(|(_, video)| **video)
-            .map(|(allocation, _)| allocation.budget_bytes_per_sec)
-            .sum();
+        self.gate.configure(link.bandwidth_bytes_per_sec, budget, window, latency_capped);
+        let video_granted: f64 = allocations.iter().zip(&is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
         self.video_rate.set_cap_bytes_per_sec(video_granted);
         self.video_rate.set_link_bytes_per_sec(budget);
         self.video_rate.pacer.set_rate(self.video_rate.pacing_bps());
@@ -510,21 +439,14 @@ impl PeerState {
             probing_rtt: link.probing_rtt(),
             latency_target_ms: latency_target.as_secs_f64() * 1000.0,
             path_rtt_ms: link.path_rtt_ms,
-            latency_first: latency_capped
-                || link
-                    .path_rtt_ms
-                    .or(link.min_rtt_ms)
-                    .is_some_and(|rtt| rtt < latency_target.as_secs_f64() * 1000.0),
+            latency_first: latency_capped || link.path_rtt_ms.or(link.min_rtt_ms).is_some_and(|rtt| rtt < latency_target.as_secs_f64() * 1000.0),
             in_flight_bytes: self.gate.in_flight(),
             window_bytes: window,
             reserved_bytes_per_sec: reserved,
             bulk_chunk_bytes: self.gate.chunk_bytes(),
             demand_bytes_per_sec: total_demand,
             sent_bytes_per_sec: per_sec(sent),
-            network_blocked_fraction: (blocked_ms
-                / 1000.0
-                / (interval_secs * active.max(1) as f64))
-                .min(1.0),
+            network_blocked_fraction: (blocked_ms / 1000.0 / (interval_secs * active.max(1) as f64)).min(1.0),
             constrained: total_demand > budget,
         };
     }
@@ -539,30 +461,16 @@ impl PeerState {
     fn video_cap(&self, now: Instant, budget: f64, video_delivered: f64) -> Option<f64> {
         // a queue delay with no fresh feedback behind it says nothing (no video got through lately): held at its last value,
         // it kept braking a link with no video on it for 15 s
-        let queue_ms = self
-            .video_rate
-            .delivery()
-            .map_or(0.0, |_| self.video_rate.queue_delay_ms());
+        let queue_ms = self.video_rate.delivery().map_or(0.0, |_| self.video_rate.queue_delay_ms());
         let target_ms = self.config.latency_target.as_secs_f64() * 1000.0;
         let (recent_most, high_rounds) = {
             let mut delivery = self.video_delivery.lock();
             delivery.0.push_back((now, video_delivered));
-            while delivery
-                .0
-                .front()
-                .is_some_and(|(at, _)| now.duration_since(*at) > VIDEO_DELIVERY_WINDOW)
-            {
+            while delivery.0.front().is_some_and(|(at, _)| now.duration_since(*at) > VIDEO_DELIVERY_WINDOW) {
                 delivery.0.pop_front();
             }
-            delivery.1 = if queue_ms > target_ms / 2.0 {
-                delivery.1 + 1
-            } else {
-                0
-            };
-            (
-                delivery.0.iter().map(|(_, rate)| *rate).fold(0.0, f64::max),
-                delivery.1,
-            )
+            delivery.1 = if queue_ms > target_ms / 2.0 { delivery.1 + 1 } else { 0 };
+            (delivery.0.iter().map(|(_, rate)| *rate).fold(0.0, f64::max), delivery.1)
         };
         let mut brake = self.video_brake.lock();
         if high_rounds >= VIDEO_QUEUE_ROUNDS && recent_most > 0.0 {
@@ -581,31 +489,14 @@ impl PeerState {
     /// What data may take to reach the page: the gateway's target, tightened by the latency tolerances the page's streams
     /// state (maxAge, `SubShared::latency_tolerance`), averaged weighted by the bandwidth each was granted. (Only
     /// robot-to-page data crosses this queue; what the page publishes, cmd_vel and heartbeats, travels the other way.)
-    fn latency_target(
-        &self,
-        subscriptions: &[Arc<SubShared>],
-        allocations: &[allocator::Allocation],
-        bandwidth: f64,
-    ) -> Duration {
-        let weighted = subscriptions
-            .iter()
-            .zip(allocations)
-            .filter_map(|(shared, allocation)| {
-                let weight = allocation.budget_bytes_per_sec;
-                shared
-                    .latency_tolerance(bandwidth)
-                    .filter(|_| weight > 0.0)
-                    .map(|tolerance| (weight, tolerance))
-            });
-        let (weights, sum) = weighted.fold((0.0, 0.0), |(weights, sum), (weight, tolerance)| {
-            (weights + weight, sum + weight * tolerance)
+    fn latency_target(&self, subscriptions: &[Arc<SubShared>], allocations: &[allocator::Allocation], bandwidth: f64) -> Duration {
+        let weighted = subscriptions.iter().zip(allocations).filter_map(|(shared, allocation)| {
+            let weight = allocation.budget_bytes_per_sec;
+            shared.latency_tolerance(bandwidth).filter(|_| weight > 0.0).map(|tolerance| (weight, tolerance))
         });
+        let (weights, sum) = weighted.fold((0.0, 0.0), |(weights, sum), (weight, tolerance)| (weights + weight, sum + weight * tolerance));
         let target = self.config.latency_target;
-        if weights > 0.0 {
-            target.min(crate::secs(sum / weights))
-        } else {
-            target
-        }
+        if weights > 0.0 { target.min(crate::secs(sum / weights)) } else { target }
     }
 
     /// What the streams may use: the link's bandwidth x its gain, within the cap.
@@ -614,17 +505,12 @@ impl PeerState {
         let (rate, _) = link.pacing(None);
         if known {
             // (a known link has nothing to probe for)
-            return (
-                self.config.max_bandwidth.map_or(rate, |cap| cap.min(rate)),
-                true,
-            );
+            return (self.config.max_bandwidth.map_or(rate, |cap| cap.min(rate)), true);
         }
         match self.config.max_bandwidth {
             // a probe could reach the cap: the link carries about the cap, so probing past it (and draining what that
             // queued) only dipped the budget under the cap (a 480 KB/s cap budgeted 333 KB/s in the drain round)
-            Some(cap) if link.bandwidth_bytes_per_sec * allocator::PROBE_UP_GAIN >= cap => {
-                (cap, true)
-            }
+            Some(cap) if link.bandwidth_bytes_per_sec * allocator::PROBE_UP_GAIN >= cap => (cap, true),
             Some(cap) => (cap.min(rate), false),
             None => (rate, false),
         }
@@ -651,31 +537,22 @@ impl PeerState {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        warn!(
-            "peer {}: control channel never opened, dropped {event}",
-            self.peer_id
-        );
+        warn!("peer {}: control channel never opened, dropped {event}", self.peer_id);
     }
 
     /// Its grant and the gateway's refusal hook.
     fn access(&self) -> crate::auth::Access<'_> {
-        crate::auth::Access {
-            grant: &self.grant,
-            on_refused: self.on_refused.as_ref(),
-        }
+        crate::auth::Access { grant: &self.grant, on_refused: self.on_refused.as_ref() }
     }
 
     async fn send_accepted(&self, id: Option<u64>) {
-        self.send_event(json!({"event": "accepted", "id": id}))
-            .await;
+        self.send_event(json!({"event": "accepted", "id": id})).await;
     }
 
     fn find_publisher(&self, pub_id: u64) -> Option<(String, Arc<PubShared>)> {
         let channels = self.channels.lock();
         channels.values().find_map(|entry| match &entry.stats {
-            ChannelStats::Pub(shared) if entry.label.id == Some(pub_id) => {
-                Some((entry.label.key.clone(), shared.clone()))
-            }
+            ChannelStats::Pub(shared) if entry.label.id == Some(pub_id) => Some((entry.label.key.clone(), shared.clone())),
             _ => None,
         })
     }
@@ -685,10 +562,7 @@ impl PeerState {
         let armed: Vec<(u64, Deadman)> = self.deadmen.lock().drain().collect();
         for (pub_id, deadman) in armed {
             if let Some(blocked) = self.leases.blocker(self.peer_id, &deadman.key) {
-                warn!(
-                    "peer {}: deadman on {:?} not fired: {blocked}",
-                    self.peer_id, deadman.key
-                );
+                warn!("peer {}: deadman on {:?} not fired: {blocked}", self.peer_id, deadman.key);
                 continue;
             }
             // trip first, so a put racing in behind the deadman can't undo it
@@ -702,18 +576,9 @@ impl PeerState {
                 .reliability(Reliability::Reliable)
                 .express(true);
             match tokio::time::timeout(self.config.put_timeout, put).await {
-                Ok(Ok(())) => info!(
-                    "peer {}: deadman fired on {:?} ({reason})",
-                    self.peer_id, deadman.key
-                ),
-                Ok(Err(error)) => warn!(
-                    "peer {}: deadman on {:?} failed: {error}",
-                    self.peer_id, deadman.key
-                ),
-                Err(_) => warn!(
-                    "peer {}: deadman on {:?} failed: zenoh held it past {:?}",
-                    self.peer_id, deadman.key, self.config.put_timeout
-                ),
+                Ok(Ok(())) => info!("peer {}: deadman fired on {:?} ({reason})", self.peer_id, deadman.key),
+                Ok(Err(error)) => warn!("peer {}: deadman on {:?} failed: {error}", self.peer_id, deadman.key),
+                Err(_) => warn!("peer {}: deadman on {:?} failed: zenoh held it past {:?}", self.peer_id, deadman.key, self.config.put_timeout),
             }
             let control = self.control.lock().clone();
             if let Some(control) = control {
@@ -725,8 +590,7 @@ impl PeerState {
 
     async fn lease_lost(&self, group: &str, reason: &str) {
         info!("peer {}: lease {group:?} lost ({reason})", self.peer_id);
-        self.send_event(json!({"event": "leaseLost", "group": group, "reason": reason}))
-            .await;
+        self.send_event(json!({"event": "leaseLost", "group": group, "reason": reason})).await;
     }
 }
 
@@ -751,29 +615,16 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    pub fn new(
-        session: zenoh::Session,
-        codecs: EncodingRegistry,
-        allocation: AllocationConfig,
-        leases: Leases,
-        connect_config: ConnectConfig,
-    ) -> Arc<Self> {
+    pub fn new(session: zenoh::Session, codecs: EncodingRegistry, allocation: AllocationConfig, leases: Leases, connect_config: ConnectConfig) -> Arc<Self> {
         let codecs = Arc::new(codecs);
         // the shared decode/encode results, and the links' seeds, expire whether or not any frontend is left to ask
-        let link_seeds: Arc<Mutex<HashMap<String, (allocator::LinkSeed, Instant)>>> =
-            Default::default();
-        let (weak, weak_seeds, link_memory) = (
-            Arc::downgrade(&codecs),
-            Arc::downgrade(&link_seeds),
-            allocation.link_memory,
-        );
+        let link_seeds: Arc<Mutex<HashMap<String, (allocator::LinkSeed, Instant)>>> = Default::default();
+        let (weak, weak_seeds, link_memory) = (Arc::downgrade(&codecs), Arc::downgrade(&link_seeds), allocation.link_memory);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
             loop {
                 ticker.tick().await;
-                let (Some(codecs), Some(seeds)) = (weak.upgrade(), weak_seeds.upgrade()) else {
-                    break;
-                };
+                let (Some(codecs), Some(seeds)) = (weak.upgrade(), weak_seeds.upgrade()) else { break };
                 codecs.sweep();
                 seeds.lock().retain(|_, (_, at)| at.elapsed() < link_memory);
             }
@@ -803,22 +654,14 @@ impl Gateway {
         };
         let mut in_use = self.udp_ports_in_use.lock();
         let used: HashSet<u16> = in_use.values().copied().collect();
-        let port = range.clone().find(|port| {
-            !used.contains(port) && std::net::UdpSocket::bind(("0.0.0.0", *port)).is_ok()
-        });
-        let port = port.ok_or_else(|| {
-            anyhow::anyhow!("no free UDP port in {range:?} for another connection")
-        })?;
+        let port = range.clone().find(|port| !used.contains(port) && std::net::UdpSocket::bind(("0.0.0.0", *port)).is_ok());
+        let port = port.ok_or_else(|| anyhow::anyhow!("no free UDP port in {range:?} for another connection"))?;
         in_use.insert(peer_id, port);
         Ok(Some(port))
     }
 
     async fn lease_lost(&self, holder: u64, group: &str, reason: &str) {
-        let state = self
-            .peers
-            .lock()
-            .get(&holder)
-            .map(|entry| entry.state.clone());
+        let state = self.peers.lock().get(&holder).map(|entry| entry.state.clone());
         if let Some(state) = state {
             state.lease_lost(group, reason).await;
         }
@@ -827,21 +670,10 @@ impl Gateway {
     /// Every open subscription: its key expression and encoding.
     pub fn subscriptions(&self) -> Vec<(String, Option<String>)> {
         let peers = self.peers.lock();
-        let channels = peers.values().flat_map(|entry| {
-            entry
-                .state
-                .channels
-                .lock()
-                .values()
-                .filter_map(|channel| match &channel.stats {
-                    ChannelStats::Sub(shared) => Some((
-                        channel.label.key.clone(),
-                        shared.codec.as_ref().map(|codec| codec.name().to_owned()),
-                    )),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        });
+        let channels = peers.values().flat_map(|entry| entry.state.channels.lock().values().filter_map(|channel| match &channel.stats {
+            ChannelStats::Sub(shared) => Some((channel.label.key.clone(), shared.codec.as_ref().map(|codec| codec.name().to_owned()))),
+            _ => None,
+        }).collect::<Vec<_>>());
         channels.collect()
     }
 
@@ -850,44 +682,18 @@ impl Gateway {
     async fn end_leased_subscriptions(&self, keys: &[String], holder: u64) {
         let ended: Vec<(Arc<PeerState>, Option<u64>, String)> = {
             let peers = self.peers.lock();
-            peers
-                .iter()
-                .filter(|(peer_id, _)| **peer_id != holder)
-                .flat_map(|(peer_id, entry)| {
-                    entry
-                        .state
-                        .channels
-                        .lock()
-                        .values()
-                        .filter_map(|channel| match &channel.stats {
-                            ChannelStats::Sub(shared)
-                                if !shared.is_closed()
-                                    && let Some(reason) = self
-                                        .leases
-                                        .subscribe_blocker(*peer_id, &channel.label.key)
-                                    && crate::auth::overlaps(
-                                        keys,
-                                        std::slice::from_ref(&channel.label.key),
-                                    ) =>
-                            {
-                                shared.leased_away.store(true, Ordering::Relaxed);
-                                shared.close();
-                                Some((entry.state.clone(), channel.label.id, reason))
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect()
+            peers.iter().filter(|(peer_id, _)| **peer_id != holder).flat_map(|(peer_id, entry)| entry.state.channels.lock().values().filter_map(|channel| match &channel.stats {
+                ChannelStats::Sub(shared) if !shared.is_closed() && let Some(reason) = self.leases.subscribe_blocker(*peer_id, &channel.label.key) && crate::auth::overlaps(keys, std::slice::from_ref(&channel.label.key)) => {
+                    shared.leased_away.store(true, Ordering::Relaxed);
+                    shared.close();
+                    Some((entry.state.clone(), channel.label.id, reason))
+                }
+                _ => None,
+            }).collect::<Vec<_>>()).collect()
         };
         for (state, sub_id, reason) in ended {
-            info!(
-                "peer {}: subscription {sub_id:?} ended: {reason}",
-                state.peer_id
-            );
-            state
-                .send_event(json!({"event": "rejected", "id": sub_id, "reason": reason}))
-                .await;
+            info!("peer {}: subscription {sub_id:?} ended: {reason}", state.peer_id);
+            state.send_event(json!({"event": "rejected", "id": sub_id, "reason": reason})).await;
         }
     }
 
@@ -904,13 +710,7 @@ impl Gateway {
 
     /// Closes every connection made with `token`.
     pub fn revoke(&self, token: &str) -> usize {
-        let revoked: Vec<u64> = self
-            .peers
-            .lock()
-            .iter()
-            .filter(|(_, entry)| entry.state.token.as_deref() == Some(token))
-            .map(|(id, _)| *id)
-            .collect();
+        let revoked: Vec<u64> = self.peers.lock().iter().filter(|(_, entry)| entry.state.token.as_deref() == Some(token)).map(|(id, _)| *id).collect();
         for peer_id in &revoked {
             self.drop_peer(*peer_id, "revoked");
         }
@@ -918,39 +718,18 @@ impl Gateway {
     }
 
     /// Non-trickle signaling: take an offer, return an answer with all our candidates in it.
-    pub async fn answer(
-        self: &Arc<Self>,
-        offer: RTCSessionDescription,
-        token: Option<String>,
-        grant: Grant,
-    ) -> anyhow::Result<RTCSessionDescription> {
+    pub async fn answer(self: &Arc<Self>, offer: RTCSessionDescription, token: Option<String>, grant: Grant) -> anyhow::Result<RTCSessionDescription> {
         let peer_id = self.next_peer.fetch_add(1, Ordering::Relaxed);
         self.answer_as(peer_id, offer, token, grant).await
     }
 
-    async fn answer_as(
-        self: &Arc<Self>,
-        peer_id: u64,
-        offer: RTCSessionDescription,
-        token: Option<String>,
-        grant: Grant,
-    ) -> anyhow::Result<RTCSessionDescription> {
-        let request = ice::IceRequest {
-            side: ice::IceSide::Gateway,
-            token: token.clone(),
-        };
+    async fn answer_as(self: &Arc<Self>, peer_id: u64, offer: RTCSessionDescription, token: Option<String>, grant: Grant) -> anyhow::Result<RTCSessionDescription> {
+        let request = ice::IceRequest { side: ice::IceSide::Gateway, token: token.clone() };
         let (gathered_tx, mut gathered_rx) = mpsc::channel::<()>(1);
-        let (media_engine, interceptors, video_rate) =
-            media::media_setup(self.allocation.initial_bandwidth)?;
+        let (media_engine, interceptors, video_rate) = media::media_setup(self.allocation.initial_bandwidth)?;
         let (state, mut api_events) = PeerState::new(peer_id, self, video_rate, token, grant);
         let state = Arc::new(state);
-        let mut pending = PendingPeer {
-            gateway: Arc::downgrade(self),
-            peer_id,
-            state: state.clone(),
-            connection: None,
-            armed: true,
-        };
+        let mut pending = PendingPeer { gateway: Arc::downgrade(self), peer_id, state: state.clone(), connection: None, armed: true };
         let forwarder = Arc::downgrade(&state);
         let (stale_after, mut gone) = (self.allocation.stale_after, state.gone_signal.subscribe());
         tokio::spawn(async move {
@@ -974,52 +753,29 @@ impl Gateway {
         });
         let port = self.reserve_udp_port(peer_id)?.unwrap_or(0);
         let config = &self.connect_config;
-        let ice_servers = ice::servers(
-            &config.ice_servers,
-            config.turn_secret.as_ref(),
-            config.ice_servers_fn.as_ref(),
-            request,
-        )
-        .await
-        .into_iter()
-        .map(|server| RTCIceServer {
-            urls: server.urls,
-            username: server.username,
-            credential: server.credential,
-        })
-        .collect();
-        let handler = Arc::new(Handler {
-            gateway: Arc::downgrade(self),
-            peer_id,
-            gathered_tx,
-            state: Arc::downgrade(&state),
-        });
+        let ice_servers = ice::servers(&config.ice_servers, config.turn_secret.as_ref(), config.ice_servers_fn.as_ref(), request)
+            .await
+            .into_iter()
+            .map(|server| RTCIceServer { urls: server.urls, username: server.username, credential: server.credential })
+            .collect();
+        let handler = Arc::new(Handler { gateway: Arc::downgrade(self), peer_id, gathered_tx, state: Arc::downgrade(&state) });
         let setting_engine = SettingEngineBuilder::new()
             .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_MESSAGE_SIZE))
             .build();
-        let peer_connection: Arc<dyn PeerConnection> = Arc::new(
-            PeerConnectionBuilder::new()
-                .with_configuration(
-                    RTCConfigurationBuilder::new()
-                        .with_ice_servers(ice_servers)
-                        .build(),
-                )
-                .with_setting_engine(setting_engine)
-                .with_media_engine(media_engine)
-                .with_interceptor_registry(interceptors)
-                .with_handler(handler)
-                .with_udp_addrs(vec![format!("0.0.0.0:{port}"), format!("127.0.0.1:{port}")])
-                .build()
-                .await?,
-        );
+        let peer_connection: Arc<dyn PeerConnection> = Arc::new(PeerConnectionBuilder::new()
+            .with_configuration(RTCConfigurationBuilder::new().with_ice_servers(ice_servers).build())
+            .with_setting_engine(setting_engine)
+            .with_media_engine(media_engine)
+            .with_interceptor_registry(interceptors)
+            .with_handler(handler)
+            .with_udp_addrs(vec![format!("0.0.0.0:{port}"), format!("127.0.0.1:{port}")])
+            .build()
+            .await?);
         pending.connection = Some(peer_connection.clone());
         peer_connection.set_remote_description(offer).await?;
         let answer = peer_connection.create_answer(None).await?;
         peer_connection.set_local_description(answer).await?;
-        if tokio::time::timeout(GATHER_TIMEOUT, gathered_rx.recv())
-            .await
-            .is_err()
-        {
+        if tokio::time::timeout(GATHER_TIMEOUT, gathered_rx.recv()).await.is_err() {
             warn!("peer {peer_id}: ICE gathering timed out, answering with what we have");
         }
         let local = peer_connection
@@ -1029,26 +785,17 @@ impl Gateway {
         let connection = peer_connection;
         *state.connection.lock() = Some(connection.clone());
         let gateway = Arc::downgrade(self);
-        crate::spawn_isolated(
-            format!("peer {peer_id}: allocator"),
-            run_allocator(Arc::downgrade(&state)),
-            async move {
-                if let Some(gateway) = gateway.upgrade() {
-                    gateway.drop_peer(peer_id, "internal error");
-                }
-            },
-        );
+        crate::spawn_isolated(format!("peer {peer_id}: allocator"), run_allocator(Arc::downgrade(&state)), async move {
+            if let Some(gateway) = gateway.upgrade() {
+                gateway.drop_peer(peer_id, "internal error");
+            }
+        });
         let watched = state.clone();
         pending.armed = false;
-        self.peers
-            .lock()
-            .insert(peer_id, PeerEntry { connection, state });
+        self.peers.lock().insert(peer_id, PeerEntry { connection, state });
         info!("peer {peer_id}: answered");
         // failed or closed while gathering: drop_peer ran before the peer was in `peers` and did nothing
-        if matches!(
-            *watched.connection_state.lock(),
-            Some(RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed)
-        ) {
+        if matches!(*watched.connection_state.lock(), Some(RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed)) {
             self.drop_peer(peer_id, "disconnected");
         }
         // a browser that gave up before connecting (a phone retrying over a bad link) may never move ICE to `failed`
@@ -1058,9 +805,7 @@ impl Gateway {
                 () = tokio::time::sleep(CONNECT_TIMEOUT) => {}
                 () = watched.wait_gone() => return,
             }
-            if !watched.ever_connected.load(Ordering::Relaxed)
-                && let Some(gateway) = gateway.upgrade()
-            {
+            if !watched.ever_connected.load(Ordering::Relaxed) && let Some(gateway) = gateway.upgrade() {
                 gateway.drop_peer(peer_id, "never connected");
             }
         });
@@ -1075,9 +820,7 @@ impl Gateway {
             // kept for the page reconnecting (a page that never measured its link leaves nothing)
             let link_id = entry.state.link_id.lock().take();
             if let (Some(link_id), Some(seed)) = (link_id, entry.state.link.lock().seed()) {
-                self.link_seeds
-                    .lock()
-                    .insert(link_id, (seed, Instant::now()));
+                self.link_seeds.lock().insert(link_id, (seed, Instant::now()));
             }
             entry.state.gone.store(true, Ordering::Relaxed);
             // the channels of a browser that vanished never report their own close; closed before the gone signal,
@@ -1097,9 +840,7 @@ impl Gateway {
                 // a browser can take ~30 s to notice a closed connection by itself
                 let control = entry.state.control.lock().take();
                 if let Some(control) = control {
-                    let _ = control
-                        .send_text(&json!({"event": "closed", "reason": reason}).to_string())
-                        .await;
+                    let _ = control.send_text(&json!({"event": "closed", "reason": reason}).to_string()).await;
                     // closing right away would drop it unsent
                     for _ in 0..50 {
                         if control.outstanding_bytes().await.unwrap_or(0) == 0 {
@@ -1108,8 +849,7 @@ impl Gateway {
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 }
-                let _ =
-                    tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, entry.connection.close()).await;
+                let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, entry.connection.close()).await;
             });
         }
     }
@@ -1118,19 +858,9 @@ impl Gateway {
     pub async fn shutdown(&self) {
         let peers: Vec<PeerEntry> = self.peers.lock().drain().map(|(_, entry)| entry).collect();
         // every frontend's at once (each put waits at most put_timeout), so many browsers don't add up
-        futures::future::join_all(
-            peers
-                .iter()
-                .map(|entry| entry.state.fire_deadmen("shutdown")),
-        )
-        .await;
+        futures::future::join_all(peers.iter().map(|entry| entry.state.fire_deadmen("shutdown"))).await;
         // a peer whose transport is already broken can take forever to close; never hold up exit
-        futures::future::join_all(
-            peers.iter().map(|entry| {
-                tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, entry.connection.close())
-            }),
-        )
-        .await;
+        futures::future::join_all(peers.iter().map(|entry| tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, entry.connection.close()))).await;
     }
 }
 
@@ -1147,10 +877,7 @@ async fn run_allocator(state: Weak<PeerState>) {
         // a page that acked nothing of a frame for stale_after stopped reading: what is queued for it in SCTP (strict
         // and small frames, control) can't be taken back, so it goes with its connection
         if state.gate.expire_stale() {
-            warn!(
-                "peer {}: the page acked nothing for {:?}: dropping it",
-                state.peer_id, state.config.stale_after
-            );
+            warn!("peer {}: the page acked nothing for {:?}: dropping it", state.peer_id, state.config.stale_after);
             if let Some(gateway) = state.gateway.upgrade() {
                 gateway.drop_peer(state.peer_id, "stopped reading");
             }
@@ -1182,10 +909,7 @@ impl Drop for PendingPeer {
         }
         self.state.gone.store(true, Ordering::Relaxed);
         self.state.gone_signal.send_replace(true);
-        if let (Some(connection), Ok(runtime)) = (
-            self.connection.take(),
-            tokio::runtime::Handle::try_current(),
-        ) {
+        if let (Some(connection), Ok(runtime)) = (self.connection.take(), tokio::runtime::Handle::try_current()) {
             runtime.spawn(async move {
                 let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, connection.close()).await;
             });
@@ -1225,13 +949,10 @@ impl PeerConnectionEventHandler for Handler {
             }
             // ICE may sit in `disconnected` without ever reaching `failed`
             RTCPeerConnectionState::Disconnected => {
-                let (gateway, state, peer_id) =
-                    (self.gateway.clone(), self.state.clone(), self.peer_id);
+                let (gateway, state, peer_id) = (self.gateway.clone(), self.state.clone(), self.peer_id);
                 tokio::spawn(async move {
                     tokio::time::sleep(DISCONNECTED_GRACE).await;
-                    let still_down = state.upgrade().is_some_and(|state| {
-                        *state.connection_state.lock() != Some(RTCPeerConnectionState::Connected)
-                    });
+                    let still_down = state.upgrade().is_some_and(|state| *state.connection_state.lock() != Some(RTCPeerConnectionState::Connected));
                     if still_down && let Some(gateway) = gateway.upgrade() {
                         gateway.drop_peer(peer_id, "disconnected");
                     }
@@ -1244,38 +965,24 @@ impl PeerConnectionEventHandler for Handler {
     async fn on_data_channel(&self, dc: Arc<dyn DataChannel>) {
         // Must not block here: the driver waits for this to return.
         let closing = dc.clone();
-        let Some(state) = self
-            .state
-            .upgrade()
-            .filter(|state| !state.gone.load(Ordering::Relaxed))
-        else {
+        let Some(state) = self.state.upgrade().filter(|state| !state.gone.load(Ordering::Relaxed)) else {
             tokio::spawn(async move {
                 let _ = closing.close().await;
             });
             return;
         };
-        crate::spawn_isolated(
-            format!("peer {}: channel", self.peer_id),
-            run_channel(dc, self.gateway.clone(), state),
-            async move {
-                let _ = closing.close().await;
-            },
-        );
+        crate::spawn_isolated(format!("peer {}: channel", self.peer_id), run_channel(dc, self.gateway.clone(), state), async move {
+            let _ = closing.close().await;
+        });
     }
 }
 
-async fn run_channel(
-    dc: Arc<dyn DataChannel>,
-    gateway: std::sync::Weak<Gateway>,
-    state: Arc<PeerState>,
-) {
+async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>, state: Arc<PeerState>) {
     let peer_id = state.peer_id;
     let raw_label = dc.label().await.unwrap_or_default();
     if raw_label == "control" {
         // the page's requests are answered ahead of queued bulk (see `subscription::CONTROL_CHANNEL_PRIORITY`)
-        let _ = dc
-            .set_priority(subscription::CONTROL_CHANNEL_PRIORITY)
-            .await;
+        let _ = dc.set_priority(subscription::CONTROL_CHANNEL_PRIORITY).await;
         *state.control.lock() = Some(dc.clone());
         tokio::select! {
             () = run_control(dc, state.clone()) => {}
@@ -1302,108 +1009,54 @@ async fn run_channel(
     let session = state.session.clone();
     let entry_id = state.next_channel.fetch_add(1, Ordering::Relaxed);
     let register = |opts: Value, stats: ChannelStats| {
-        state.channels.lock().insert(
-            entry_id,
-            ChannelEntry {
-                label: label.clone(),
-                opts,
-                stats,
-            },
-        );
+        state.channels.lock().insert(entry_id, ChannelEntry { label: label.clone(), opts, stats });
     };
-    let work = async {
-        match label.kind.as_str() {
-            "sub" => match state
-                .access()
-                .check(crate::auth::Action::Subscribe, &label.key)
-                .and_then(|()| SubOpts::parse(&label.opts))
-                .and_then(|mut opts| {
-                    let resolved = opts.resolve_encoding(&state.codecs)?;
-                    let track = bind_track(&state, &resolved, &label)?;
-                    Ok((opts, resolved, track))
-                }) {
-                Ok((opts, resolved, track)) => {
-                    let shared = Arc::new(SubShared::new(
-                        &opts,
-                        resolved,
-                        state.codecs.clone(),
-                        state.gate.clone(),
-                        state.config.reliable_max_backlog,
-                        state.config.stream_decode_backlog,
-                    ));
-                    register(
-                        opts.normalized(matches!(shared.channel, Channel::Video(_))),
-                        ChannelStats::Sub(shared.clone()),
-                    );
-                    // checked once registered, so a lease taken meanwhile either sees this subscription or is seen here
-                    if let Some(reason) = state.leases.subscribe_blocker(peer_id, &label.key) {
-                        return Some(reason);
-                    }
-                    state.leases.changed();
-                    state.send_accepted(label.id).await;
-                    subscription::run(
-                        dc.clone(),
-                        label.clone(),
-                        session,
-                        shared.clone(),
-                        track,
-                        state
-                            .grant
-                            .acl
-                            .is_some()
-                            .then(|| Arc::new(state.grant.clone())),
-                    )
-                    .await;
-                    // like a rejected channel, the client closes it itself
-                    if shared.leased_away.load(Ordering::Relaxed) {
-                        close_after_client(&dc).await;
-                    }
-                    None
+    let work = async { match label.kind.as_str() {
+        "sub" => match state.access().check(crate::auth::Action::Subscribe, &label.key).and_then(|()| SubOpts::parse(&label.opts)).and_then(|mut opts| {
+            let resolved = opts.resolve_encoding(&state.codecs)?;
+            let track = bind_track(&state, &resolved, &label)?;
+            Ok((opts, resolved, track))
+        }) {
+            Ok((opts, resolved, track)) => {
+                let shared = Arc::new(SubShared::new(&opts, resolved, state.codecs.clone(), state.gate.clone(), state.config.reliable_max_backlog, state.config.stream_decode_backlog));
+                register(opts.normalized(matches!(shared.channel, Channel::Video(_))), ChannelStats::Sub(shared.clone()));
+                // checked once registered, so a lease taken meanwhile either sees this subscription or is seen here
+                if let Some(reason) = state.leases.subscribe_blocker(peer_id, &label.key) {
+                    return Some(reason);
                 }
-                Err(error) => Some(error),
-            },
-            "pub" => match state
-                .access()
-                .check(crate::auth::Action::Publish, &label.key)
-                .and_then(|()| PubOpts::parse(&label.opts))
-            {
-                Ok(opts) => {
-                    let shared = Arc::new(PubShared::default());
-                    register(
-                        json!({"delivery": opts.delivery, "priority": opts.priority, "latencyLimit": opts.latency_limit}),
-                        ChannelStats::Pub(shared.clone()),
-                    );
-                    state.send_accepted(label.id).await;
-                    let (leases, key) = (state.leases.clone(), label.key.clone());
-                    let blocker = move || leases.blocker(peer_id, &key);
-                    publisher::run(
-                        dc.clone(),
-                        label.clone(),
-                        opts,
-                        session,
-                        shared,
-                        state.clock_offset_ms.clone(),
-                        blocker,
-                        state.config.put_timeout,
-                    )
-                    .await;
-                    None
+                state.leases.changed();
+                state.send_accepted(label.id).await;
+                subscription::run(dc.clone(), label.clone(), session, shared.clone(), track, state.grant.acl.is_some().then(|| Arc::new(state.grant.clone()))).await;
+                // like a rejected channel, the client closes it itself
+                if shared.leased_away.load(Ordering::Relaxed) {
+                    close_after_client(&dc).await;
                 }
-                Err(error) => Some(error),
-            },
-            "heartbeat" => match HeartbeatOpts::parse(&label.opts) {
-                Ok(opts) => {
-                    let _ = dc
-                        .set_priority(subscription::REAL_TIME_CHANNEL_PRIORITY)
-                        .await;
-                    run_heartbeat(dc.clone(), opts, state.clone()).await;
-                    None
-                }
-                Err(error) => Some(error),
-            },
-            other => Some(format!("unknown channel type {other:?}")),
-        }
-    };
+                None
+            }
+            Err(error) => Some(error),
+        },
+        "pub" => match state.access().check(crate::auth::Action::Publish, &label.key).and_then(|()| PubOpts::parse(&label.opts)) {
+            Ok(opts) => {
+                let shared = Arc::new(PubShared::default());
+                register(json!({"delivery": opts.delivery, "priority": opts.priority, "latencyLimit": opts.latency_limit}), ChannelStats::Pub(shared.clone()));
+                state.send_accepted(label.id).await;
+                let (leases, key) = (state.leases.clone(), label.key.clone());
+                let blocker = move || leases.blocker(peer_id, &key);
+                publisher::run(dc.clone(), label.clone(), opts, session, shared, state.clock_offset_ms.clone(), blocker, state.config.put_timeout).await;
+                None
+            }
+            Err(error) => Some(error),
+        },
+        "heartbeat" => match HeartbeatOpts::parse(&label.opts) {
+            Ok(opts) => {
+                let _ = dc.set_priority(subscription::REAL_TIME_CHANNEL_PRIORITY).await;
+                run_heartbeat(dc.clone(), opts, state.clone()).await;
+                None
+            }
+            Err(error) => Some(error),
+        },
+        other => Some(format!("unknown channel type {other:?}")),
+    } };
     // a dropped peer's channels never report their close: without this each waited forever, holding the peer's state
     let rejected = tokio::select! {
         rejected = work => rejected,
@@ -1411,17 +1064,10 @@ async fn run_channel(
     };
     if let Some(error) = rejected {
         warn!("peer {peer_id}: rejected channel {raw_label}: {error}");
-        state
-            .send_event(json!({"event": "rejected", "id": label.id, "reason": error}))
-            .await;
+        state.send_event(json!({"event": "rejected", "id": label.id, "reason": error})).await;
         close_after_client(&dc).await;
     }
-    if state
-        .channels
-        .lock()
-        .remove(&entry_id)
-        .is_some_and(|entry| matches!(entry.stats, ChannelStats::Sub(_)))
-    {
+    if state.channels.lock().remove(&entry_id).is_some_and(|entry| matches!(entry.stats, ChannelStats::Sub(_))) {
         state.leases.changed();
     }
     // a publisher stream that goes away takes its deadman with it (the client cleared or closed it)
@@ -1442,10 +1088,7 @@ async fn close_after_client(dc: &Arc<dyn DataChannel>) {
             }
         }
     };
-    if tokio::time::timeout(Duration::from_secs(5), client_closed)
-        .await
-        .is_err()
-    {
+    if tokio::time::timeout(Duration::from_secs(5), client_closed).await.is_err() {
         let _ = dc.close().await;
     }
 }
@@ -1473,37 +1116,26 @@ const UPDATABLE: [&str; 15] = [
 fn update_subscription(state: &PeerState, request: &ControlRequest) -> Value {
     let result = (|| -> Result<Value, String> {
         let sub_id = request.sub_id.ok_or("updateSubscription needs subId")?;
-        let Some(Value::Object(changes)) = &request.opts else {
-            return Err("updateSubscription needs opts (an object)".into());
-        };
+        let Some(Value::Object(changes)) = &request.opts else { return Err("updateSubscription needs opts (an object)".into()) };
         let mut channels = state.channels.lock();
         let entry = channels
             .values_mut()
             .find(|entry| entry.label.kind == "sub" && entry.label.id == Some(sub_id))
             .ok_or_else(|| format!("no subscription with id {sub_id}"))?;
-        let ChannelStats::Sub(shared) = &entry.stats else {
-            return Err(format!("no subscription with id {sub_id}"));
-        };
+        let ChannelStats::Sub(shared) = &entry.stats else { return Err(format!("no subscription with id {sub_id}")) };
         let mut merged = match &entry.label.opts {
             Value::Object(opts) => opts.clone(),
             _ => serde_json::Map::new(),
         };
         for (name, value) in changes {
             if !UPDATABLE.contains(&name.as_str()) {
-                return Err(format!(
-                    "{name} can't change on a running subscription (it may change: {})",
-                    UPDATABLE.join(", ")
-                ));
+                return Err(format!("{name} can't change on a running subscription (it may change: {})", UPDATABLE.join(", ")));
             }
             // encodeOptions: only its quality, the rest is how the encoding works
             if name == "encodeOptions" {
-                let Value::Object(options) = value else {
-                    return Err("encodeOptions must be an object".into());
-                };
+                let Value::Object(options) = value else { return Err("encodeOptions must be an object".into()) };
                 if let Some(other) = options.keys().find(|option| *option != "quality") {
-                    return Err(format!(
-                        "encodeOptions.{other} can't change on a running subscription (encodeOptions.quality may)"
-                    ));
+                    return Err(format!("encodeOptions.{other} can't change on a running subscription (encodeOptions.quality may)"));
                 }
                 let current = merged.entry("encodeOptions").or_insert_with(|| json!({}));
                 if let (Value::Object(current), Some(quality)) = (current, options.get("quality")) {
@@ -1534,27 +1166,15 @@ fn update_subscription(state: &PeerState, request: &ControlRequest) -> Value {
 }
 
 /// A video or audio channel's subscription claims the track the browser renegotiated for it (by mid).
-fn bind_track(
-    state: &PeerState,
-    resolved: &Resolved,
-    label: &Label,
-) -> Result<Option<TrackClaim>, String> {
+fn bind_track(state: &PeerState, resolved: &Resolved, label: &Label) -> Result<Option<TrackClaim>, String> {
     let Some(mime) = media::track_mime(resolved.channel) else {
         return Ok(None);
     };
     let channel = resolved.channel.as_str();
-    let mid = label.mid.as_deref().ok_or_else(|| {
-        format!("channel {channel}: the label needs the mid of a renegotiated transceiver")
-    })?;
-    let track =
-        state.tracks.lock().get(mid).cloned().ok_or_else(|| {
-            format!("no track for mid {mid:?} (renegotiate with the channel first)")
-        })?;
+    let mid = label.mid.as_deref().ok_or_else(|| format!("channel {channel}: the label needs the mid of a renegotiated transceiver"))?;
+    let track = state.tracks.lock().get(mid).cloned().ok_or_else(|| format!("no track for mid {mid:?} (renegotiate with the channel first)"))?;
     if track.mime != mime {
-        return Err(format!(
-            "track {mid:?} carries {}, channel {channel} needs {mime}",
-            track.mime
-        ));
+        return Err(format!("track {mid:?} carries {}, channel {channel} needs {mime}", track.mime));
     }
     Ok(Some(track.claim()))
 }
@@ -1564,45 +1184,23 @@ fn bind_track(
 /// share of the data-channel estimate is bandwidth they cannot use. Granting it anyway made the
 /// encoders outrun the pacer, and the excess queued there as latency (seconds, after a subscription
 /// started, while GCC was still climbing from its initial rate). Data streams get what is left.
-fn allocate_within_video_cap(
-    budget: f64,
-    video_cap: f64,
-    demands: Vec<allocator::Demand>,
-    is_video: &[bool],
-) -> Vec<allocator::Allocation> {
+fn allocate_within_video_cap(budget: f64, video_cap: f64, demands: Vec<allocator::Demand>, is_video: &[bool]) -> Vec<allocator::Allocation> {
     let joint = allocator::allocate(budget, &demands);
-    let video_total: f64 = joint
-        .iter()
-        .zip(is_video)
-        .filter(|(_, video)| **video)
-        .map(|(allocation, _)| allocation.budget_bytes_per_sec)
-        .sum();
+    let video_total: f64 = joint.iter().zip(is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
     if video_total <= video_cap * (1.0 + 1e-9) {
         return joint;
     }
-    let (video, data): (Vec<_>, Vec<_>) = demands
-        .into_iter()
-        .enumerate()
-        .partition(|(index, _)| is_video[*index]);
+    let (video, data): (Vec<_>, Vec<_>) = demands.into_iter().enumerate().partition(|(index, _)| is_video[*index]);
     let (video_indices, video_demands): (Vec<usize>, Vec<_>) = video.into_iter().unzip();
     let (data_indices, data_demands): (Vec<usize>, Vec<_>) = data.into_iter().unzip();
     let video_allocations = allocator::allocate(video_cap, &video_demands);
-    let video_used: f64 = video_allocations
-        .iter()
-        .map(|allocation| allocation.budget_bytes_per_sec)
-        .sum();
+    let video_used: f64 = video_allocations.iter().map(|allocation| allocation.budget_bytes_per_sec).sum();
     let data_allocations = allocator::allocate((budget - video_used).max(0.0), &data_demands);
     let mut out: Vec<Option<allocator::Allocation>> = vec![None; is_video.len()];
-    for (index, allocation) in video_indices
-        .into_iter()
-        .zip(video_allocations)
-        .chain(data_indices.into_iter().zip(data_allocations))
-    {
+    for (index, allocation) in video_indices.into_iter().zip(video_allocations).chain(data_indices.into_iter().zip(data_allocations)) {
         out[index] = Some(allocation);
     }
-    out.into_iter()
-        .map(|allocation| allocation.expect("every stream allocated"))
-        .collect()
+    out.into_iter().map(|allocation| allocation.expect("every stream allocated")).collect()
 }
 
 #[derive(Deserialize)]
@@ -1620,12 +1218,7 @@ async fn run_heartbeat(dc: Arc<dyn DataChannel>, opts: HeartbeatOpts, state: Arc
         let mut heartbeat = state.heartbeat.lock();
         let already_configured = heartbeat.configured;
         if !already_configured {
-            *heartbeat = HeartbeatStats {
-                configured: true,
-                hz: opts.hz,
-                misses: opts.misses,
-                ..Default::default()
-            };
+            *heartbeat = HeartbeatStats { configured: true, hz: opts.hz, misses: opts.misses, ..Default::default() };
         }
         already_configured
     };
@@ -1716,23 +1309,14 @@ fn ok(id: &Value, extra: Value) -> Value {
 /// The browser's address on the connection ICE picked, or `None` before it picked one.
 async fn remote_address(state: &PeerState) -> Option<String> {
     let connection = state.connection.lock().clone()?;
-    let pair = connection
-        .sctp()
-        .await?
-        .transport()
-        .ice_transport()
-        .get_selected_candidate_pair()
-        .await
-        .ok()??;
+    let pair = connection.sctp().await?.transport().ice_transport().get_selected_candidate_pair().await.ok()??;
     Some(pair.remote().address.clone())
 }
 
 /// Whether `address` is one of this machine's own (loopback, or an interface's: binding to it works); a name (a
 /// browser's mDNS `<uuid>.local`) can't be told, and is taken at the page's word.
 fn on_this_machine(address: &str) -> bool {
-    address.parse::<std::net::IpAddr>().map_or(true, |ip| {
-        ip.is_loopback() || std::net::UdpSocket::bind((ip, 0)).is_ok()
-    })
+    address.parse::<std::net::IpAddr>().map_or(true, |ip| ip.is_loopback() || std::net::UdpSocket::bind((ip, 0)).is_ok())
 }
 
 fn fail(id: &Value, error: impl std::fmt::Display) -> Value {
@@ -1756,21 +1340,10 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             let (dc, state) = (dc.clone(), state.clone());
             let slow = api::SLOW_OPS.contains(&request.op.as_str());
             // a get waits its own timeout (at most MAX_GET_TIMEOUT_MS); anything else as long as a put may
-            let limit = state.config.put_timeout
-                + if slow {
-                    Duration::from_millis(api::MAX_GET_TIMEOUT_MS)
-                } else {
-                    Duration::ZERO
-                };
+            let limit = state.config.put_timeout + if slow { Duration::from_millis(api::MAX_GET_TIMEOUT_MS) } else { Duration::ZERO };
             let task = async move {
                 let id = request.id.clone();
-                let context = api::Context {
-                    session: &state.session,
-                    access: state.access(),
-                    api: &state.api,
-                    events: state.api_events.clone(),
-                    put_timeout: state.config.put_timeout,
-                };
+                let context = api::Context { session: &state.session, access: state.access(), api: &state.api, events: state.api_events.clone(), put_timeout: state.config.put_timeout };
                 let response = tokio::select! {
                     response = tokio::time::timeout(limit, api::handle(context, request)) => response.unwrap_or_else(|_| fail(&id, format!("timed out after {limit:?}"))),
                     // a peer that left takes its pending ops with it (each held its state)
@@ -1800,9 +1373,7 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 tokio::spawn(async move {
                     let handling = async {
                         match request.op.as_str() {
-                            "listTopics" => {
-                                handle_list_topics(&state.session, &request, &state.grant).await
-                            }
+                            "listTopics" => handle_list_topics(&state.session, &request, &state.grant).await,
                             "expireLease" => expire_lease(&state, &request).await,
                             _ => handle_renegotiate(&state, &request).await,
                         }
@@ -1818,34 +1389,19 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             }
             "ping" => {
                 state.record_clock(request.offset_ms, request.rtt_ms);
-                ok(
-                    &request.id,
-                    json!({"t0": request.t0, "t1": t1, "t2": now_unix_ms()}),
-                )
+                ok(&request.id, json!({"t0": request.t0, "t1": t1, "t2": now_unix_ms()}))
             }
             "stats" => {
                 let clock = json!({"offsetMs": *state.clock_offset_ms.lock(), "rttMs": *state.rtt_ms.lock()});
-                let heartbeat =
-                    serde_json::to_value(state.heartbeat.lock().clone()).unwrap_or_default();
-                let bandwidth =
-                    serde_json::to_value(state.bandwidth.lock().clone()).unwrap_or_default();
-                ok(
-                    &request.id,
-                    json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "bandwidth": bandwidth, "memory": state.memory_counts()}),
-                )
+                let heartbeat = serde_json::to_value(state.heartbeat.lock().clone()).unwrap_or_default();
+                let bandwidth = serde_json::to_value(state.bandwidth.lock().clone()).unwrap_or_default();
+                ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "bandwidth": bandwidth, "memory": state.memory_counts()}))
             }
             "setDeadman" => set_deadman(&state, &request).await,
             "encodings" => {
-                let encodings: Vec<Value> = state
-                    .codecs
-                    .list()
-                    .map(|(name, output)| json!({"name": name, "output": output.as_str()}))
-                    .collect();
+                let encodings: Vec<Value> = state.codecs.list().map(|(name, output)| json!({"name": name, "output": output.as_str()})).collect();
                 // features: what a page may use beyond 0.5.31 (the subscribe option `metadata`)
-                ok(
-                    &request.id,
-                    json!({"encodings": encodings, "features": ["metadata"]}),
-                )
+                ok(&request.id, json!({"encodings": encodings, "features": ["metadata"]}))
             }
             "lease" => {
                 let response = take_lease(&state, &request);
@@ -1855,22 +1411,10 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             }
             "updateSubscription" => update_subscription(&state, &request),
             "setLinkBandwidth" => match request.bytes_per_sec {
-                Some(known) if !(known.is_finite() && known > 0.0) => fail(
-                    &request.id,
-                    format!("bytesPerSec must be a positive number of bytes/s, got {known}"),
-                ),
+                Some(known) if !(known.is_finite() && known > 0.0) => fail(&request.id, format!("bytesPerSec must be a positive number of bytes/s, got {known}")),
                 // a page through a tunnel (ssh -L) is on 127.0.0.1 too, but its media comes over the network: no known speed then
-                Some(_)
-                    if let Some(remote) = remote_address(&state)
-                        .await
-                        .filter(|remote| !on_this_machine(remote)) =>
-                {
-                    fail(
-                        &request.id,
-                        format!(
-                            "the page is at {remote}, not on this machine: the link's speed is estimated"
-                        ),
-                    )
+                Some(_) if let Some(remote) = remote_address(&state).await.filter(|remote| !on_this_machine(remote)) => {
+                    fail(&request.id, format!("the page is at {remote}, not on this machine: the link's speed is estimated"))
                 }
                 known => {
                     *state.known_bandwidth.lock() = known;
@@ -1878,32 +1422,17 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 }
             },
             "resumeLink" => match request.link_id {
-                Some(link_id) if link_id.is_empty() || link_id.len() > MAX_LINK_ID_LEN => fail(
-                    &request.id,
-                    format!("linkId must be 1-{MAX_LINK_ID_LEN} bytes"),
-                ),
+                Some(link_id) if link_id.is_empty() || link_id.len() > MAX_LINK_ID_LEN => fail(&request.id, format!("linkId must be 1-{MAX_LINK_ID_LEN} bytes")),
                 Some(link_id) => {
-                    let seed = state
-                        .link_seeds
-                        .lock()
-                        .get(&link_id)
-                        .filter(|(_, at)| at.elapsed() < state.config.link_memory)
-                        .map(|(seed, _)| *seed);
+                    let seed = state.link_seeds.lock().get(&link_id).filter(|(_, at)| at.elapsed() < state.config.link_memory).map(|(seed, _)| *seed);
                     let seeded = seed.filter(|seed| state.link.lock().seeded(*seed));
                     *state.link_id.lock() = Some(link_id);
-                    ok(
-                        &request.id,
-                        json!({"seededBytesPerSec": seeded.map(|seed| seed.bandwidth_bytes_per_sec)}),
-                    )
+                    ok(&request.id, json!({"seededBytesPerSec": seeded.map(|seed| seed.bandwidth_bytes_per_sec)}))
                 }
                 None => fail(&request.id, "resumeLink needs a linkId"),
             },
             "releaseLease" => {
-                state
-                    .leases
-                    .end(request.group.as_deref().unwrap_or_default(), |holder, _| {
-                        holder == state.peer_id
-                    });
+                state.leases.end(request.group.as_deref().unwrap_or_default(), |holder, _| holder == state.peer_id);
                 ok(&request.id, json!({}))
             }
             "clearDeadman" => {
@@ -1945,20 +1474,11 @@ async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Valu
                 // tracks whose m-line the offer dropped (their subscription closed and the page stopped the transceiver)
                 let dropped: Vec<Arc<media::MediaTrack>> = {
                     let mut tracks = state.tracks.lock();
-                    let gone: Vec<String> = tracks
-                        .keys()
-                        .filter(|mid| !live.contains(*mid))
-                        .cloned()
-                        .collect();
+                    let gone: Vec<String> = tracks.keys().filter(|mid| !live.contains(*mid)).cloned().collect();
                     gone.iter().filter_map(|mid| tracks.remove(mid)).collect()
                 };
                 if !dropped.is_empty() {
-                    info!(
-                        "peer {}: stopping {} dropped track(s), {} left",
-                        state.peer_id,
-                        dropped.len(),
-                        state.tracks.lock().len()
-                    );
+                    info!("peer {}: stopping {} dropped track(s), {} left", state.peer_id, dropped.len(), state.tracks.lock().len());
                 }
                 media::stop_tracks(&connection, &dropped).await;
                 let mid = track.map(|track| {
@@ -1986,17 +1506,10 @@ async fn handle_renegotiate(state: &PeerState, request: &ControlRequest) -> Valu
 
 /// Ends lease `serial` of `group` once its holder's heartbeat has been silent for `timeout` ("heartbeat"); returns when
 /// the lease ends any other way or its holder goes. Holds the holder only weakly, between checks.
-async fn watch_lease_timeout(
-    holder: Weak<PeerState>,
-    group: String,
-    serial: u64,
-    timeout: Duration,
-) {
+async fn watch_lease_timeout(holder: Weak<PeerState>, group: String, serial: u64, timeout: Duration) {
     loop {
         let silent = {
-            let Some(state) = holder.upgrade() else {
-                return;
-            };
+            let Some(state) = holder.upgrade() else { return };
             if !state.leases.is_held(&group, serial) {
                 return;
             }
@@ -2006,18 +1519,9 @@ async fn watch_lease_timeout(
             tokio::time::sleep(timeout - silent).await;
             continue;
         }
-        let Some(state) = holder.upgrade() else {
-            return;
-        };
-        if state
-            .leases
-            .end(&group, |_, lease_serial| lease_serial == serial)
-            .is_some()
-        {
-            warn!(
-                "peer {}: heartbeat silent for {timeout:?}: lease {group:?} ends",
-                state.peer_id
-            );
+        let Some(state) = holder.upgrade() else { return };
+        if state.leases.end(&group, |_, lease_serial| lease_serial == serial).is_some() {
+            warn!("peer {}: heartbeat silent for {timeout:?}: lease {group:?} ends", state.peer_id);
             state.lease_lost(&group, "heartbeat").await;
         }
         return;
@@ -2028,42 +1532,22 @@ async fn watch_lease_timeout(
 fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
     let heartbeat = state.heartbeat.lock().clone();
     if !heartbeat.configured {
-        return fail(
-            &request.id,
-            "a lease needs a heartbeat: connect(url, { heartbeatHz, heartbeatMisses })",
-        );
+        return fail(&request.id, "a lease needs a heartbeat: connect(url, { heartbeatHz, heartbeatMisses })");
     }
     let timeout = match request.timeout_ms {
-        Some(ms) if !(ms.is_finite() && ms > 0.0) => {
-            return fail(
-                &request.id,
-                format!("timeoutMs must be a positive number, got {ms}"),
-            );
-        }
+        Some(ms) if !(ms.is_finite() && ms > 0.0) => return fail(&request.id, format!("timeoutMs must be a positive number, got {ms}")),
         ms => ms.map(|ms| crate::secs(ms / 1000.0)),
     };
     let slowest = state.leases.slowest_heartbeat.as_secs_f64();
     match timeout {
         Some(timeout) if timeout.as_secs_f64() > slowest => {
-            return fail(
-                &request.id,
-                format!(
-                    "timeoutMs must be at most {} (the server's slowest lease heartbeat), got {}",
-                    slowest * 1000.0,
-                    timeout.as_secs_f64() * 1000.0
-                ),
-            );
+            return fail(&request.id, format!("timeoutMs must be at most {} (the server's slowest lease heartbeat), got {}", slowest * 1000.0, timeout.as_secs_f64() * 1000.0));
         }
         Some(_) => {}
         None => {
             let deadline_secs = heartbeat.misses as f64 / heartbeat.hz;
             if deadline_secs > slowest {
-                return fail(
-                    &request.id,
-                    format!(
-                        "a lease needs a heartbeat deadline (heartbeatMisses / heartbeatHz, or timeoutMs) of at most {slowest} s, got {deadline_secs} s"
-                    ),
-                );
+                return fail(&request.id, format!("a lease needs a heartbeat deadline (heartbeatMisses / heartbeatHz, or timeoutMs) of at most {slowest} s, got {deadline_secs} s"));
             }
         }
     }
@@ -2074,60 +1558,35 @@ fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
         max_secs: request.max_seconds,
         timeout,
     };
-    match state
-        .leases
-        .take(state.peer_id, &state.grant, request.group.as_deref(), asked)
-    {
-        Ok(crate::auth::Taken {
-            group,
-            publish,
-            subscribe,
-            expires_in,
-            serial,
-            taken_over,
-        }) => {
+    match state.leases.take(state.peer_id, &state.grant, request.group.as_deref(), asked) {
+        Ok(crate::auth::Taken { group, publish, subscribe, expires_in, serial, taken_over }) => {
             let gateway = state.gateway.clone();
             let (holder, ending) = (state.peer_id, subscribe.clone());
             tokio::spawn(async move {
-                let Some(gateway) = gateway.upgrade() else {
-                    return;
-                };
+                let Some(gateway) = gateway.upgrade() else { return };
                 for (lost, loser) in taken_over {
                     gateway.lease_lost(loser, &lost, "takenOver").await;
                 }
                 gateway.end_leased_subscriptions(&ending, holder).await;
             });
             if let Some(timeout) = timeout {
-                tokio::spawn(watch_lease_timeout(
-                    Arc::downgrade(state),
-                    group.clone(),
-                    serial,
-                    timeout,
-                ));
+                tokio::spawn(watch_lease_timeout(Arc::downgrade(state), group.clone(), serial, timeout));
             }
             if let Some(after) = expires_in {
                 let (gateway, group) = (state.gateway.clone(), group.clone());
                 tokio::spawn(async move {
                     tokio::time::sleep(after).await;
                     if let Some(gateway) = gateway.upgrade()
-                        && let Some(holder) = gateway
-                            .leases
-                            .end(&group, |_, lease_serial| lease_serial == serial)
+                        && let Some(holder) = gateway.leases.end(&group, |_, lease_serial| lease_serial == serial)
                     {
                         gateway.lease_lost(holder, &group, "maxSeconds").await;
                     }
                 });
             }
-            info!(
-                "peer {}: leased {group:?} publish {publish:?} subscribe {subscribe:?}",
-                state.peer_id
-            );
+            info!("peer {}: leased {group:?} publish {publish:?} subscribe {subscribe:?}", state.peer_id);
             let expires_in_ms = expires_in.map(|after| after.as_millis() as u64);
             let timeout_ms = timeout.map(|timeout| timeout.as_secs_f64() * 1000.0);
-            ok(
-                &request.id,
-                json!({"group": group, "keys": publish, "publish": publish, "subscribe": subscribe, "expiresInMs": expires_in_ms, "timeoutMs": timeout_ms}),
-            )
+            ok(&request.id, json!({"group": group, "keys": publish, "publish": publish, "subscribe": subscribe, "expiresInMs": expires_in_ms, "timeoutMs": timeout_ms}))
         }
         Err(error) => fail(&request.id, error),
     }
@@ -2137,23 +1596,14 @@ fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
 async fn expire_lease(state: &PeerState, request: &ControlRequest) -> Value {
     let group = request.group.as_deref().unwrap_or_default();
     if !state.grant.force_expire {
-        return fail(
-            &request.id,
-            format!("not authorized to force-expire lease {group:?}"),
-        );
+        return fail(&request.id, format!("not authorized to force-expire lease {group:?}"));
     }
     let Some(gateway) = state.gateway.upgrade() else {
         return fail(&request.id, "shutting down");
     };
     match gateway.leases.end(group, |_, _| true) {
         Some(holder) => {
-            gateway
-                .lease_lost(
-                    holder,
-                    group,
-                    &format!("force-expired by peer {}", state.peer_id),
-                )
-                .await;
+            gateway.lease_lost(holder, group, &format!("force-expired by peer {}", state.peer_id)).await;
             ok(&request.id, json!({}))
         }
         None => fail(&request.id, format!("no lease {group:?} is held")),
@@ -2165,14 +1615,9 @@ async fn set_deadman(state: &PeerState, request: &ControlRequest) -> Value {
         return fail(&request.id, "setDeadman needs pubId");
     };
     if !state.heartbeat.lock().configured {
-        return fail(
-            &request.id,
-            "setDeadman needs a heartbeat: connect(url, { heartbeatHz, heartbeatMisses })",
-        );
+        return fail(&request.id, "setDeadman needs a heartbeat: connect(url, { heartbeatHz, heartbeatMisses })");
     }
-    let bytes = match base64::engine::general_purpose::STANDARD
-        .decode(request.bytes.as_deref().unwrap_or_default())
-    {
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(request.bytes.as_deref().unwrap_or_default()) {
         Ok(bytes) => bytes,
         Err(error) => return fail(&request.id, error),
     };
@@ -2192,10 +1637,7 @@ async fn set_deadman(state: &PeerState, request: &ControlRequest) -> Value {
         return fail(&request.id, "publisher is tripped; create a new one");
     }
     shared.stats.lock().deadman_armed = true;
-    state
-        .deadmen
-        .lock()
-        .insert(pub_id, Deadman { key, bytes, shared });
+    state.deadmen.lock().insert(pub_id, Deadman { key, bytes, shared });
     ok(&request.id, json!({}))
 }
 
@@ -2206,20 +1648,10 @@ async fn set_deadman(state: &PeerState, request: &ControlRequest) -> Value {
 ///   a zero `probe` skips that subscription
 ///
 /// Plain publishers, subscribers and queryables without a token are invisible.
-async fn list_topics(
-    session: &zenoh::Session,
-    filter: &str,
-    probe: Duration,
-) -> anyhow::Result<Vec<Value>> {
+async fn list_topics(session: &zenoh::Session, filter: &str, probe: Duration) -> anyhow::Result<Vec<Value>> {
     let found: Arc<Mutex<BTreeMap<String, BTreeSet<&'static str>>>> = Arc::default();
-    let note = |found: &Mutex<BTreeMap<String, BTreeSet<&'static str>>>,
-                key: &str,
-                source: &'static str| {
-        found
-            .lock()
-            .entry(key.to_owned())
-            .or_default()
-            .insert(source);
+    let note = |found: &Mutex<BTreeMap<String, BTreeSet<&'static str>>>, key: &str, source: &'static str| {
+        found.lock().entry(key.to_owned()).or_default().insert(source);
     };
     let sink = found.clone();
     // probe 0 = tokens only: no subscription, so publishers that only send while matched (matching
@@ -2235,12 +1667,7 @@ async fn list_topics(
         ),
     };
     for selector in [filter.to_owned(), format!("{filter}/@adv/pub/**")] {
-        let Ok(replies) = session
-            .liveliness()
-            .get(selector.as_str())
-            .timeout(LIVELINESS_QUERY_TIMEOUT)
-            .await
-        else {
+        let Ok(replies) = session.liveliness().get(selector.as_str()).timeout(LIVELINESS_QUERY_TIMEOUT).await else {
             continue;
         };
         while let Ok(reply) = replies.recv_async().await {
@@ -2256,43 +1683,14 @@ async fn list_topics(
     tokio::time::sleep(probe).await;
     drop(probe_subscriber);
     let found = found.lock();
-    Ok(found
-        .iter()
-        .map(|(key, sources)| json!({"key": key, "sources": sources}))
-        .collect())
+    Ok(found.iter().map(|(key, sources)| json!({"key": key, "sources": sources})).collect())
 }
 
-async fn handle_list_topics(
-    session: &zenoh::Session,
-    request: &ControlRequest,
-    grant: &Grant,
-) -> Value {
-    let filter = if request.key.is_empty() {
-        "**"
-    } else {
-        &request.key
-    };
-    match list_topics(
-        session,
-        filter,
-        Duration::from_millis(
-            request
-                .probe_ms
-                .unwrap_or(DEFAULT_LIST_PROBE_MS)
-                .min(MAX_LIST_PROBE_MS),
-        ),
-    )
-    .await
-    {
+async fn handle_list_topics(session: &zenoh::Session, request: &ControlRequest, grant: &Grant) -> Value {
+    let filter = if request.key.is_empty() { "**" } else { &request.key };
+    match list_topics(session, filter, Duration::from_millis(request.probe_ms.unwrap_or(DEFAULT_LIST_PROBE_MS).min(MAX_LIST_PROBE_MS))).await {
         Ok(mut topics) => {
-            topics.retain(|topic| {
-                grant
-                    .allows(
-                        crate::auth::Action::List,
-                        topic["key"].as_str().unwrap_or_default(),
-                    )
-                    .is_ok()
-            });
+            topics.retain(|topic| grant.allows(crate::auth::Action::List, topic["key"].as_str().unwrap_or_default()).is_ok());
             ok(&request.id, json!({"topics": topics}))
         }
         Err(error) => fail(&request.id, error),
@@ -2322,57 +1720,22 @@ mod tests {
         assert!(on_this_machine("127.0.0.1") && on_this_machine("::1"));
         // TEST-NET-1: never one of this machine's addresses
         assert!(!on_this_machine("192.0.2.7"));
-        assert!(
-            on_this_machine("6f1c2a0e-9b1d-4e2f-8a3b-1c2d3e4f5a6b.local"),
-            "a name is taken at the page's word"
-        );
+        assert!(on_this_machine("6f1c2a0e-9b1d-4e2f-8a3b-1c2d3e4f5a6b.local"), "a name is taken at the page's word");
     }
 
     fn stream(bytes_per_message: f64, hz: f64) -> allocator::Demand {
-        allocator::Demand {
-            priority: 1.0,
-            max_hz: hz,
-            quality_range: None,
-            tradeoff: 0.5,
-            price: Box::new(move |_| bytes_per_message),
-            fixed_bytes_per_sec: None,
-            shrinks_last: false,
-        }
+        allocator::Demand { priority: 1.0, max_hz: hz, quality_range: None, tradeoff: 0.5, price: Box::new(move |_| bytes_per_message), fixed_bytes_per_sec: None, shrinks_last: false }
     }
 
     #[test]
     fn video_gets_no_more_than_its_cap_and_data_gets_the_rest() {
         // budget 1 MB/s; the video stream wants 500 KB/s but GCC allows 100 KB/s; data wants 500 KB/s
-        let allocations = allocate_within_video_cap(
-            1_000_000.0,
-            100_000.0,
-            vec![stream(50_000.0, 10.0), stream(50_000.0, 10.0)],
-            &[true, false],
-        );
-        assert!(
-            allocations[0].budget_bytes_per_sec <= 100_000.0 + 1e-6,
-            "{:?}",
-            allocations[0]
-        );
-        assert_eq!(
-            allocations[1].budget_bytes_per_sec, 500_000.0,
-            "{:?}",
-            allocations[1]
-        );
+        let allocations = allocate_within_video_cap(1_000_000.0, 100_000.0, vec![stream(50_000.0, 10.0), stream(50_000.0, 10.0)], &[true, false]);
+        assert!(allocations[0].budget_bytes_per_sec <= 100_000.0 + 1e-6, "{:?}", allocations[0]);
+        assert_eq!(allocations[1].budget_bytes_per_sec, 500_000.0, "{:?}", allocations[1]);
         // under the cap nothing changes
-        let allocations = allocate_within_video_cap(
-            1_000_000.0,
-            600_000.0,
-            vec![stream(50_000.0, 10.0), stream(50_000.0, 10.0)],
-            &[true, false],
-        );
-        assert_eq!(
-            (
-                allocations[0].budget_bytes_per_sec,
-                allocations[1].budget_bytes_per_sec
-            ),
-            (500_000.0, 500_000.0)
-        );
+        let allocations = allocate_within_video_cap(1_000_000.0, 600_000.0, vec![stream(50_000.0, 10.0), stream(50_000.0, 10.0)], &[true, false]);
+        assert_eq!((allocations[0].budget_bytes_per_sec, allocations[1].budget_bytes_per_sec), (500_000.0, 500_000.0));
     }
 
     /// zenoh 1.7.0-1.10.1 answer the admin space under the routing tables' read lock and take it again, so a racing declaration deadlocked every thread (it hung web_ctrl).
@@ -2380,24 +1743,13 @@ mod tests {
     fn list_topics_survives_concurrent_declarations() {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4)
-                .enable_all()
-                .build()
-                .unwrap();
+            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
             runtime.block_on(async {
                 let mut config = zenoh::Config::default();
-                config
-                    .insert_json5("scouting/multicast/enabled", "false")
-                    .unwrap();
+                config.insert_json5("scouting/multicast/enabled", "false").unwrap();
                 config.insert_json5("listen/endpoints", "[]").unwrap();
                 config.insert_json5("adminspace/enabled", "true").unwrap();
-                config
-                    .insert_json5(
-                        "adminspace/permissions",
-                        r#"{"read": true, "write": false}"#,
-                    )
-                    .unwrap();
+                config.insert_json5("adminspace/permissions", r#"{"read": true, "write": false}"#).unwrap();
                 let session = zenoh::open(config).await.unwrap();
                 let deadline = Instant::now() + Duration::from_secs(3);
                 let mut tasks = Vec::new();
@@ -2406,10 +1758,7 @@ mod tests {
                     tasks.push(tokio::spawn(async move {
                         let mut round = 0;
                         while Instant::now() < deadline {
-                            let subscriber = session
-                                .declare_subscriber(format!("deadlock/{worker}/{round}"))
-                                .await
-                                .unwrap();
+                            let subscriber = session.declare_subscriber(format!("deadlock/{worker}/{round}")).await.unwrap();
                             subscriber.undeclare().await.unwrap();
                             round += 1;
                         }
@@ -2421,11 +1770,7 @@ mod tests {
                         while Instant::now() < deadline {
                             list_topics(&session, "**", Duration::ZERO).await.unwrap();
                             // what listTopics used to ask: the gateway's own declarations, from the admin space
-                            let replies = session
-                                .get("@/*/*/subscriber/**")
-                                .timeout(Duration::from_secs(1))
-                                .await
-                                .unwrap();
+                            let replies = session.get("@/*/*/subscriber/**").timeout(Duration::from_secs(1)).await.unwrap();
                             while replies.recv_async().await.is_ok() {}
                         }
                     }));
@@ -2436,9 +1781,6 @@ mod tests {
             });
             let _ = done_tx.send(());
         });
-        assert!(
-            done_rx.recv_timeout(Duration::from_secs(30)).is_ok(),
-            "listTopics and declarations deadlocked"
-        );
+        assert!(done_rx.recv_timeout(Duration::from_secs(30)).is_ok(), "listTopics and declarations deadlocked");
     }
 }

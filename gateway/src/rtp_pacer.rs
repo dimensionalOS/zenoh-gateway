@@ -13,7 +13,7 @@
 //! are what it replaces, and it gets out sooner.
 
 use parking_lot::Mutex;
-use rtc::interceptor::{Attribute, Interceptor, Pacer, Packet, StreamInfo, TaggedPacket};
+use rtc::interceptor::{Attribute, Interceptor, Packet, Pacer, StreamInfo, TaggedPacket};
 use rtc::shared::marshal::MarshalSize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -42,14 +42,7 @@ pub struct PacerShared {
 
 impl Default for PacerShared {
     fn default() -> Self {
-        PacerShared {
-            queue_limit: Mutex::new(crate::allocator::DEFAULT_LATENCY_TARGET),
-            rate_bps: Mutex::new(None),
-            backlog: Default::default(),
-            keyframe_flags: Default::default(),
-            keyframes: Default::default(),
-            dropped_packets: Default::default(),
-        }
+        PacerShared { queue_limit: Mutex::new(crate::allocator::DEFAULT_LATENCY_TARGET), rate_bps: Mutex::new(None), backlog: Default::default(), keyframe_flags: Default::default(), keyframes: Default::default(), dropped_packets: Default::default() }
     }
 }
 
@@ -86,11 +79,8 @@ impl PacerShared {
         let (bits, bps, head_since, at) = *self.backlog.lock();
         let Some(at) = at else { return Duration::ZERO };
         let now = Instant::now();
-        let draining =
-            (bits / bps.max(1.0) - now.saturating_duration_since(at).as_secs_f64()).max(0.0);
-        let head = head_since.map_or(0.0, |since| {
-            now.saturating_duration_since(since).as_secs_f64()
-        });
+        let draining = (bits / bps.max(1.0) - now.saturating_duration_since(at).as_secs_f64()).max(0.0);
+        let head = head_since.map_or(0.0, |since| now.saturating_duration_since(since).as_secs_f64());
         crate::secs(if bits > 0.0 { draining.max(head) } else { 0.0 })
     }
 
@@ -142,12 +132,7 @@ impl AgedPacer {
     }
 
     fn publish(&self, now: Instant) {
-        *self.shared.backlog.lock() = (
-            self.queued_bits,
-            self.bucket.target_bitrate(),
-            self.queue.front().map(|queued| queued.since),
-            Some(now),
-        );
+        *self.shared.backlog.lock() = (self.queued_bits, self.bucket.target_bitrate(), self.queue.front().map(|queued| queued.since), Some(now));
     }
 
     fn remember_dropped(&mut self, key: (u32, u16)) {
@@ -164,8 +149,7 @@ impl AgedPacer {
     /// When a packet queued `now` is dropped: the queue limit, plus the time its frame up to it takes to leave at the
     /// bucket's rate now (set at entry: a rate that later fell, while no feedback came, stretched a frame's wait to 17 s).
     fn deadline(&self, now: Instant, frame_bits_so_far: f64) -> Instant {
-        now + *self.shared.queue_limit.lock()
-            + crate::secs(frame_bits_so_far / self.bucket.target_bitrate().max(1.0))
+        now + *self.shared.queue_limit.lock() + crate::secs(frame_bits_so_far / self.bucket.target_bitrate().max(1.0))
     }
 
     fn apply_rate(&mut self) {
@@ -216,9 +200,7 @@ impl AgedPacer {
     /// A keyframe entering the queue: the stream's packets queued before it are what it replaces (libwebrtc's pacer does
     /// the same), dropped without asking for another keyframe.
     fn flush_before_keyframe(&mut self, ssrc: u32) {
-        let (flushed, kept): (VecDeque<Queued>, VecDeque<Queued>) = std::mem::take(&mut self.queue)
-            .into_iter()
-            .partition(|queued| queued.frame.0 == ssrc);
+        let (flushed, kept): (VecDeque<Queued>, VecDeque<Queued>) = std::mem::take(&mut self.queue).into_iter().partition(|queued| queued.frame.0 == ssrc);
         self.queue = kept;
         for queued in flushed {
             self.drop_packet(queued);
@@ -235,11 +217,7 @@ impl rtc::sansio::Protocol<TaggedPacket, TaggedPacket, ()> for AgedPacer {
 
     fn handle_read(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
         // the congestion controller's target rides the feedback packet it came from (rtc-interceptor's pacer does the same)
-        if let Some(Attribute::TargetBitrateChanged { bits_per_second }) =
-            message.message.get(&Attribute::TargetBitrateChanged {
-                bits_per_second: 0.0,
-            })
-        {
+        if let Some(Attribute::TargetBitrateChanged { bits_per_second }) = message.message.get(&Attribute::TargetBitrateChanged { bits_per_second: 0.0 }) {
             self.bucket.set_target_bitrate(*bits_per_second);
         }
         self.read_queue.push_back(message);
@@ -257,10 +235,7 @@ impl rtc::sansio::Protocol<TaggedPacket, TaggedPacket, ()> for AgedPacer {
             return Ok(());
         };
         // a retransmission of a packet dropped for its age: what it belongs to is gone (a keyframe is on its way)
-        if self
-            .dropped
-            .contains(&(rtp.header.ssrc, rtp.header.sequence_number))
-        {
+        if self.dropped.contains(&(rtp.header.ssrc, rtp.header.sequence_number)) {
             self.shared.dropped_packets.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
@@ -288,22 +263,13 @@ impl rtc::sansio::Protocol<TaggedPacket, TaggedPacket, ()> for AgedPacer {
         self.queued_bits += bits;
         let since = message.now;
         let deadline = self.deadline(since, frame_bits_so_far);
-        self.queue.push_back(Queued {
-            packet: message,
-            bits,
-            since,
-            deadline,
-            frame,
-            keyframe,
-        });
+        self.queue.push_back(Queued { packet: message, bits, since, deadline, frame, keyframe });
         self.publish(since);
         Ok(())
     }
 
     fn poll_write(&mut self) -> Option<TaggedPacket> {
-        self.write_queue
-            .pop_front()
-            .or_else(|| self.released.pop_front())
+        self.write_queue.pop_front().or_else(|| self.released.pop_front())
     }
 
     fn handle_timeout(&mut self, now: Instant) -> Result<(), Self::Error> {
@@ -354,20 +320,9 @@ mod tests {
     const SSRC: u32 = 7;
 
     fn rtp(sequence_number: u16, timestamp: u32, now: Instant) -> TaggedPacket {
-        let mut packet = rtc::rtp::Packet {
-            payload: bytes::Bytes::from(vec![0; 1000]),
-            ..Default::default()
-        };
-        (
-            packet.header.ssrc,
-            packet.header.sequence_number,
-            packet.header.timestamp,
-        ) = (SSRC, sequence_number, timestamp);
-        TaggedPacket {
-            now,
-            transport: TransportContext::default(),
-            message: AttributedPacket::new(Packet::Rtp(packet)),
-        }
+        let mut packet = rtc::rtp::Packet { payload: bytes::Bytes::from(vec![0; 1000]), ..Default::default() };
+        (packet.header.ssrc, packet.header.sequence_number, packet.header.timestamp) = (SSRC, sequence_number, timestamp);
+        TaggedPacket { now, transport: TransportContext::default(), message: AttributedPacket::new(Packet::Rtp(packet)) }
     }
 
     /// A frame bigger than the queue limit's worth of the link (default 300 ms) (5 packets, ~40 kbit, at 80 kbit/s: 0.5 s) leaves whole: its
@@ -382,15 +337,11 @@ mod tests {
         let start = Instant::now();
         shared.mark_keyframe(SSRC, Some(100));
         for sequence_number in 0..5 {
-            pacer
-                .handle_write(rtp(sequence_number, 100, start))
-                .unwrap();
+            pacer.handle_write(rtp(sequence_number, 100, start)).unwrap();
         }
         let mut sent = 0;
         for ms in (0..=1000).step_by(10) {
-            pacer
-                .handle_timeout(start + Duration::from_millis(ms))
-                .unwrap();
+            pacer.handle_timeout(start + Duration::from_millis(ms)).unwrap();
             while pacer.poll_write().is_some() {
                 sent += 1;
             }
@@ -420,14 +371,7 @@ mod tests {
         pacer.handle_write(rtp(3, 200, start)).unwrap();
         pacer.handle_write(rtp(4, 200, start)).unwrap();
         assert_eq!(shared.dropped_packets(), 2);
-        assert_eq!(
-            pacer
-                .queue
-                .iter()
-                .map(|queued| queued.frame)
-                .collect::<Vec<_>>(),
-            [(SSRC + 1, 50), (SSRC, 200), (SSRC, 200)]
-        );
+        assert_eq!(pacer.queue.iter().map(|queued| queued.frame).collect::<Vec<_>>(), [(SSRC + 1, 50), (SSRC, 200), (SSRC, 200)]);
         assert!(!requested.load(Ordering::Acquire));
     }
 
@@ -443,13 +387,6 @@ mod tests {
         pacer.handle_write(rtp(1, 500, start)).unwrap();
         pacer.handle_write(rtp(2, 500, start)).unwrap();
         pacer.handle_write(rtp(3, 600, start)).unwrap();
-        assert_eq!(
-            pacer
-                .queue
-                .iter()
-                .map(|queued| queued.keyframe)
-                .collect::<Vec<_>>(),
-            [true, true, false]
-        );
+        assert_eq!(pacer.queue.iter().map(|queued| queued.keyframe).collect::<Vec<_>>(), [true, true, false]);
     }
 }

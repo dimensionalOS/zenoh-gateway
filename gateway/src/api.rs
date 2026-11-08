@@ -7,12 +7,12 @@
 
 use crate::auth::{Access, AclMessage, Action};
 use base64::Engine;
-use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zenoh::bytes::{Encoding, ZBytes};
 use zenoh::liveliness::LivelinessToken;
@@ -116,9 +116,7 @@ impl ApiState {
     /// unfinished queries forever).
     pub(crate) fn reap_queries(&self) {
         let stale_after = self.stale_after;
-        self.queries
-            .lock()
-            .retain(|_, (_, since)| since.elapsed() < stale_after);
+        self.queries.lock().retain(|_, (_, since)| since.elapsed() < stale_after);
     }
 }
 
@@ -166,10 +164,7 @@ pub(crate) struct ApiRequest {
 pub(crate) struct Events(pub tokio::sync::mpsc::UnboundedSender<(Instant, Value)>);
 
 impl Events {
-    pub(crate) fn send(
-        &self,
-        event: Value,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<(Instant, Value)>> {
+    pub(crate) fn send(&self, event: Value) -> Result<(), tokio::sync::mpsc::error::SendError<(Instant, Value)>> {
         self.0.send((Instant::now(), event))
     }
 }
@@ -189,14 +184,7 @@ fn base64() -> base64::engine::general_purpose::GeneralPurpose {
 }
 
 fn decode(field: &str, value: &Option<String>) -> Result<Option<Vec<u8>>, String> {
-    value
-        .as_ref()
-        .map(|text| {
-            base64()
-                .decode(text)
-                .map_err(|error| format!("{field}: {error}"))
-        })
-        .transpose()
+    value.as_ref().map(|text| base64().decode(text).map_err(|error| format!("{field}: {error}"))).transpose()
 }
 
 fn encode(bytes: &ZBytes) -> String {
@@ -204,11 +192,7 @@ fn encode(bytes: &ZBytes) -> String {
 }
 
 fn priority(value: Option<u8>) -> Result<Option<Priority>, String> {
-    value
-        .map(|value| {
-            Priority::try_from(value).map_err(|_| format!("priority must be 1-7, not {value}"))
-        })
-        .transpose()
+    value.map(|value| Priority::try_from(value).map_err(|_| format!("priority must be 1-7, not {value}"))).transpose()
 }
 
 fn congestion_control(value: &Option<String>) -> Result<Option<CongestionControl>, String> {
@@ -216,9 +200,7 @@ fn congestion_control(value: &Option<String>) -> Result<Option<CongestionControl
         None => Ok(None),
         Some("drop") => Ok(Some(CongestionControl::Drop)),
         Some("block") => Ok(Some(CongestionControl::Block)),
-        Some(other) => Err(format!(
-            "congestionControl must be \"drop\" or \"block\", not {other:?}"
-        )),
+        Some(other) => Err(format!("congestionControl must be \"drop\" or \"block\", not {other:?}")),
     }
 }
 
@@ -228,9 +210,7 @@ fn query_target(value: &Option<String>) -> Result<Option<QueryTarget>, String> {
         Some("bestMatching") => Ok(Some(QueryTarget::BestMatching)),
         Some("all") => Ok(Some(QueryTarget::All)),
         Some("allComplete") => Ok(Some(QueryTarget::AllComplete)),
-        Some(other) => Err(format!(
-            "target must be bestMatching, all or allComplete, not {other:?}"
-        )),
+        Some(other) => Err(format!("target must be bestMatching, all or allComplete, not {other:?}")),
     }
 }
 
@@ -241,21 +221,13 @@ fn consolidation(value: &Option<String>) -> Result<Option<ConsolidationMode>, St
         Some("none") => Ok(Some(ConsolidationMode::None)),
         Some("monotonic") => Ok(Some(ConsolidationMode::Monotonic)),
         Some("latest") => Ok(Some(ConsolidationMode::Latest)),
-        Some(other) => Err(format!(
-            "consolidation must be auto, none, monotonic or latest, not {other:?}"
-        )),
+        Some(other) => Err(format!("consolidation must be auto, none, monotonic or latest, not {other:?}")),
     }
 }
 
 fn timestamp(session: &Session, ms: Option<f64>) -> Option<Timestamp> {
     // NTP64 holds 32-bit seconds: a time past 2106 (or NaN) gets zenoh's own timestamp instead
-    ms.filter(|ms| (0.0..4_294_967_295_000.0).contains(ms))
-        .map(|ms| {
-            Timestamp::new(
-                NTP64::from(Duration::from_secs_f64(ms / 1000.0)),
-                session.zid().into(),
-            )
-        })
+    ms.filter(|ms| (0.0..4_294_967_295_000.0).contains(ms)).map(|ms| Timestamp::new(NTP64::from(Duration::from_secs_f64(ms / 1000.0)), session.zid().into()))
 }
 
 fn timestamp_ms(timestamp: Option<&Timestamp>) -> Option<f64> {
@@ -307,10 +279,7 @@ fn fail(id: &Value, error: impl std::fmt::Display) -> Value {
 }
 
 fn now_ms() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs_f64() * 1000.0)
-        .unwrap_or_default()
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_secs_f64() * 1000.0).unwrap_or_default()
 }
 
 /// The `key` part of a selector (`a/b?x=1` -> `a/b`).
@@ -328,29 +297,15 @@ pub(crate) async fn handle(context: Context<'_>, request: ApiRequest) -> Value {
 }
 
 async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String> {
-    let Context {
-        session,
-        access,
-        api,
-        events,
-        put_timeout,
-    } = context;
-    let timed_out = || {
-        format!(
-            "{} timed out after {put_timeout:?} (zenoh held it back)",
-            request.op
-        )
-    };
+    let Context { session, access, api, events, put_timeout } = context;
+    let timed_out = || format!("{} timed out after {put_timeout:?} (zenoh held it back)", request.op);
     let grant = access.grant;
     api.reap_queries();
     let error = |error: zenoh::Error| error.to_string();
     match request.op.as_str() {
         "put" => {
             access.check(Action::Publish, &request.key)?;
-            let mut builder = session.put(
-                &request.key,
-                decode("bytes", &request.bytes)?.unwrap_or_default(),
-            );
+            let mut builder = session.put(&request.key, decode("bytes", &request.bytes)?.unwrap_or_default());
             if let Some(encoding) = &request.encoding {
                 builder = builder.encoding(Encoding::from(encoding.as_str()));
             }
@@ -363,15 +318,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             if let Some(congestion_control) = congestion_control(&request.congestion_control)? {
                 builder = builder.congestion_control(congestion_control);
             }
-            tokio::time::timeout(
-                put_timeout,
-                builder
-                    .express(request.express.unwrap_or(false))
-                    .timestamp(timestamp(session, request.timestamp)),
-            )
-            .await
-            .map_err(|_| timed_out())?
-            .map_err(error)?;
+            tokio::time::timeout(put_timeout, builder.express(request.express.unwrap_or(false)).timestamp(timestamp(session, request.timestamp))).await.map_err(|_| timed_out())?.map_err(error)?;
             Ok(json!({}))
         }
         "delete" => {
@@ -386,15 +333,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             if let Some(congestion_control) = congestion_control(&request.congestion_control)? {
                 builder = builder.congestion_control(congestion_control);
             }
-            tokio::time::timeout(
-                put_timeout,
-                builder
-                    .express(request.express.unwrap_or(false))
-                    .timestamp(timestamp(session, request.timestamp)),
-            )
-            .await
-            .map_err(|_| timed_out())?
-            .map_err(error)?;
+            tokio::time::timeout(put_timeout, builder.express(request.express.unwrap_or(false)).timestamp(timestamp(session, request.timestamp))).await.map_err(|_| timed_out())?.map_err(error)?;
             Ok(json!({}))
         }
         "get" => {
@@ -405,12 +344,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
                 }
                 _ => request.key.clone(),
             };
-            let timeout = Duration::from_millis(
-                request
-                    .timeout_ms
-                    .unwrap_or(DEFAULT_GET_TIMEOUT_MS)
-                    .min(MAX_GET_TIMEOUT_MS),
-            );
+            let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(DEFAULT_GET_TIMEOUT_MS).min(MAX_GET_TIMEOUT_MS));
             let mut builder = session.get(selector.as_str()).timeout(timeout);
             if let Some(payload) = decode("payload", &request.payload)? {
                 builder = builder.payload(payload);
@@ -433,10 +367,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             if let Some(congestion_control) = congestion_control(&request.congestion_control)? {
                 builder = builder.congestion_control(congestion_control);
             }
-            let replies = builder
-                .express(request.express.unwrap_or(false))
-                .await
-                .map_err(error)?;
+            let replies = builder.express(request.express.unwrap_or(false)).await.map_err(error)?;
             let mut results = Vec::new();
             while let Ok(reply) = replies.recv_async().await {
                 // a reply the rules keep from the browser (reply, egress) is dropped, as zenoh drops it
@@ -488,95 +419,60 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             Ok(json!({"queryableId": queryable_id}))
         }
         "undeclareQueryable" => {
-            let queryable = api
-                .queryables
-                .lock()
-                .remove(&request.queryable_id.unwrap_or_default())
-                .ok_or("no such queryable")?;
+            let queryable = api.queryables.lock().remove(&request.queryable_id.unwrap_or_default()).ok_or("no such queryable")?;
             queryable.undeclare().await.map_err(error)?;
             Ok(json!({}))
         }
         "reply" | "replyErr" | "replyDel" => {
             let query_id = request.query_id.ok_or("queryId missing")?;
             // a reply goes out while the query stays open for more (finalizeQuery ends it)
-            let query = api
-                .queries
-                .lock()
-                .get(&query_id)
-                .map(|(query, _)| query.clone())
-                .ok_or("no such query (finalized or expired)")?;
+            let query = api.queries.lock().get(&query_id).map(|(query, _)| query.clone()).ok_or("no such query (finalized or expired)")?;
             match request.op.as_str() {
                 "reply" => {
-                    let key = if request.key.is_empty() {
-                        query.key_expr().to_string()
-                    } else {
-                        request.key.clone()
-                    };
+                    let key = if request.key.is_empty() { query.key_expr().to_string() } else { request.key.clone() };
                     access.reply(&key)?;
-                    let mut builder =
-                        query.reply(key, decode("bytes", &request.bytes)?.unwrap_or_default());
+                    let mut builder = query.reply(key, decode("bytes", &request.bytes)?.unwrap_or_default());
                     if let Some(encoding) = &request.encoding {
                         builder = builder.encoding(Encoding::from(encoding.as_str()));
                     }
                     if let Some(attachment) = decode("attachment", &request.attachment)? {
                         builder = builder.attachment(attachment);
                     }
-                    builder
-                        .timestamp(timestamp(session, request.timestamp))
-                        .await
-                        .map_err(error)?;
+                    builder.timestamp(timestamp(session, request.timestamp)).await.map_err(error)?;
                 }
                 "replyErr" => {
-                    let mut builder =
-                        query.reply_err(decode("bytes", &request.bytes)?.unwrap_or_default());
+                    let mut builder = query.reply_err(decode("bytes", &request.bytes)?.unwrap_or_default());
                     if let Some(encoding) = &request.encoding {
                         builder = builder.encoding(Encoding::from(encoding.as_str()));
                     }
                     builder.await.map_err(error)?;
                 }
                 _ => {
-                    let key = if request.key.is_empty() {
-                        query.key_expr().to_string()
-                    } else {
-                        request.key.clone()
-                    };
+                    let key = if request.key.is_empty() { query.key_expr().to_string() } else { request.key.clone() };
                     access.reply(&key)?;
                     let mut builder = query.reply_del(key);
                     if let Some(attachment) = decode("attachment", &request.attachment)? {
                         builder = builder.attachment(attachment);
                     }
-                    builder
-                        .timestamp(timestamp(session, request.timestamp))
-                        .await
-                        .map_err(error)?;
+                    builder.timestamp(timestamp(session, request.timestamp)).await.map_err(error)?;
                 }
             }
             Ok(json!({}))
         }
         "finalizeQuery" => {
             // dropping the last copy of a Query sends its final reply
-            api.queries
-                .lock()
-                .remove(&request.query_id.unwrap_or_default());
+            api.queries.lock().remove(&request.query_id.unwrap_or_default());
             Ok(json!({}))
         }
         "declareToken" => {
             access.check(Action::LivelinessToken, &request.key)?;
-            let token = session
-                .liveliness()
-                .declare_token(&request.key)
-                .await
-                .map_err(error)?;
+            let token = session.liveliness().declare_token(&request.key).await.map_err(error)?;
             let token_id = api.next();
             api.tokens.lock().insert(token_id, token);
             Ok(json!({"tokenId": token_id}))
         }
         "undeclareToken" => {
-            let token = api
-                .tokens
-                .lock()
-                .remove(&request.token_id.unwrap_or_default())
-                .ok_or("no such token")?;
+            let token = api.tokens.lock().remove(&request.token_id.unwrap_or_default()).ok_or("no such token")?;
             token.undeclare().await.map_err(error)?;
             Ok(json!({}))
         }
@@ -602,28 +498,14 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             Ok(json!({"subId": sub_id}))
         }
         "livelinessUnsubscribe" => {
-            let subscriber = api
-                .liveliness_subscribers
-                .lock()
-                .remove(&request.sub_id.unwrap_or_default())
-                .ok_or("no such liveliness subscriber")?;
+            let subscriber = api.liveliness_subscribers.lock().remove(&request.sub_id.unwrap_or_default()).ok_or("no such liveliness subscriber")?;
             subscriber.undeclare().await.map_err(error)?;
             Ok(json!({}))
         }
         "livelinessGet" => {
             access.check(Action::LivelinessGet, &request.key)?;
-            let timeout = Duration::from_millis(
-                request
-                    .timeout_ms
-                    .unwrap_or(DEFAULT_GET_TIMEOUT_MS)
-                    .min(MAX_GET_TIMEOUT_MS),
-            );
-            let replies = session
-                .liveliness()
-                .get(&request.key)
-                .timeout(timeout)
-                .await
-                .map_err(error)?;
+            let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(DEFAULT_GET_TIMEOUT_MS).min(MAX_GET_TIMEOUT_MS));
+            let replies = session.liveliness().get(&request.key).timeout(timeout).await.map_err(error)?;
             let mut tokens = Vec::new();
             while let Ok(reply) = replies.recv_async().await {
                 if let Ok(sample) = reply.result()
@@ -639,9 +521,7 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
                 "subscribers" => false,
                 "queryables" => true,
                 other => {
-                    return Err(format!(
-                        "matching must be \"subscribers\" or \"queryables\", not {other:?}"
-                    ));
+                    return Err(format!("matching must be \"subscribers\" or \"queryables\", not {other:?}"));
                 }
             };
             if queryables {
@@ -666,38 +546,23 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             };
             let entity = if queryables {
                 let querier = session.declare_querier(key).wait().map_err(error)?;
-                let listener = querier
-                    .matching_listener()
-                    .callback(on_change)
-                    .wait()
-                    .map_err(error)?;
+                let listener = querier.matching_listener().callback(on_change).wait().map_err(error)?;
                 MatchingEntity::Querier(querier, listener)
             } else {
                 let publisher = session.declare_publisher(key).wait().map_err(error)?;
-                let listener = publisher
-                    .matching_listener()
-                    .callback(on_change)
-                    .wait()
-                    .map_err(error)?;
+                let listener = publisher.matching_listener().callback(on_change).wait().map_err(error)?;
                 MatchingEntity::Publisher(publisher, listener)
             };
             api.matching.lock().insert(listener_id, entity);
             Ok(json!({"listenerId": listener_id}))
         }
         "undeclareMatchingListener" => {
-            api.matching
-                .lock()
-                .remove(&request.listener_id.unwrap_or_default())
-                .ok_or("no such matching listener")?;
+            api.matching.lock().remove(&request.listener_id.unwrap_or_default()).ok_or("no such matching listener")?;
             Ok(json!({}))
         }
         "info" => {
             let info = session.info();
-            let routers: Vec<String> = info
-                .routers_zid()
-                .await
-                .map(|zid| zid.to_string())
-                .collect();
+            let routers: Vec<String> = info.routers_zid().await.map(|zid| zid.to_string()).collect();
             let peers: Vec<String> = info.peers_zid().await.map(|zid| zid.to_string()).collect();
             Ok(json!({"zid": info.zid().await.to_string(), "routers": routers, "peers": peers}))
         }
