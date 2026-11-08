@@ -74,6 +74,8 @@ pub struct AllocationConfig {
     pub disconnected_grace: Duration,
     /// how long an answered connection may take to connect before it is treated as gone
     pub connect_timeout: Duration,
+    /// samples a stream-decoded key may queue, which is also that key's latency floor
+    pub stream_decode_backlog: usize,
     /// how long a closed connection's link estimate is kept for its page reconnecting (`resumeLink`)
     pub link_memory: Duration,
 }
@@ -1088,7 +1090,7 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
             Ok((opts, resolved, track))
         }) {
             Ok((opts, resolved, track)) => {
-                let shared = Arc::new(SubShared::new(&opts, resolved, state.codecs.clone(), state.gate.clone(), state.config.reliable_max_backlog));
+                let shared = Arc::new(SubShared::new(&opts, resolved, state.codecs.clone(), state.gate.clone(), state.config.reliable_max_backlog, state.config.stream_decode_backlog));
                 register(opts.normalized(matches!(shared.channel, Channel::Video(_))), ChannelStats::Sub(shared.clone()));
                 // checked once registered, so a lease taken meanwhile either sees this subscription or is seen here
                 if let Some(reason) = state.leases.subscribe_blocker(peer_id, &label.key) {

@@ -69,6 +69,7 @@ pub struct ServerBuilder {
     max_bandwidth_bytes_per_sec: Option<f64>,
     initial_bandwidth_bytes_per_sec: f64,
     reliable_max_backlog: Duration,
+    stream_decode_backlog: usize,
     link_memory: Duration,
     latency_target: Duration,
     stale_after: Duration,
@@ -105,6 +106,7 @@ impl Default for ServerBuilder {
             max_bandwidth_bytes_per_sec: None,
             initial_bandwidth_bytes_per_sec: crate::allocator::DEFAULT_INITIAL_BANDWIDTH,
             reliable_max_backlog: crate::subscription::DEFAULT_RELIABLE_MAX_BACKLOG,
+            stream_decode_backlog: crate::subscription::DEFAULT_STREAM_DECODE_BACKLOG,
             link_memory: crate::allocator::DEFAULT_LINK_MEMORY,
             latency_target: crate::allocator::DEFAULT_LATENCY_TARGET,
             stale_after: crate::allocator::DEFAULT_STALE_AFTER,
@@ -199,6 +201,18 @@ impl ServerBuilder {
     /// ones push the oldest out (order kept; the drops show as `seq` gaps and in `droppedQueue`).
     pub fn reliable_max_backlog(mut self, backlog: Duration) -> Self {
         self.reliable_max_backlog = backlog;
+        self
+    }
+
+    /// Samples a stream-decoded key may queue (default 8), which is also that key's latency floor.
+    ///
+    /// A stream whose frames predict from each other must see every sample, so room to ride out a stall is worth far
+    /// more here than on a key whose frames stand alone. But where decoding a frame takes about as long as a frame
+    /// interval there is no spare capacity to drain the queue with, so a full queue stays full and its depth is added to
+    /// the age of every picture: eight frames is ~266 ms at 30 Hz. Lower it on a machine that would rather drop a sample
+    /// than carry that. Never less than one, since zero would queue nothing at all.
+    pub fn stream_decode_backlog(mut self, samples: usize) -> Self {
+        self.stream_decode_backlog = samples.max(1);
         self
     }
 
@@ -428,6 +442,7 @@ impl ServerBuilder {
             reliable_max_backlog: self.reliable_max_backlog,
             disconnected_grace: self.disconnected_grace,
             connect_timeout: self.connect_timeout,
+            stream_decode_backlog: self.stream_decode_backlog,
             link_memory: self.link_memory,
         }, leases, self.connect_config);
         let inner = Arc::new(Inner { gateway, session, owns_session, serve_dir: self.serve_dir, tls, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });

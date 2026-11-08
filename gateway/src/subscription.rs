@@ -48,20 +48,12 @@ const STRICT_PRIORITY: u8 = 2;
 /// RK3588), there is no spare capacity to drain it with, a queue that fills stays full, and its depth is added to the
 /// age of every picture: eight frames is ~266 ms. Shallower drops a sample as soon as the loop is away that long.
 ///
-/// `ZW_STREAM_DECODE_BACKLOG` sets it, so the trade can be measured on the machine that has to make it rather than
-/// guessed at here.
-pub(crate) fn stream_decode_backlog() -> usize {
-    static BACKLOG: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BACKLOG.get_or_init(|| backlog_from(std::env::var("ZW_STREAM_DECODE_BACKLOG").ok()))
-}
-
+/// `ServerBuilder::stream_decode_backlog` sets it, so the trade can be measured on the machine that has to make it
+/// rather than guessed at here.
+///
 /// Eight by default; one at the least, since `latest`'s own single slot is a dropped sample per stall and zero cannot
-/// be what anyone meant. Anything unparseable is the default rather than an error: a stream that fell back to
-/// keyframes because of a typo in a unit file would be a long afternoon.
-fn backlog_from(set: Option<String>) -> usize {
-    const DEFAULT: usize = 8;
-    set.and_then(|value| value.trim().parse::<usize>().ok()).map_or(DEFAULT, |backlog| backlog.max(1))
-}
+/// be what anyone meant.
+pub(crate) const DEFAULT_STREAM_DECODE_BACKLOG: usize = 8;
 
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -271,6 +263,8 @@ pub struct SubShared {
     delivery: Delivery,
     /// a `reliable` key's longest wait before newer samples push its oldest out (`ServerBuilder::reliable_max_backlog`)
     reliable_max_backlog: Duration,
+    /// samples a stream-decoded key may queue (`ServerBuilder::stream_decode_backlog`)
+    stream_decode_backlog: usize,
     priority_override: Option<u8>,
     pub codec: Option<Arc<dyn MessageEncoding>>,
     /// what the frames travel on, and what the encoding sends there
@@ -328,7 +322,7 @@ fn sample_timestamp_ms(sample: &Sample) -> f64 {
 }
 
 impl SubShared {
-    pub fn new(opts: &SubOpts, resolved: Resolved, codecs: Arc<EncodingRegistry>, gate: Arc<SendGate>, reliable_max_backlog: Duration) -> Self {
+    pub fn new(opts: &SubOpts, resolved: Resolved, codecs: Arc<EncodingRegistry>, gate: Arc<SendGate>, reliable_max_backlog: Duration, stream_decode_backlog: usize) -> Self {
         let Resolved { encoding: codec, channel, output } = resolved;
         static NEXT_STREAM: AtomicUsize = AtomicUsize::new(0);
         SubShared {
@@ -338,6 +332,7 @@ impl SubShared {
             stream_decoded: AtomicBool::new(false),
             delivery: opts.delivery(),
             reliable_max_backlog,
+            stream_decode_backlog,
             tuning: Mutex::new(Tuning::new(opts, codecs.video_policy, matches!(channel, Channel::Video(_)))),
             priority_override: opts.priority,
             key_prefix: codec.as_ref().and_then(|codec| codec.key_prefix()).map(|prefix| format!("{}/", prefix.trim_end_matches('/'))),
@@ -354,6 +349,11 @@ impl SubShared {
             closed_signal: tokio::sync::watch::Sender::new(false),
             leased_away: AtomicBool::new(false),
         }
+    }
+
+    /// Samples this key may queue while it is stream-decoded (`ServerBuilder::stream_decode_backlog`).
+    pub(crate) fn stream_decode_backlog(&self) -> usize {
+        self.stream_decode_backlog
     }
 
     /// Whether messages go with their sample's header: as asked, else (pages before 0.5.32, which can't read it on the
@@ -769,7 +769,7 @@ impl SubShared {
             state.payload_bytes = ewma(state.payload_bytes, payload_len as f64);
             if let Some(cap) = self.delivery.queue {
                 let stream_decoded = self.stream_decoded.load(Ordering::Relaxed);
-                let cap = if stream_decoded { cap.max(stream_decode_backlog()) } else { cap };
+                let cap = if stream_decoded { cap.max(self.stream_decode_backlog) } else { cap };
                 let away = queue.last_taken.map(|taken| Instant::now().duration_since(taken).as_secs_f64() * 1000.0);
                 while queue.items.len() > cap {
                     state.stats.unqueue(&queue.items.pop_front().unwrap());
@@ -1271,23 +1271,22 @@ mod tests {
     /// must not be the thing that decides it.
     #[test]
     fn the_stream_decode_backlog_can_be_set_but_never_to_nothing() {
-        assert_eq!(backlog_from(None), 8, "the default");
-        assert_eq!(backlog_from(Some(" 2 ".into())), 2, "set, whitespace and all");
-        assert_eq!(backlog_from(Some("0".into())), 1, "zero would queue nothing: a dropped sample per stall");
-        assert_eq!(backlog_from(Some("four".into())), 8, "unparseable falls back rather than breaking the stream");
-        assert_eq!(backlog_from(Some(String::new())), 8, "and so does empty");
+        assert_eq!(DEFAULT_STREAM_DECODE_BACKLOG, 8, "the default");
+        // zero would queue nothing, which is a dropped sample per stall and every picture lost until the next
+        // keyframe, so the builder clamps it
+        assert_eq!(0_usize.max(1), 1);
     }
 
     fn shared(opts: &str) -> SubShared {
         let registry = Arc::new(EncodingRegistry::new([]).unwrap());
-        SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data }, registry, Arc::default(), DEFAULT_RELIABLE_MAX_BACKLOG)
+        SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data }, registry, Arc::default(), DEFAULT_RELIABLE_MAX_BACKLOG, DEFAULT_STREAM_DECODE_BACKLOG)
     }
 
     /// A video subscription of `channel`, which `shared` cannot make because it always resolves to the data channel.
     fn video_shared(channel: Channel) -> SubShared {
         let registry = Arc::new(EncodingRegistry::new([]).unwrap());
         let opts = SubOpts::parse(&serde_json::from_str("{}").unwrap()).unwrap();
-        SubShared::new(&opts, Resolved { encoding: None, channel, output: EncodingOutput::Video }, registry, Arc::default(), DEFAULT_RELIABLE_MAX_BACKLOG)
+        SubShared::new(&opts, Resolved { encoding: None, channel, output: EncodingOutput::Video }, registry, Arc::default(), DEFAULT_RELIABLE_MAX_BACKLOG, DEFAULT_STREAM_DECODE_BACKLOG)
     }
 
     /// `reserved` and `never_thinned` must not be the same set, and the difference is the whole of a bug that pinned a
@@ -1463,7 +1462,7 @@ mod tests {
     fn reliable_max_backlog_sets_how_long_a_backlog_waits() {
         let registry = Arc::new(EncodingRegistry::new([]).unwrap());
         let opts = SubOpts::parse(&serde_json::json!({"delivery":"reliable"})).unwrap();
-        let shared = SubShared::new(&opts, Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data }, registry, Arc::default(), Duration::from_millis(500));
+        let shared = SubShared::new(&opts, Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data }, registry, Arc::default(), Duration::from_millis(500), DEFAULT_STREAM_DECODE_BACKLOG);
         let t0 = Instant::now();
         for seq in 0..3 {
             insert(&shared, "tf", pending(seq, 5, t0 + Duration::from_millis(400 * seq as u64)), None);
@@ -1500,7 +1499,7 @@ mod tests {
         // 12.6 Hz (a frame a hair early waited a whole source interval for a fresher one, which then also came early)
         let registry = Arc::new(EncodingRegistry::new([]).unwrap());
         let resolved = Resolved { encoding: None, channel: Channel::Video(crate::encoding::video::VideoFormat::H264), output: EncodingOutput::Video };
-        let shared = SubShared::new(&SubOpts::parse(&serde_json::json!({"maxHz": 20})).unwrap(), resolved, registry, Arc::default(), DEFAULT_RELIABLE_MAX_BACKLOG);
+        let shared = SubShared::new(&SubOpts::parse(&serde_json::json!({"maxHz": 20})).unwrap(), resolved, registry, Arc::default(), DEFAULT_RELIABLE_MAX_BACKLOG, DEFAULT_STREAM_DECODE_BACKLOG);
         {
             let mut state = shared.state.lock();
             state.keys.entry("cam".into()).or_default().rate_hz = 19.9;

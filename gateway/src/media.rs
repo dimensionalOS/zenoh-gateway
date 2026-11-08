@@ -1458,13 +1458,13 @@ struct Fed {
 /// Samples of one key waiting to be picked before the send loop spends a frame catching up: it decodes the picture (so
 /// the stream's reference chain stays whole) and does not encode it, which costs this one frame and saves the stream.
 ///
-/// Half of the key's [backlog](crate::subscription::stream_decode_backlog), not "anything queued": at 30 Hz a
+/// Half of the key's configured backlog, not "anything queued": at 30 Hz a
 /// sample is almost always queued, and skipping the encode whenever one was sent **nothing at all** (2337 samples
 /// received, 0 frames encoded). Half leaves the loop encoding every frame at its rate and catching up only when it has
 /// fallen far enough behind that the queue is about to drop a sample — which for a stream decoder is a gap in the
 /// reference chain and the pictures until the publisher's next keyframe, about a second on a robot camera.
-fn catch_up_backlog() -> usize {
-    (crate::subscription::stream_decode_backlog() / 2).max(1)
+fn catch_up_backlog(stream_decode_backlog: usize) -> usize {
+    (stream_decode_backlog / 2).max(1)
 }
 
 /// Where a video send loop's wall clock goes, logged every `PROFILE_FRAMES` iterations.
@@ -1880,7 +1880,7 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             let interval = shared.min_interval().unwrap_or_default();
             let now = Instant::now();
             let due = last_encode.is_none_or(|previous| now.duration_since(previous) + CATCH_UP_EARLY >= interval);
-            if !due || shared.backlog(&key) >= catch_up_backlog() {
+            if !due || shared.backlog(&key) >= catch_up_backlog(shared.stream_decode_backlog()) {
                 catching_up += 1;
                 shared.record_catch_up();
                 continue;
