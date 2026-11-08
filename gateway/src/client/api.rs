@@ -12,14 +12,25 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Events routed to a handle, and the field naming the handle.
-pub(super) const EVENT_IDS: &[(&str, &str)] = &[("query", "queryableId"), ("liveliness", "subId"), ("matching", "listenerId")];
+pub(super) const EVENT_IDS: &[(&str, &str)] = &[
+    ("query", "queryableId"),
+    ("liveliness", "subId"),
+    ("matching", "listenerId"),
+];
 
 fn base64() -> base64::engine::general_purpose::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
 }
 
 fn decoded(value: &Value) -> Result<Option<Vec<u8>>> {
-    value.as_str().map(|text| base64().decode(text).map_err(|error| anyhow!("bad base64: {error}"))).transpose()
+    value
+        .as_str()
+        .map(|text| {
+            base64()
+                .decode(text)
+                .map_err(|error| anyhow!("bad base64: {error}"))
+        })
+        .transpose()
 }
 
 /// zenoh's congestion control.
@@ -135,7 +146,8 @@ impl GetOptions {
     }
 
     fn request(&self, key: &str) -> Value {
-        let mut request = json!({"op": "get", "key": key, "timeoutMs": self.timeout().as_millis() as u64});
+        let mut request =
+            json!({"op": "get", "key": key, "timeoutMs": self.timeout().as_millis() as u64});
         if let Some(parameters) = &self.parameters {
             request["parameters"] = json!(parameters);
         }
@@ -179,9 +191,15 @@ impl GetOptions {
 pub(super) fn parse_reply(reply: &Value) -> Result<GetReply> {
     let encoding = reply["encoding"].as_str().map(str::to_owned);
     Ok(match reply.get("error") {
-        Some(error) => {
-            GetReply { key: None, bytes: decoded(error)?.unwrap_or_default(), error: true, encoding, attachment: None, delete: false, timestamp_ms: None }
-        }
+        Some(error) => GetReply {
+            key: None,
+            bytes: decoded(error)?.unwrap_or_default(),
+            error: true,
+            encoding,
+            attachment: None,
+            delete: false,
+            timestamp_ms: None,
+        },
         None => GetReply {
             key: reply["key"].as_str().map(str::to_owned),
             bytes: decoded(&reply["bytes"])?.unwrap_or_default(),
@@ -245,11 +263,24 @@ impl Client {
     fn route(&self, event: &'static str, id: u64) -> (Route, mpsc::UnboundedReceiver<Value>) {
         let (sender, receiver) = mpsc::unbounded_channel();
         let mut routes = self.inner.shared.api_routes.lock();
-        for message in self.inner.shared.api_early.lock().remove(&(event, id)).unwrap_or_default() {
+        for message in self
+            .inner
+            .shared
+            .api_early
+            .lock()
+            .remove(&(event, id))
+            .unwrap_or_default()
+        {
             let _ = sender.send(message);
         }
         routes.insert((event, id), sender);
-        (Route { client: Arc::downgrade(&self.inner), key: (event, id) }, receiver)
+        (
+            Route {
+                client: Arc::downgrade(&self.inner),
+                key: (event, id),
+            },
+            receiver,
+        )
     }
 
     /// A one-off zenoh put through the gateway (needs the `publish` grant).
@@ -268,67 +299,171 @@ impl Client {
 
     /// A zenoh query with options.
     pub async fn get_with(&self, key: &str, options: GetOptions) -> Result<Vec<GetReply>> {
-        let reply = self.api_request(options.request(key), options.timeout() + Duration::from_secs(2)).await?;
-        reply["replies"].as_array().map(Vec::as_slice).unwrap_or_default().iter().map(parse_reply).collect()
+        let reply = self
+            .api_request(
+                options.request(key),
+                options.timeout() + Duration::from_secs(2),
+            )
+            .await?;
+        reply["replies"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(parse_reply)
+            .collect()
     }
 
     /// Queries with fixed options, like zenoh's querier.
     pub fn querier(&self, key: &str, options: GetOptions) -> Querier {
-        Querier { client: Client { inner: self.inner.clone() }, key: key.to_owned(), options }
+        Querier {
+            client: Client {
+                inner: self.inner.clone(),
+            },
+            key: key.to_owned(),
+            options,
+        }
     }
 
     /// Answers queries on `key` from this client (needs the `queryable` grant). `complete`: it
     /// answers for every key under `key`.
     pub async fn declare_queryable(&self, key: &str, complete: bool) -> Result<Queryable> {
-        let reply = self.api_request(json!({"op": "declareQueryable", "key": key, "complete": complete}), PING_TIMEOUT).await?;
-        let id = reply["queryableId"].as_u64().ok_or_else(|| anyhow!("no queryableId"))?;
+        let reply = self
+            .api_request(
+                json!({"op": "declareQueryable", "key": key, "complete": complete}),
+                PING_TIMEOUT,
+            )
+            .await?;
+        let id = reply["queryableId"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("no queryableId"))?;
         let (route, receiver) = self.route("query", id);
-        Ok(Queryable { client: Client { inner: self.inner.clone() }, id, receiver, _route: route })
+        Ok(Queryable {
+            client: Client {
+                inner: self.inner.clone(),
+            },
+            id,
+            receiver,
+            _route: route,
+        })
     }
 
     /// A liveliness token on `key`, alive until undeclared or this client goes (needs `liveliness`).
     pub async fn declare_token(&self, key: &str) -> Result<LivelinessToken> {
-        let reply = self.api_request(json!({"op": "declareToken", "key": key}), PING_TIMEOUT).await?;
-        let id = reply["tokenId"].as_u64().ok_or_else(|| anyhow!("no tokenId"))?;
-        Ok(LivelinessToken { client: Client { inner: self.inner.clone() }, id })
+        let reply = self
+            .api_request(json!({"op": "declareToken", "key": key}), PING_TIMEOUT)
+            .await?;
+        let id = reply["tokenId"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("no tokenId"))?;
+        Ok(LivelinessToken {
+            client: Client {
+                inner: self.inner.clone(),
+            },
+            id,
+        })
     }
 
     /// Liveliness tokens appearing and disappearing under `key`; `history` also reports the ones
     /// already alive.
-    pub async fn liveliness_subscribe(&self, key: &str, history: bool) -> Result<LivelinessSubscriber> {
-        let reply = self.api_request(json!({"op": "livelinessSubscribe", "key": key, "history": history}), PING_TIMEOUT).await?;
+    pub async fn liveliness_subscribe(
+        &self,
+        key: &str,
+        history: bool,
+    ) -> Result<LivelinessSubscriber> {
+        let reply = self
+            .api_request(
+                json!({"op": "livelinessSubscribe", "key": key, "history": history}),
+                PING_TIMEOUT,
+            )
+            .await?;
         let id = reply["subId"].as_u64().ok_or_else(|| anyhow!("no subId"))?;
         let (route, receiver) = self.route("liveliness", id);
-        Ok(LivelinessSubscriber { client: Client { inner: self.inner.clone() }, id, receiver, _route: route })
+        Ok(LivelinessSubscriber {
+            client: Client {
+                inner: self.inner.clone(),
+            },
+            id,
+            receiver,
+            _route: route,
+        })
     }
 
     /// The keys of the liveliness tokens alive under `key`.
     pub async fn liveliness_get(&self, key: &str, timeout: Duration) -> Result<Vec<String>> {
-        let reply =
-            self.api_request(json!({"op": "livelinessGet", "key": key, "timeoutMs": timeout.as_millis() as u64}), timeout + Duration::from_secs(2)).await?;
-        Ok(reply["tokens"].as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(|key| key.as_str().map(str::to_owned)).collect())
+        let reply = self
+            .api_request(
+                json!({"op": "livelinessGet", "key": key, "timeoutMs": timeout.as_millis() as u64}),
+                timeout + Duration::from_secs(2),
+            )
+            .await?;
+        Ok(reply["tokens"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|key| key.as_str().map(str::to_owned))
+            .collect())
     }
 
     /// Whether a publisher (subscribers) or a querier (queryables) on `key` would reach anyone now.
     pub async fn matching_status(&self, key: &str, target: MatchingTarget) -> Result<bool> {
-        let reply = self.api_request(json!({"op": "matchingStatus", "key": key, "matching": target.as_str()}), PING_TIMEOUT + Duration::from_secs(5)).await?;
-        reply["matching"].as_bool().ok_or_else(|| anyhow!("no matching"))
+        let reply = self
+            .api_request(
+                json!({"op": "matchingStatus", "key": key, "matching": target.as_str()}),
+                PING_TIMEOUT + Duration::from_secs(5),
+            )
+            .await?;
+        reply["matching"]
+            .as_bool()
+            .ok_or_else(|| anyhow!("no matching"))
     }
 
     /// Notified each time [`Client::matching_status`] for `key` changes.
-    pub async fn matching_listener(&self, key: &str, target: MatchingTarget) -> Result<MatchingListener> {
-        let reply = self.api_request(json!({"op": "declareMatchingListener", "key": key, "matching": target.as_str()}), PING_TIMEOUT).await?;
-        let id = reply["listenerId"].as_u64().ok_or_else(|| anyhow!("no listenerId"))?;
+    pub async fn matching_listener(
+        &self,
+        key: &str,
+        target: MatchingTarget,
+    ) -> Result<MatchingListener> {
+        let reply = self
+            .api_request(
+                json!({"op": "declareMatchingListener", "key": key, "matching": target.as_str()}),
+                PING_TIMEOUT,
+            )
+            .await?;
+        let id = reply["listenerId"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("no listenerId"))?;
         let (route, receiver) = self.route("matching", id);
-        Ok(MatchingListener { client: Client { inner: self.inner.clone() }, id, receiver, _route: route })
+        Ok(MatchingListener {
+            client: Client {
+                inner: self.inner.clone(),
+            },
+            id,
+            receiver,
+            _route: route,
+        })
     }
 
     /// The gateway's zenoh session: its id, and the routers and peers it is connected to.
     pub async fn info(&self) -> Result<SessionInfo> {
-        let reply = self.api_request(json!({"op": "info"}), PING_TIMEOUT).await?;
-        let strings =
-            |value: &Value| value.as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(|item| item.as_str().map(str::to_owned)).collect();
-        Ok(SessionInfo { zid: reply["zid"].as_str().unwrap_or_default().to_owned(), routers: strings(&reply["routers"]), peers: strings(&reply["peers"]) })
+        let reply = self
+            .api_request(json!({"op": "info"}), PING_TIMEOUT)
+            .await?;
+        let strings = |value: &Value| {
+            value
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        };
+        Ok(SessionInfo {
+            zid: reply["zid"].as_str().unwrap_or_default().to_owned(),
+            routers: strings(&reply["routers"]),
+            peers: strings(&reply["peers"]),
+        })
     }
 }
 
@@ -346,7 +481,12 @@ impl Querier {
     }
 
     /// With per-call parameters, payload and attachment on top of the querier's options.
-    pub async fn get_with(&self, parameters: Option<&str>, payload: Option<Vec<u8>>, attachment: Option<Vec<u8>>) -> Result<Vec<GetReply>> {
+    pub async fn get_with(
+        &self,
+        parameters: Option<&str>,
+        payload: Option<Vec<u8>>,
+        attachment: Option<Vec<u8>>,
+    ) -> Result<Vec<GetReply>> {
         let mut options = self.options.clone();
         options.parameters = parameters.map(str::to_owned).or(options.parameters);
         options.payload = payload.or(options.payload);
@@ -356,7 +496,9 @@ impl Querier {
 
     /// Whether a queryable would answer now.
     pub async fn matching_status(&self) -> Result<bool> {
-        self.client.matching_status(&self.key, MatchingTarget::Queryables).await
+        self.client
+            .matching_status(&self.key, MatchingTarget::Queryables)
+            .await
     }
 }
 
@@ -380,7 +522,13 @@ pub struct Query {
 
 impl Query {
     /// Replies with a sample on `key` (default: the query's key).
-    pub async fn reply(&self, key: Option<&str>, bytes: impl AsRef<[u8]>, encoding: Option<&str>, attachment: Option<&[u8]>) -> Result<()> {
+    pub async fn reply(
+        &self,
+        key: Option<&str>,
+        bytes: impl AsRef<[u8]>,
+        encoding: Option<&str>,
+        attachment: Option<&[u8]>,
+    ) -> Result<()> {
         let mut request = json!({"op": "reply", "queryId": self.id, "key": key.unwrap_or_default(), "bytes": base64().encode(bytes)});
         if let Some(encoding) = encoding {
             request["encoding"] = json!(encoding);
@@ -388,26 +536,45 @@ impl Query {
         if let Some(attachment) = attachment {
             request["attachment"] = json!(base64().encode(attachment));
         }
-        self.client.api_request(request, PING_TIMEOUT).await.map(drop)
+        self.client
+            .api_request(request, PING_TIMEOUT)
+            .await
+            .map(drop)
     }
 
     /// Replies with an error.
     pub async fn reply_err(&self, bytes: impl AsRef<[u8]>, encoding: Option<&str>) -> Result<()> {
-        let mut request = json!({"op": "replyErr", "queryId": self.id, "bytes": base64().encode(bytes)});
+        let mut request =
+            json!({"op": "replyErr", "queryId": self.id, "bytes": base64().encode(bytes)});
         if let Some(encoding) = encoding {
             request["encoding"] = json!(encoding);
         }
-        self.client.api_request(request, PING_TIMEOUT).await.map(drop)
+        self.client
+            .api_request(request, PING_TIMEOUT)
+            .await
+            .map(drop)
     }
 
     /// Replies that `key` (default: the query's key) was deleted.
     pub async fn reply_del(&self, key: Option<&str>) -> Result<()> {
-        self.client.api_request(json!({"op": "replyDel", "queryId": self.id, "key": key.unwrap_or_default()}), PING_TIMEOUT).await.map(drop)
+        self.client
+            .api_request(
+                json!({"op": "replyDel", "queryId": self.id, "key": key.unwrap_or_default()}),
+                PING_TIMEOUT,
+            )
+            .await
+            .map(drop)
     }
 
     /// No more replies: the asker's get completes.
     pub async fn finalize(self) -> Result<()> {
-        self.client.api_request(json!({"op": "finalizeQuery", "queryId": self.id}), PING_TIMEOUT).await.map(drop)
+        self.client
+            .api_request(
+                json!({"op": "finalizeQuery", "queryId": self.id}),
+                PING_TIMEOUT,
+            )
+            .await
+            .map(drop)
     }
 }
 
@@ -424,7 +591,9 @@ impl Queryable {
     pub async fn recv(&mut self) -> Option<Query> {
         let event = self.receiver.recv().await?;
         Some(Query {
-            client: Client { inner: self.client.inner.clone() },
+            client: Client {
+                inner: self.client.inner.clone(),
+            },
             id: event["queryId"].as_u64().unwrap_or_default(),
             key: event["key"].as_str().unwrap_or_default().to_owned(),
             parameters: event["parameters"].as_str().unwrap_or_default().to_owned(),
@@ -436,7 +605,13 @@ impl Queryable {
 
     /// Ends it on the gateway.
     pub async fn undeclare(self) -> Result<()> {
-        self.client.api_request(json!({"op": "undeclareQueryable", "queryableId": self.id}), PING_TIMEOUT).await.map(drop)
+        self.client
+            .api_request(
+                json!({"op": "undeclareQueryable", "queryableId": self.id}),
+                PING_TIMEOUT,
+            )
+            .await
+            .map(drop)
     }
 }
 
@@ -449,7 +624,13 @@ pub struct LivelinessToken {
 impl LivelinessToken {
     /// Ends it on the gateway.
     pub async fn undeclare(self) -> Result<()> {
-        self.client.api_request(json!({"op": "undeclareToken", "tokenId": self.id}), PING_TIMEOUT).await.map(drop)
+        self.client
+            .api_request(
+                json!({"op": "undeclareToken", "tokenId": self.id}),
+                PING_TIMEOUT,
+            )
+            .await
+            .map(drop)
     }
 }
 
@@ -474,12 +655,21 @@ impl LivelinessSubscriber {
     /// The next change (None once the connection is gone).
     pub async fn recv(&mut self) -> Option<LivelinessChange> {
         let event = self.receiver.recv().await?;
-        Some(LivelinessChange { key: event["key"].as_str().unwrap_or_default().to_owned(), alive: event["kind"] == "put" })
+        Some(LivelinessChange {
+            key: event["key"].as_str().unwrap_or_default().to_owned(),
+            alive: event["kind"] == "put",
+        })
     }
 
     /// Ends it on the gateway.
     pub async fn undeclare(self) -> Result<()> {
-        self.client.api_request(json!({"op": "livelinessUnsubscribe", "subId": self.id}), PING_TIMEOUT).await.map(drop)
+        self.client
+            .api_request(
+                json!({"op": "livelinessUnsubscribe", "subId": self.id}),
+                PING_TIMEOUT,
+            )
+            .await
+            .map(drop)
     }
 }
 
@@ -499,14 +689,23 @@ impl MatchingListener {
 
     /// Ends it on the gateway.
     pub async fn undeclare(self) -> Result<()> {
-        self.client.api_request(json!({"op": "undeclareMatchingListener", "listenerId": self.id}), PING_TIMEOUT).await.map(drop)
+        self.client
+            .api_request(
+                json!({"op": "undeclareMatchingListener", "listenerId": self.id}),
+                PING_TIMEOUT,
+            )
+            .await
+            .map(drop)
     }
 }
 
 impl super::Publisher {
     /// A zenoh delete on this publisher's key.
     pub async fn delete(&self, options: PutOptions) -> Result<()> {
-        let inner = self.client.upgrade().ok_or_else(|| anyhow!("the client is gone"))?;
+        let inner = self
+            .client
+            .upgrade()
+            .ok_or_else(|| anyhow!("the client is gone"))?;
         Client { inner }.delete(&self.key, options).await
     }
 }

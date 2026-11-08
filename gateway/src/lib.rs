@@ -58,25 +58,38 @@ mod rtp_pacer;
 mod server;
 mod subscription;
 
-pub use encoding::{AudioPcm, Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, MessageHeader, EncodedVideo, H264Encoder, PixelFormat, StreamDecoder, VideoEncoder, VideoFormat, VideoImage, VideoPolicy, VideoTarget};
 pub use auth::{Acl, AclMessage, AclRule, Flow, Grant, OnRefused, Permission};
+pub use encoding::{
+    AudioPcm, Channel, Compress, DecodedFrame, EncodeOptions, EncodedVideo, EncodingOutput,
+    EncodingSample, H264Encoder, MessageEncoding, MessageHeader, PixelFormat, StreamDecoder,
+    VideoEncoder, VideoFormat, VideoImage, VideoPolicy, VideoTarget,
+};
 pub use fields::Fields;
-pub use ice::{ICE_HOOK_TIMEOUT, IceRequest, IceServer, IceServersFn, IceSide, turn_credentials};
 #[cfg(feature = "cloudflare")]
 pub use ice::CloudflareTurn;
+pub use ice::{ICE_HOOK_TIMEOUT, IceRequest, IceServer, IceServersFn, IceSide, turn_credentials};
 #[doc(hidden)]
 pub use peer::live_peer_states;
-pub use server::{Authorize, DEFAULT_PORT, HEALTH_PATH, ICE_PATH, RunningServer, SIGNALLING_PREFIX, Server, ServerBuilder};
+pub use server::{
+    Authorize, DEFAULT_PORT, HEALTH_PATH, ICE_PATH, RunningServer, SIGNALLING_PREFIX, Server,
+    ServerBuilder,
+};
 /// The zenoh version this crate is built against (for [`ServerBuilder::session`] and
 /// [`ServerBuilder::zenoh_config`]).
 pub use zenoh;
 
 /// Spawns `task`; a panic in it is logged and runs `on_panic` (closing only what the task served) instead of
 /// leaving that part of the gateway dead. The returned handle finishes after both.
-pub(crate) fn spawn_isolated(what: String, task: impl Future<Output = ()> + Send + 'static, on_panic: impl Future<Output = ()> + Send + 'static) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn_isolated(
+    what: String,
+    task: impl Future<Output = ()> + Send + 'static,
+    on_panic: impl Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
     let handle = tokio::spawn(task);
     tokio::spawn(async move {
-        if let Err(error) = handle.await && error.is_panic() {
+        if let Err(error) = handle.await
+            && error.is_panic()
+        {
             log::error!("{what} panicked, closing it: {error}");
             on_panic.await;
         }
@@ -85,7 +98,11 @@ pub(crate) fn spawn_isolated(what: String, task: impl Future<Output = ()> + Send
 
 /// Seconds as a `Duration` that cannot panic: NaN or negative is zero, beyond a day is a day (so `Instant + it` cannot overflow either).
 pub(crate) fn secs(seconds: f64) -> std::time::Duration {
-    std::time::Duration::from_secs_f64(if seconds > 0.0 { seconds.min(86_400.0) } else { 0.0 })
+    std::time::Duration::from_secs_f64(if seconds > 0.0 {
+        seconds.min(86_400.0)
+    } else {
+        0.0
+    })
 }
 
 #[cfg(test)]
@@ -104,10 +121,16 @@ mod tests {
     #[tokio::test]
     async fn a_panicked_task_runs_only_its_own_cleanup() {
         let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
-        super::spawn_isolated("test".into(), async { panic!("boom") }, async move { closed_tx.send(()).unwrap() }).await.unwrap();
+        super::spawn_isolated("test".into(), async { panic!("boom") }, async move {
+            closed_tx.send(()).unwrap()
+        })
+        .await
+        .unwrap();
         closed_rx.await.expect("on_panic ran");
         let (unused_tx, unused_rx) = tokio::sync::oneshot::channel::<()>();
-        super::spawn_isolated("test".into(), async {}, async move { drop(unused_tx) }).await.unwrap();
+        super::spawn_isolated("test".into(), async {}, async move { drop(unused_tx) })
+            .await
+            .unwrap();
         drop(unused_rx);
     }
 }

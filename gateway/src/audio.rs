@@ -7,7 +7,9 @@ use crate::subscription::{self, SubShared};
 use anyhow::{Result, ensure};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use unsafe_libopus::{OPUS_APPLICATION_AUDIO, OpusEncoder, opus_encode, opus_encoder_create, opus_encoder_destroy};
+use unsafe_libopus::{
+    OPUS_APPLICATION_AUDIO, OpusEncoder, opus_encode, opus_encoder_create, opus_encoder_destroy,
+};
 use webrtc::data_channel::DataChannel;
 
 const PACKET: Duration = Duration::from_millis(20);
@@ -26,9 +28,23 @@ impl Opus {
     fn new(sample_rate: u32, channels: u8) -> Result<Self> {
         let mut error = 0;
         // SAFETY: AudioPcm guarantees a rate and channel count libopus accepts; the result is checked
-        let encoder = unsafe { opus_encoder_create(sample_rate as i32, channels as i32, OPUS_APPLICATION_AUDIO, &mut error) };
-        ensure!(!encoder.is_null() && error == 0, "opus_encoder_create failed ({error})");
-        Ok(Opus { encoder, sample_rate, channels })
+        let encoder = unsafe {
+            opus_encoder_create(
+                sample_rate as i32,
+                channels as i32,
+                OPUS_APPLICATION_AUDIO,
+                &mut error,
+            )
+        };
+        ensure!(
+            !encoder.is_null() && error == 0,
+            "opus_encoder_create failed ({error})"
+        );
+        Ok(Opus {
+            encoder,
+            sample_rate,
+            channels,
+        })
     }
 
     /// Samples (all channels) in one packet.
@@ -40,7 +56,15 @@ impl Opus {
     fn encode(&mut self, samples: &[i16]) -> Result<Vec<u8>> {
         let mut packet = vec![0u8; 1500];
         // SAFETY: `samples` holds one 20 ms frame of `channels` interleaved samples; `packet` is writable for its length
-        let length = unsafe { opus_encode(self.encoder, samples.as_ptr(), (samples.len() / self.channels as usize) as i32, packet.as_mut_ptr(), packet.len() as i32) };
+        let length = unsafe {
+            opus_encode(
+                self.encoder,
+                samples.as_ptr(),
+                (samples.len() / self.channels as usize) as i32,
+                packet.as_mut_ptr(),
+                packet.len() as i32,
+            )
+        };
         ensure!(length > 0, "opus_encode failed ({length})");
         packet.truncate(length as usize);
         Ok(packet)
@@ -58,7 +82,9 @@ impl Drop for Opus {
 /// (a remainder waits for the next sample) and write them to the track; a small frame per sample
 /// on the data channel delivers the message to the page.
 pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: TrackClaim) {
-    let Some(codec) = shared.codec.clone() else { return };
+    let Some(codec) = shared.codec.clone() else {
+        return;
+    };
     let mut opus: Option<Opus> = None;
     let mut pending: Vec<i16> = Vec::new();
     let mut frame_id: u32 = 0;
@@ -69,10 +95,15 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             continue;
         };
         // the per-sample frame carries the sample's header (its stamp) when asked
-        let header = shared.sends_header().then(|| subscription::sample_header(&*codec, &key, &item)).flatten();
+        let header = shared
+            .sends_header()
+            .then(|| subscription::sample_header(&*codec, &key, &item))
+            .flatten();
         // audio is decoded sample by sample: Opus frames do not depend on each other, so no stream decoder
         let decoding = start_decode(&shared, &codec, key, item, 0);
-        let crate::media::Decoding { key, item, task, .. } = decoding;
+        let crate::media::Decoding {
+            key, item, task, ..
+        } = decoding;
         let decoded = match crate::media::finish_decode(task, shared.codecs.encode_timeout).await {
             Ok((Some(decoded), ..)) => decoded,
             // only a stream decoder gives no frame, and audio has none
@@ -83,7 +114,11 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             }
         };
         let DecodedFrame::Audio(pcm) = &*decoded else {
-            shared.record_encoding_error(&format!("audio codec {:?} decoded to {:?}, not PCM", codec.name(), decoded));
+            shared.record_encoding_error(&format!(
+                "audio codec {:?} decoded to {:?}, not PCM",
+                codec.name(),
+                decoded
+            ));
             continue;
         };
         match send_pcm(&mut opus, &mut pending, pcm, &track).await {
@@ -94,7 +129,19 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             Some(header) => (crate::frame::HEADER, crate::frame::with_header(header, &[])),
             None => (0, Vec::new()),
         };
-        if subscription::send_small_frame(&dc, &key, item.timestamp_ms, item.seq, frame_id, flags, &message).await.is_err() && shared.is_closed() {
+        if subscription::send_small_frame(
+            &dc,
+            &key,
+            item.timestamp_ms,
+            item.seq,
+            frame_id,
+            flags,
+            &message,
+        )
+        .await
+        .is_err()
+            && shared.is_closed()
+        {
             break;
         }
         frame_id = frame_id.wrapping_add(1);
@@ -102,8 +149,16 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
 }
 
 /// Adds `pcm` to `pending` and writes every whole packet; returns the bytes written.
-async fn send_pcm(opus: &mut Option<Opus>, pending: &mut Vec<i16>, pcm: &AudioPcm, track: &MediaTrack) -> Result<usize> {
-    if opus.as_ref().is_none_or(|opus| (opus.sample_rate, opus.channels) != (pcm.sample_rate(), pcm.channels())) {
+async fn send_pcm(
+    opus: &mut Option<Opus>,
+    pending: &mut Vec<i16>,
+    pcm: &AudioPcm,
+    track: &MediaTrack,
+) -> Result<usize> {
+    if opus
+        .as_ref()
+        .is_none_or(|opus| (opus.sample_rate, opus.channels) != (pcm.sample_rate(), pcm.channels()))
+    {
         *opus = Some(Opus::new(pcm.sample_rate(), pcm.channels())?);
         pending.clear();
     }
@@ -128,11 +183,25 @@ mod tests {
     fn encodes_twenty_millisecond_packets() {
         let mut opus = Opus::new(48000, 1).unwrap();
         assert_eq!(opus.packet_samples(), 960);
-        let tone: Vec<i16> = (0..960).map(|index| ((index as f64 * 400.0 / 48000.0 * std::f64::consts::TAU).sin() * 8000.0) as i16).collect();
+        let tone: Vec<i16> = (0..960)
+            .map(|index| {
+                ((index as f64 * 400.0 / 48000.0 * std::f64::consts::TAU).sin() * 8000.0) as i16
+            })
+            .collect();
         let packet = opus.encode(&tone).unwrap();
-        assert!(!packet.is_empty() && packet.len() < 400, "{} bytes", packet.len());
+        assert!(
+            !packet.is_empty() && packet.len() < 400,
+            "{} bytes",
+            packet.len()
+        );
         assert_eq!(Opus::new(16000, 2).unwrap().packet_samples(), 640);
-        assert!(AudioPcm::new(44100, 1, vec![]).is_err(), "Opus can't take 44.1 kHz");
-        assert!(AudioPcm::new(48000, 2, vec![0; 3]).is_err(), "half a stereo frame");
+        assert!(
+            AudioPcm::new(44100, 1, vec![]).is_err(),
+            "Opus can't take 44.1 kHz"
+        );
+        assert!(
+            AudioPcm::new(48000, 2, vec![0; 3]).is_err(),
+            "half a stereo frame"
+        );
     }
 }

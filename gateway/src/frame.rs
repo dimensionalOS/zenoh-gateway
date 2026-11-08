@@ -97,22 +97,41 @@ pub fn with_header(header: &[u8], message: &[u8]) -> Vec<u8> {
 pub fn decode_header(bytes: &[u8]) -> Option<(crate::MessageHeader, SampleMeta)> {
     let stamp = f64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
     let frame_id_len = u16::from_le_bytes(bytes.get(8..10)?.try_into().ok()?) as usize;
-    let frame_id = std::str::from_utf8(bytes.get(10..10 + frame_id_len)?).ok()?.to_owned();
+    let frame_id = std::str::from_utf8(bytes.get(10..10 + frame_id_len)?)
+        .ok()?
+        .to_owned();
     let at = 10 + frame_id_len;
     let Some(exact) = bytes.get(at..at + 13) else {
         return Some((crate::MessageHeader::from_stamp(stamp, frame_id), None));
     };
     let word = |at: usize| u32::from_le_bytes(exact[at..at + 4].try_into().unwrap());
-    let header = crate::MessageHeader { sec: word(0) as i32, nanosec: word(4), frame_id, seq: (exact[8] & 1 != 0).then(|| word(9)) };
+    let header = crate::MessageHeader {
+        sec: word(0) as i32,
+        nanosec: word(4),
+        frame_id,
+        seq: (exact[8] & 1 != 0).then(|| word(9)),
+    };
     if exact[8] & 2 == 0 {
         return Some((header, None));
     }
     let rest = &bytes[at + 13..];
     let encoding_len = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?) as usize;
-    let encoding = std::str::from_utf8(rest.get(2..2 + encoding_len)?).ok()?.to_owned();
-    let attachment_len = u32::from_le_bytes(rest.get(2 + encoding_len..6 + encoding_len)?.try_into().ok()?) as usize;
+    let encoding = std::str::from_utf8(rest.get(2..2 + encoding_len)?)
+        .ok()?
+        .to_owned();
+    let attachment_len = u32::from_le_bytes(
+        rest.get(2 + encoding_len..6 + encoding_len)?
+            .try_into()
+            .ok()?,
+    ) as usize;
     let attachment = rest.get(6 + encoding_len..6 + encoding_len + attachment_len)?;
-    Some((header, Some((encoding, (!attachment.is_empty()).then(|| attachment.to_vec())))))
+    Some((
+        header,
+        Some((
+            encoding,
+            (!attachment.is_empty()).then(|| attachment.to_vec()),
+        )),
+    ))
 }
 
 /// Splits a [`HEADER`] message into (its header, the sample's encoding and attachment, the rest).
@@ -154,7 +173,15 @@ pub fn decode(frame: &[u8]) -> Option<(FrameHeader<'_>, &[u8])> {
     let key = std::str::from_utf8(frame.get(2..2 + key_len)?).ok()?;
     let fixed = frame.get(2 + key_len..HEADER_FIXED_LEN + key_len)?;
     let word = |at: usize| u32::from_le_bytes(fixed[at..at + 4].try_into().unwrap());
-    let header = FrameHeader { key, timestamp_ms: f64::from_le_bytes(fixed[..8].try_into().unwrap()), seq: word(8), frame_id: word(12), chunk_index: word(16), chunk_count: word(20), flags: fixed[24] };
+    let header = FrameHeader {
+        key,
+        timestamp_ms: f64::from_le_bytes(fixed[..8].try_into().unwrap()),
+        seq: word(8),
+        frame_id: word(12),
+        chunk_index: word(16),
+        chunk_count: word(20),
+        flags: fixed[24],
+    };
     Some((header, &frame[HEADER_FIXED_LEN + key_len..]))
 }
 
@@ -168,20 +195,57 @@ pub fn chunk(payload: &[u8], index: u32, chunk_bytes: usize) -> &[u8] {
 mod tests {
     #[test]
     fn a_message_header_round_trips_exactly_and_reads_0_5_31_s_shorter_form() {
-        let header = crate::MessageHeader { sec: 1_761_350_400, nanosec: 123_456_789, frame_id: "mid360_link".into(), seq: Some(7) };
+        let header = crate::MessageHeader {
+            sec: 1_761_350_400,
+            nanosec: 123_456_789,
+            frame_id: "mid360_link".into(),
+            seq: Some(7),
+        };
         let bytes = super::encode_header(&header, &None).unwrap();
-        assert_eq!(super::decode_header(&bytes), Some((header.clone(), None)), "nanoseconds an f64 stamp would lose survive");
+        assert_eq!(
+            super::decode_header(&bytes),
+            Some((header.clone(), None)),
+            "nanoseconds an f64 stamp would lose survive"
+        );
         let message = super::with_header(&bytes, b"payload");
-        assert_eq!(super::split_header(&message), Some((header.clone(), None, &b"payload"[..])));
+        assert_eq!(
+            super::split_header(&message),
+            Some((header.clone(), None, &b"payload"[..]))
+        );
         let sample = Some(("application/cdr".to_owned(), Some(vec![1, 2, 3])));
         let with_sample = super::encode_header(&header, &sample).unwrap();
-        assert_eq!(super::decode_header(&with_sample), Some((header.clone(), sample)), "the zenoh sample's encoding and attachment");
-        assert_eq!(super::decode_header(&with_sample[..bytes.len()]), None, "cut short");
+        assert_eq!(
+            super::decode_header(&with_sample),
+            Some((header.clone(), sample)),
+            "the zenoh sample's encoding and attachment"
+        );
+        assert_eq!(
+            super::decode_header(&with_sample[..bytes.len()]),
+            None,
+            "cut short"
+        );
         let short = &bytes[..10 + header.frame_id.len()];
         let (old, _) = super::decode_header(short).unwrap();
-        assert_eq!((old.sec, old.frame_id.as_str(), old.seq), (header.sec, "mid360_link", None), "0.5.31: stamp and frame id only");
-        assert!((old.nanosec as i64 - 123_456_789).abs() < 1_000, "rounded from the f64 stamp");
-        assert_eq!(super::encode_header(&crate::MessageHeader { frame_id: "x".repeat(70_000), ..header }, &None), None, "no frame id is that long");
+        assert_eq!(
+            (old.sec, old.frame_id.as_str(), old.seq),
+            (header.sec, "mid360_link", None),
+            "0.5.31: stamp and frame id only"
+        );
+        assert!(
+            (old.nanosec as i64 - 123_456_789).abs() < 1_000,
+            "rounded from the f64 stamp"
+        );
+        assert_eq!(
+            super::encode_header(
+                &crate::MessageHeader {
+                    frame_id: "x".repeat(70_000),
+                    ..header
+                },
+                &None
+            ),
+            None,
+            "no frame id is that long"
+        );
         assert_eq!(super::decode_header(&bytes[..9]), None, "cut short");
     }
 
@@ -189,7 +253,15 @@ mod tests {
 
     #[test]
     fn layout() {
-        let header = FrameHeader { key: "a/b", timestamp_ms: 1.5, seq: 7, frame_id: 9, chunk_index: 1, chunk_count: 3, flags: ZSTD };
+        let header = FrameHeader {
+            key: "a/b",
+            timestamp_ms: 1.5,
+            seq: 7,
+            frame_id: 9,
+            chunk_index: 1,
+            chunk_count: 3,
+            flags: ZSTD,
+        };
         let frame = encode(&header, &[9, 9]);
         assert_eq!(&frame[0..2], &3u16.to_le_bytes());
         assert_eq!(&frame[2..5], b"a/b");
@@ -201,7 +273,19 @@ mod tests {
         assert_eq!(frame[29], ZSTD);
         assert_eq!(&frame[30..], &[9, 9]);
         let (decoded, chunk) = decode(&frame).unwrap();
-        assert_eq!((decoded.key, decoded.timestamp_ms, decoded.seq, decoded.frame_id, decoded.chunk_index, decoded.chunk_count, decoded.flags, chunk), ("a/b", 1.5, 7, 9, 1, 3, ZSTD, &[9u8, 9][..]));
+        assert_eq!(
+            (
+                decoded.key,
+                decoded.timestamp_ms,
+                decoded.seq,
+                decoded.frame_id,
+                decoded.chunk_index,
+                decoded.chunk_count,
+                decoded.flags,
+                chunk
+            ),
+            ("a/b", 1.5, 7, 9, 1, 3, ZSTD, &[9u8, 9][..])
+        );
         assert!(decode(&frame[..20]).is_none());
     }
 
@@ -209,11 +293,19 @@ mod tests {
     fn chunking_covers_payload_exactly() {
         let payload: Vec<u8> = (0..(CHUNK_BYTES * 2 + 5)).map(|i| i as u8).collect();
         assert_eq!(chunk_count(payload.len(), CHUNK_BYTES), 3);
-        assert_eq!(chunk_count(0, CHUNK_BYTES), 1, "an empty payload is still one frame");
-        let joined: Vec<u8> = (0..3).flat_map(|i| chunk(&payload, i, CHUNK_BYTES).to_vec()).collect();
+        assert_eq!(
+            chunk_count(0, CHUNK_BYTES),
+            1,
+            "an empty payload is still one frame"
+        );
+        let joined: Vec<u8> = (0..3)
+            .flat_map(|i| chunk(&payload, i, CHUNK_BYTES).to_vec())
+            .collect();
         assert_eq!(joined, payload);
         assert_eq!(chunk(&payload, 2, CHUNK_BYTES).len(), 5);
-        let small: Vec<u8> = (0..chunk_count(payload.len(), 1000)).flat_map(|i| chunk(&payload, i, 1000).to_vec()).collect();
+        let small: Vec<u8> = (0..chunk_count(payload.len(), 1000))
+            .flat_map(|i| chunk(&payload, i, 1000).to_vec())
+            .collect();
         assert_eq!(small, payload);
     }
 }

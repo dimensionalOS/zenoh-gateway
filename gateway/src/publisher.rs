@@ -3,13 +3,13 @@
 use crate::options::{DeliveryKind, Label, PubOpts};
 use crate::subscription::now_unix_ms;
 use log::{debug, warn};
+use parking_lot::Mutex;
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use parking_lot::Mutex;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use zenoh::qos::{CongestionControl, Priority};
 
@@ -75,10 +75,23 @@ type Putting = std::pin::Pin<Box<dyn Future<Output = Option<zenoh::Result<()>>> 
 /// unread channel stops the whole connection's reads): `latest` keeps only the newest message waiting, `reliable` every
 /// one, until its own deadline passes (counted in `dropped_stale`).
 #[allow(clippy::too_many_arguments)]
-pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session: zenoh::Session, shared: Arc<PubShared>, clock_offset_ms: Arc<Mutex<Option<f64>>>, blocker: impl Fn() -> Option<String>, put_timeout: Duration) {
+pub async fn run(
+    dc: Arc<dyn DataChannel>,
+    label: Label,
+    opts: PubOpts,
+    session: zenoh::Session,
+    shared: Arc<PubShared>,
+    clock_offset_ms: Arc<Mutex<Option<f64>>>,
+    blocker: impl Fn() -> Option<String>,
+    put_timeout: Duration,
+) {
     let priority = opts.zenoh_priority().unwrap_or_default();
     let reliable = opts.delivery == DeliveryKind::Reliable;
-    let congestion_control = if reliable { CongestionControl::Block } else { CongestionControl::Drop };
+    let congestion_control = if reliable {
+        CongestionControl::Block
+    } else {
+        CongestionControl::Drop
+    };
     let publisher = session
         .declare_publisher(label.key.clone())
         .priority(priority)
@@ -93,13 +106,18 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
             return;
         }
     };
-    debug!("publisher {:?} priority={priority:?} congestion={congestion_control:?} latencyLimit={:?}", label.key, opts.latency_limit);
+    debug!(
+        "publisher {:?} priority={priority:?} congestion={congestion_control:?} latencyLimit={:?}",
+        label.key, opts.latency_limit
+    );
     let mut blocked: Option<String> = None;
     let mut waiting: VecDeque<Waiting> = VecDeque::new();
     let mut putting: Option<Putting> = None;
     loop {
         // the next waiting message still worth putting goes as soon as nothing is in flight
-        while putting.is_none() && let Some(next) = waiting.pop_front() {
+        while putting.is_none()
+            && let Some(next) = waiting.pop_front()
+        {
             let now = Instant::now();
             if next.expires <= now {
                 shared.stats.lock().dropped_stale += 1;
@@ -107,7 +125,11 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
             }
             let publisher = publisher.clone();
             let left = next.expires - now;
-            putting = Some(Box::pin(async move { tokio::time::timeout(left, publisher.put(next.payload)).await.ok() }));
+            putting = Some(Box::pin(async move {
+                tokio::time::timeout(left, publisher.put(next.payload))
+                    .await
+                    .ok()
+            }));
         }
         let event = tokio::select! {
             event = dc.poll() => event,
@@ -133,7 +155,9 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
                 let now_blocked = blocker();
                 if now_blocked != blocked {
                     blocked = now_blocked;
-                    let _ = dc.send_text(&serde_json::json!({"blocked": blocked}).to_string()).await;
+                    let _ = dc
+                        .send_text(&serde_json::json!({"blocked": blocked}).to_string())
+                        .await;
                 }
                 let mut stats = shared.stats.lock();
                 stats.received += 1;
@@ -149,7 +173,8 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
                     stats.malformed += 1;
                     continue;
                 }
-                let sent_at_ms = f64::from_le_bytes(message.data[..PUT_HEADER_LEN].try_into().unwrap());
+                let sent_at_ms =
+                    f64::from_le_bytes(message.data[..PUT_HEADER_LEN].try_into().unwrap());
                 let limit = opts.latency_limit.map(|limit| crate::secs(limit / 1000.0));
                 let worth = match *clock_offset_ms.lock() {
                     Some(offset_ms) => {
@@ -159,7 +184,9 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
                             stats.dropped_stale += 1;
                             continue;
                         }
-                        limit.map_or(put_timeout, |limit| limit.saturating_sub(crate::secs(age / 1000.0)))
+                        limit.map_or(put_timeout, |limit| {
+                            limit.saturating_sub(crate::secs(age / 1000.0))
+                        })
                     }
                     None => {
                         stats.unsynced += 1;
@@ -170,7 +197,10 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
                 if !reliable && waiting.pop_back().is_some() {
                     stats.dropped_stale += 1;
                 }
-                waiting.push_back(Waiting { payload: message.data[PUT_HEADER_LEN..].to_vec(), expires: Instant::now() + worth });
+                waiting.push_back(Waiting {
+                    payload: message.data[PUT_HEADER_LEN..].to_vec(),
+                    expires: Instant::now() + worth,
+                });
             }
             Some(DataChannelEvent::OnClose) | None => break,
             Some(_) => {}
@@ -181,7 +211,11 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
         put.await;
     }
     for next in waiting {
-        let _ = tokio::time::timeout(next.expires.saturating_duration_since(Instant::now()), publisher.put(next.payload)).await;
+        let _ = tokio::time::timeout(
+            next.expires.saturating_duration_since(Instant::now()),
+            publisher.put(next.payload),
+        )
+        .await;
     }
     debug!("publisher {:?} closed", label.key);
 }

@@ -24,12 +24,26 @@ pub struct IceServer {
 
 /// coturn's TURN REST API credentials (`use-auth-secret`): username `"<unix expiry>:<user>"`, credential
 /// base64(HMAC-SHA1(secret, username)), valid for `ttl`.
-pub fn turn_credentials(secret: &str, user: &str, ttl: Duration, now: SystemTime) -> (String, String) {
-    let expiry = now.checked_add(ttl).unwrap_or(now).duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+pub fn turn_credentials(
+    secret: &str,
+    user: &str,
+    ttl: Duration,
+    now: SystemTime,
+) -> (String, String) {
+    let expiry = now
+        .checked_add(ttl)
+        .unwrap_or(now)
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let username = format!("{expiry}:{user}");
-    let mut mac = Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key length");
+    let mut mac =
+        Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key length");
     mac.update(username.as_bytes());
-    (username, base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+    (
+        username,
+        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()),
+    )
 }
 
 fn is_turn(server: &IceServer) -> bool {
@@ -37,13 +51,22 @@ fn is_turn(server: &IceServer) -> bool {
 }
 
 /// The servers with credentials minted for `user` on every TURN entry that has none, when a secret is set.
-pub(crate) fn mint(servers: &[IceServer], secret: Option<&(String, Duration)>, user: &str) -> Vec<IceServer> {
+pub(crate) fn mint(
+    servers: &[IceServer],
+    secret: Option<&(String, Duration)>,
+    user: &str,
+) -> Vec<IceServer> {
     servers
         .iter()
         .map(|server| match secret {
             Some((secret, ttl)) if server.username.is_empty() && is_turn(server) => {
-                let (username, credential) = turn_credentials(secret, user, *ttl, SystemTime::now());
-                IceServer { username, credential, ..server.clone() }
+                let (username, credential) =
+                    turn_credentials(secret, user, *ttl, SystemTime::now());
+                IceServer {
+                    username,
+                    credential,
+                    ..server.clone()
+                }
             }
             _ => server.clone(),
         })
@@ -70,7 +93,8 @@ pub struct IceRequest {
 
 /// The ICE servers hook ([`ServerBuilder::ice_servers_fn`](crate::ServerBuilder::ice_servers_fn)): servers for one end of
 /// one connection, added after the static ones; an error (or no answer in [`ICE_HOOK_TIMEOUT`]) leaves just the static ones.
-pub type IceServersFn = dyn Fn(IceRequest) -> BoxFuture<'static, anyhow::Result<Vec<IceServer>>> + Send + Sync;
+pub type IceServersFn =
+    dyn Fn(IceRequest) -> BoxFuture<'static, anyhow::Result<Vec<IceServer>>> + Send + Sync;
 
 /// How long a connection waits on the [`IceServersFn`] before going on with the static servers.
 pub const ICE_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -86,7 +110,12 @@ impl std::fmt::Debug for IceHook {
 }
 
 /// The static servers (TURN credentials minted with `secret`), then the hook's, for `request`.
-pub(crate) async fn servers(statics: &[IceServer], secret: Option<&(String, Duration)>, hook: Option<&IceHook>, request: IceRequest) -> Vec<IceServer> {
+pub(crate) async fn servers(
+    statics: &[IceServer],
+    secret: Option<&(String, Duration)>,
+    hook: Option<&IceHook>,
+    request: IceRequest,
+) -> Vec<IceServer> {
     let user = match request.side {
         IceSide::Browser => "browser",
         IceSide::Gateway => "gateway",
@@ -96,14 +125,22 @@ pub(crate) async fn servers(statics: &[IceServer], secret: Option<&(String, Dura
         match tokio::time::timeout(ICE_HOOK_TIMEOUT, hook(request)).await {
             Ok(Ok(minted)) => {
                 // a browser refuses the whole connection over one TURN entry without credentials
-                let (usable, unusable): (Vec<_>, Vec<_>) = minted.into_iter().partition(|server| !is_turn(server) || (!server.username.is_empty() && !server.credential.is_empty()));
+                let (usable, unusable): (Vec<_>, Vec<_>) = minted.into_iter().partition(|server| {
+                    !is_turn(server)
+                        || (!server.username.is_empty() && !server.credential.is_empty())
+                });
                 if !unusable.is_empty() {
-                    warn!("ICE servers hook: dropped {} TURN server(s) without a username and credential", unusable.len());
+                    warn!(
+                        "ICE servers hook: dropped {} TURN server(s) without a username and credential",
+                        unusable.len()
+                    );
                 }
                 servers.extend(usable)
             }
             Ok(Err(error)) => warn!("ICE servers hook failed, using the static servers: {error:#}"),
-            Err(_) => warn!("ICE servers hook gave no answer in {ICE_HOOK_TIMEOUT:?}, using the static servers"),
+            Err(_) => warn!(
+                "ICE servers hook gave no answer in {ICE_HOOK_TIMEOUT:?}, using the static servers"
+            ),
         }
     }
     servers
@@ -186,21 +223,45 @@ mod cloudflare {
 
         /// Mints a fresh set of servers from the API.
         pub async fn generate(&self) -> Result<Vec<IceServer>> {
-            let url = format!("{}/turn/keys/{}/credentials/generate-ice-servers", self.api_base.trim_end_matches('/'), self.key_id);
-            let response = self.http.post(url).bearer_auth(&self.api_token).json(&serde_json::json!({"ttl": self.ttl.as_secs()})).send().await.context("asking Cloudflare for TURN credentials")?;
+            let url = format!(
+                "{}/turn/keys/{}/credentials/generate-ice-servers",
+                self.api_base.trim_end_matches('/'),
+                self.key_id
+            );
+            let response = self
+                .http
+                .post(url)
+                .bearer_auth(&self.api_token)
+                .json(&serde_json::json!({"ttl": self.ttl.as_secs()}))
+                .send()
+                .await
+                .context("asking Cloudflare for TURN credentials")?;
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
-                bail!("Cloudflare TURN credentials: HTTP {status}: {}", body.chars().take(300).collect::<String>());
+                bail!(
+                    "Cloudflare TURN credentials: HTTP {status}: {}",
+                    body.chars().take(300).collect::<String>()
+                );
             }
-            let generated: Generated = response.json().await.context("reading Cloudflare's TURN credentials")?;
+            let generated: Generated = response
+                .json()
+                .await
+                .context("reading Cloudflare's TURN credentials")?;
             let servers = match generated.ice_servers {
                 OneOrMany::Many(servers) => servers,
                 OneOrMany::One(server) => vec![server],
             };
             Ok(servers
                 .into_iter()
-                .map(|server| IceServer { urls: server.urls.into_iter().filter(|url| !is_port_53(url)).collect(), ..server })
+                .map(|server| IceServer {
+                    urls: server
+                        .urls
+                        .into_iter()
+                        .filter(|url| !is_port_53(url))
+                        .collect(),
+                    ..server
+                })
                 .filter(|server| !server.urls.is_empty())
                 .collect())
         }
@@ -224,7 +285,9 @@ mod cloudflare {
 
     /// `turn:host:53?transport=udp`, `stun:host:53`
     fn is_port_53(url: &str) -> bool {
-        url.split('?').next().is_some_and(|address| address.ends_with(":53"))
+        url.split('?')
+            .next()
+            .is_some_and(|address| address.ends_with(":53"))
     }
 
     #[cfg(test)]
@@ -235,21 +298,43 @@ mod cloudflare {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// A fake API on localhost that counts its calls and answers with `reply` (status 201) or 401 when `refuse`.
-        async fn fake_api(reply: serde_json::Value, refuse: bool) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Option<(String, serde_json::Value)>>>) {
+        async fn fake_api(
+            reply: serde_json::Value,
+            refuse: bool,
+        ) -> (
+            String,
+            Arc<AtomicUsize>,
+            Arc<std::sync::Mutex<Option<(String, serde_json::Value)>>>,
+        ) {
             let calls = Arc::new(AtomicUsize::new(0));
             let seen = Arc::new(std::sync::Mutex::new(None));
             let (calls_in, seen_in) = (calls.clone(), seen.clone());
             let app = axum::Router::new().route(
                 "/v1/turn/keys/{key}/credentials/generate-ice-servers",
-                post(move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
-                    let (calls, seen, reply) = (calls_in.clone(), seen_in.clone(), reply.clone());
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        let auth = headers.get("authorization").and_then(|value| value.to_str().ok()).unwrap_or_default().to_owned();
-                        *seen.lock().unwrap() = Some((auth, body));
-                        if refuse { (axum::http::StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({"error": "bad token"}))) } else { (axum::http::StatusCode::CREATED, axum::Json(reply)) }
-                    }
-                }),
+                post(
+                    move |headers: axum::http::HeaderMap,
+                          axum::Json(body): axum::Json<serde_json::Value>| {
+                        let (calls, seen, reply) =
+                            (calls_in.clone(), seen_in.clone(), reply.clone());
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let auth = headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_owned();
+                            *seen.lock().unwrap() = Some((auth, body));
+                            if refuse {
+                                (
+                                    axum::http::StatusCode::UNAUTHORIZED,
+                                    axum::Json(serde_json::json!({"error": "bad token"})),
+                                )
+                            } else {
+                                (axum::http::StatusCode::CREATED, axum::Json(reply))
+                            }
+                        }
+                    },
+                ),
             );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -267,19 +352,54 @@ mod cloudflare {
         #[tokio::test]
         async fn mints_with_the_token_and_ttl_and_drops_port_53() {
             let (base, _, seen) = fake_api(reply(), false).await;
-            let servers = CloudflareTurn::new("key", "secret-token").ttl(Duration::from_secs(600)).api_base(base).generate().await.unwrap();
-            assert_eq!(servers, vec![
-                IceServer { urls: vec!["stun:stun.cloudflare.com:3478".into()], ..Default::default() },
-                IceServer { urls: vec!["turn:turn.cloudflare.com:3478?transport=udp".into(), "turns:turn.cloudflare.com:443?transport=tcp".into()], username: "u1".into(), credential: "c1".into() },
-            ]);
-            assert_eq!(seen.lock().unwrap().clone().unwrap(), ("Bearer secret-token".to_owned(), serde_json::json!({"ttl": 600})));
+            let servers = CloudflareTurn::new("key", "secret-token")
+                .ttl(Duration::from_secs(600))
+                .api_base(base)
+                .generate()
+                .await
+                .unwrap();
+            assert_eq!(
+                servers,
+                vec![
+                    IceServer {
+                        urls: vec!["stun:stun.cloudflare.com:3478".into()],
+                        ..Default::default()
+                    },
+                    IceServer {
+                        urls: vec![
+                            "turn:turn.cloudflare.com:3478?transport=udp".into(),
+                            "turns:turn.cloudflare.com:443?transport=tcp".into()
+                        ],
+                        username: "u1".into(),
+                        credential: "c1".into()
+                    },
+                ]
+            );
+            assert_eq!(
+                seen.lock().unwrap().clone().unwrap(),
+                (
+                    "Bearer secret-token".to_owned(),
+                    serde_json::json!({"ttl": 600})
+                )
+            );
         }
 
         #[tokio::test]
         async fn reads_the_older_single_server_reply() {
             let (base, _, _) = fake_api(serde_json::json!({"iceServers": {"urls": ["turn:t:3478"], "username": "u", "credential": "c"}}), false).await;
-            let servers = CloudflareTurn::new("key", "token").api_base(base).generate().await.unwrap();
-            assert_eq!(servers, vec![IceServer { urls: vec!["turn:t:3478".into()], username: "u".into(), credential: "c".into() }]);
+            let servers = CloudflareTurn::new("key", "token")
+                .api_base(base)
+                .generate()
+                .await
+                .unwrap();
+            assert_eq!(
+                servers,
+                vec![IceServer {
+                    urls: vec!["turn:t:3478".into()],
+                    username: "u".into(),
+                    credential: "c".into()
+                }]
+            );
         }
 
         #[tokio::test]
@@ -290,12 +410,16 @@ mod cloudflare {
                 shared.servers().await.unwrap();
             }
             assert_eq!(calls.load(Ordering::SeqCst), 1);
-            let short = CloudflareTurn::new("key", "token").ttl(Duration::from_millis(40)).api_base(base.clone());
+            let short = CloudflareTurn::new("key", "token")
+                .ttl(Duration::from_millis(40))
+                .api_base(base.clone());
             short.servers().await.unwrap();
             tokio::time::sleep(Duration::from_millis(30)).await;
             short.servers().await.unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 3);
-            let each = CloudflareTurn::new("key", "token").per_connection(true).api_base(base);
+            let each = CloudflareTurn::new("key", "token")
+                .per_connection(true)
+                .api_base(base);
             each.servers().await.unwrap();
             each.servers().await.unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 5);
@@ -304,7 +428,11 @@ mod cloudflare {
         #[tokio::test]
         async fn a_refusal_is_an_error_that_names_the_status() {
             let (base, _, _) = fake_api(reply(), true).await;
-            let error = CloudflareTurn::new("key", "token").api_base(base).servers().await.unwrap_err();
+            let error = CloudflareTurn::new("key", "token")
+                .api_base(base)
+                .servers()
+                .await
+                .unwrap_err();
             assert!(format!("{error:#}").contains("401"), "{error:#}");
         }
     }
@@ -317,7 +445,12 @@ mod tests {
     #[test]
     fn credentials_match_coturn() {
         // `printf 1700000000:alice | openssl dgst -sha1 -hmac north -binary | base64`, what coturn checks with static-auth-secret=north
-        let (username, credential) = turn_credentials("north", "alice", Duration::from_secs(3600), UNIX_EPOCH + Duration::from_secs(1_699_996_400));
+        let (username, credential) = turn_credentials(
+            "north",
+            "alice",
+            Duration::from_secs(3600),
+            UNIX_EPOCH + Duration::from_secs(1_699_996_400),
+        );
         assert_eq!(username, "1700000000:alice");
         assert_eq!(credential, "Cd/49soE35ICqcJF/bCTn8Z4OyE=");
     }
@@ -325,11 +458,25 @@ mod tests {
     #[test]
     fn mints_only_turn_entries_without_credentials() {
         let servers = vec![
-            IceServer { urls: vec!["stun:s:3478".into()], ..Default::default() },
-            IceServer { urls: vec!["turn:t:3478".into()], ..Default::default() },
-            IceServer { urls: vec!["turn:u:3478".into()], username: "fixed".into(), credential: "pw".into() },
+            IceServer {
+                urls: vec!["stun:s:3478".into()],
+                ..Default::default()
+            },
+            IceServer {
+                urls: vec!["turn:t:3478".into()],
+                ..Default::default()
+            },
+            IceServer {
+                urls: vec!["turn:u:3478".into()],
+                username: "fixed".into(),
+                credential: "pw".into(),
+            },
         ];
-        let minted = mint(&servers, Some(&("north".into(), Duration::from_secs(60))), "peer");
+        let minted = mint(
+            &servers,
+            Some(&("north".into(), Duration::from_secs(60))),
+            "peer",
+        );
         assert_eq!((&minted[0], &minted[2]), (&servers[0], &servers[2]));
         assert!(minted[1].username.ends_with(":peer") && !minted[1].credential.is_empty());
         assert_eq!(mint(&servers, None, "peer"), servers);
@@ -337,22 +484,71 @@ mod tests {
 
     #[tokio::test]
     async fn hook_servers_follow_the_static_ones_and_an_error_leaves_the_static_ones() {
-        let statics = vec![IceServer { urls: vec!["stun:s:3478".into()], ..Default::default() }];
-        let extra = IceServer { urls: vec!["turn:t:3478".into()], username: "u".into(), credential: "c".into() };
+        let statics = vec![IceServer {
+            urls: vec!["stun:s:3478".into()],
+            ..Default::default()
+        }];
+        let extra = IceServer {
+            urls: vec!["turn:t:3478".into()],
+            username: "u".into(),
+            credential: "c".into(),
+        };
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_in = seen.clone();
         let extra_in = extra.clone();
         let good = IceHook(Arc::new(move |request: IceRequest| {
             seen_in.lock().unwrap().push((request.side, request.token));
             let extra = extra_in.clone();
-            Box::pin(async move { Ok(vec![extra]) }) as BoxFuture<'static, anyhow::Result<Vec<IceServer>>>
+            Box::pin(async move { Ok(vec![extra]) })
+                as BoxFuture<'static, anyhow::Result<Vec<IceServer>>>
         }));
-        let request = IceRequest { side: IceSide::Gateway, token: Some("t".into()) };
-        assert_eq!(servers(&statics, None, Some(&good), request).await, vec![statics[0].clone(), extra]);
-        assert_eq!(seen.lock().unwrap().as_slice(), &[(IceSide::Gateway, Some("t".to_owned()))]);
-        let bare_turn = IceHook(Arc::new(|_| Box::pin(async { Ok(vec![IceServer { urls: vec!["turn:t:3478".into()], ..Default::default() }]) })));
-        assert_eq!(servers(&statics, None, Some(&bare_turn), IceRequest { side: IceSide::Browser, token: None }).await, statics, "a TURN entry without credentials is dropped");
+        let request = IceRequest {
+            side: IceSide::Gateway,
+            token: Some("t".into()),
+        };
+        assert_eq!(
+            servers(&statics, None, Some(&good), request).await,
+            vec![statics[0].clone(), extra]
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[(IceSide::Gateway, Some("t".to_owned()))]
+        );
+        let bare_turn = IceHook(Arc::new(|_| {
+            Box::pin(async {
+                Ok(vec![IceServer {
+                    urls: vec!["turn:t:3478".into()],
+                    ..Default::default()
+                }])
+            })
+        }));
+        assert_eq!(
+            servers(
+                &statics,
+                None,
+                Some(&bare_turn),
+                IceRequest {
+                    side: IceSide::Browser,
+                    token: None
+                }
+            )
+            .await,
+            statics,
+            "a TURN entry without credentials is dropped"
+        );
         let failing = IceHook(Arc::new(|_| Box::pin(async { anyhow::bail!("down") })));
-        assert_eq!(servers(&statics, None, Some(&failing), IceRequest { side: IceSide::Browser, token: None }).await, statics);
+        assert_eq!(
+            servers(
+                &statics,
+                None,
+                Some(&failing),
+                IceRequest {
+                    side: IceSide::Browser,
+                    token: None
+                }
+            )
+            .await,
+            statics
+        );
     }
 }

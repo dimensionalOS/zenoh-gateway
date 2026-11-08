@@ -9,7 +9,10 @@
 
 use anyhow::{Context, Result};
 use zenoh_gateway::client::{Client, ClientOptions, Message, SubscribeOptions};
-use zenoh_gateway::{Channel, MessageEncoding, EncodingOutput, EncodingSample, DecodedFrame, RunningServer, Server, VideoImage};
+use zenoh_gateway::{
+    Channel, DecodedFrame, EncodingOutput, EncodingSample, MessageEncoding, RunningServer, Server,
+    VideoImage,
+};
 
 /// B's encoding: `u32 width | u32 height | RGB8` → a picture for B's H.264 encoder.
 pub struct RelayRgb;
@@ -25,18 +28,36 @@ impl MessageEncoding for RelayRgb {
 
     fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
         let size = |at: usize| u32::from_le_bytes(sample.payload[at..at + 4].try_into().unwrap());
-        Ok(DecodedFrame::Video(VideoImage::rgb8(size(0), size(4), sample.payload[8..].to_vec())?))
+        Ok(DecodedFrame::Video(VideoImage::rgb8(
+            size(0),
+            size(4),
+            sample.payload[8..].to_vec(),
+        )?))
     }
 }
 
 /// Starts B on `bind` and relays `camera_key` (through `codec`, a video encoding of A) from A to B's `relay/<camera_key>`.
-pub async fn relay(source_url: &str, camera_key: &str, codec: &str, bind: &str) -> Result<RunningServer> {
+pub async fn relay(
+    source_url: &str,
+    camera_key: &str,
+    codec: &str,
+    bind: &str,
+) -> Result<RunningServer> {
     let source = Client::connect(source_url, ClientOptions::default()).await?;
-    let options = SubscribeOptions { encoding: Some(codec.to_owned()), ..Default::default() };
+    let options = SubscribeOptions {
+        encoding: Some(codec.to_owned()),
+        ..Default::default()
+    };
     let mut camera = source.subscribe(camera_key, options).await?;
     let mut config = zenoh_gateway::zenoh::Config::default();
-    config.insert_json5("scouting/multicast/enabled", "false").map_err(|error| anyhow::anyhow!("{error}"))?;
-    let server = Server::builder().zenoh_config(config).encoding(RelayRgb).build().await?;
+    config
+        .insert_json5("scouting/multicast/enabled", "false")
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let server = Server::builder()
+        .zenoh_config(config)
+        .encoding(RelayRgb)
+        .build()
+        .await?;
     let session = server.session().clone();
     let key = format!("relay/{camera_key}");
     // openh264's decoder stays on one thread; frames go to it, pictures come back
@@ -45,9 +66,12 @@ pub async fn relay(source_url: &str, camera_key: &str, codec: &str, bind: &str) 
     std::thread::spawn(move || -> Result<()> {
         let mut decoder = openh264::decoder::Decoder::new()?;
         for access_unit in frames_rx {
-            let Ok(Some(picture)) = decoder.decode(&access_unit) else { continue };
+            let Ok(Some(picture)) = decoder.decode(&access_unit) else {
+                continue;
+            };
             let (width, height) = openh264::formats::YUVSource::dimensions(&picture);
-            let mut payload = [(width as u32).to_le_bytes(), (height as u32).to_le_bytes()].concat();
+            let mut payload =
+                [(width as u32).to_le_bytes(), (height as u32).to_le_bytes()].concat();
             payload.resize(8 + width * height * 3, 0);
             picture.write_rgb8(&mut payload[8..]);
             if pictures_tx.blocking_send(payload).is_err() {
@@ -79,10 +103,17 @@ pub async fn relay(source_url: &str, camera_key: &str, codec: &str, bind: &str) 
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [source, camera, codec, port] = &args[..] else {
-        anyhow::bail!("usage: relay_sketch <gateway A url> <camera key> <A's video encoding> <port for B>");
+        anyhow::bail!(
+            "usage: relay_sketch <gateway A url> <camera key> <A's video encoding> <port for B>"
+        );
     };
-    let running = relay(source, camera, codec, &format!("0.0.0.0:{port}")).await.context("starting the relay")?;
-    println!("relaying {camera} on http://{} as relay/{camera} (encoding relay-rgb)", running.local_addr());
+    let running = relay(source, camera, codec, &format!("0.0.0.0:{port}"))
+        .await
+        .context("starting the relay")?;
+    println!(
+        "relaying {camera} on http://{} as relay/{camera} (encoding relay-rgb)",
+        running.local_addr()
+    );
     tokio::signal::ctrl_c().await?;
     running.shutdown().await
 }

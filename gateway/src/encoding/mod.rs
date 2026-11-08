@@ -72,7 +72,15 @@ pub enum Channel {
 
 impl Channel {
     /// Every channel name, as subscriptions spell them.
-    pub const NAMES: [&str; 7] = ["video-h264", "video-vp8", "video-vp9", "video-av1", "video-h265", "audio-opus", "data"];
+    pub const NAMES: [&str; 7] = [
+        "video-h264",
+        "video-vp8",
+        "video-vp9",
+        "video-av1",
+        "video-h265",
+        "audio-opus",
+        "data",
+    ];
 
     /// The channel called `name`, e.g. `"video-h264"`.
     pub fn parse(name: &str) -> Result<Self, String> {
@@ -84,7 +92,12 @@ impl Channel {
             "video-h265" => Channel::Video(VideoFormat::H265),
             "audio-opus" => Channel::Audio,
             "data" => Channel::Data,
-            other => return Err(format!("unknown channel {other:?} (one of {})", Self::NAMES.join(", "))),
+            other => {
+                return Err(format!(
+                    "unknown channel {other:?} (one of {})",
+                    Self::NAMES.join(", ")
+                ));
+            }
         })
     }
 
@@ -133,7 +146,10 @@ pub struct EncodeOptions {
 impl EncodeOptions {
     /// Quality `quality` with no other options.
     pub fn quality(quality: f64) -> Self {
-        EncodeOptions { quality, options: serde_json::Map::new() }
+        EncodeOptions {
+            quality,
+            options: serde_json::Map::new(),
+        }
     }
 
     /// The string option `name`, if set.
@@ -143,7 +159,9 @@ impl EncodeOptions {
 }
 
 /// Compression of a subscription's data-channel messages (subscribe option `compress`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Compress {
     /// As encoded.
@@ -158,7 +176,9 @@ impl Compress {
     pub(crate) fn apply(self, bytes: &[u8]) -> Option<Vec<u8>> {
         match self {
             Compress::None => None,
-            Compress::Zstd => zstd::bulk::compress(bytes, 3).ok().filter(|compressed| compressed.len() < bytes.len()),
+            Compress::Zstd => zstd::bulk::compress(bytes, 3)
+                .ok()
+                .filter(|compressed| compressed.len() < bytes.len()),
         }
     }
 }
@@ -178,7 +198,11 @@ pub struct EncodingSample<'a> {
 impl<'a> EncodingSample<'a> {
     /// A sample from its parts (the gateway builds these; tests of an encoding can too).
     pub fn new(key: &'a str, payload: &'a [u8], encoding: &'a zenoh::bytes::Encoding) -> Self {
-        EncodingSample { key, payload, encoding }
+        EncodingSample {
+            key,
+            payload,
+            encoding,
+        }
     }
 }
 
@@ -215,7 +239,12 @@ impl MessageHeader {
     /// From a stamp in seconds, which is all some sources have.
     pub fn from_stamp(stamp: f64, frame_id: impl Into<String>) -> Self {
         let sec = stamp.floor();
-        MessageHeader { sec: sec as i32, nanosec: (((stamp - sec) * 1e9).round() as u32).min(999_999_999), frame_id: frame_id.into(), seq: None }
+        MessageHeader {
+            sec: sec as i32,
+            nanosec: (((stamp - sec) * 1e9).round() as u32).min(999_999_999),
+            frame_id: frame_id.into(),
+            seq: None,
+        }
     }
 }
 
@@ -240,7 +269,18 @@ struct Jpeg {
 
 impl Jpeg {
     fn decoded(&self) -> Result<&VideoImage> {
-        self.decoded.get_or_init(|| (self.decode)(&self.bytes).map(|image| VideoImage { jpeg: None, header: None, ..image }).map_err(|error| format!("{error:#}"))).as_ref().map_err(|error| anyhow!("jpeg: {error}"))
+        self.decoded
+            .get_or_init(|| {
+                (self.decode)(&self.bytes)
+                    .map(|image| VideoImage {
+                        jpeg: None,
+                        header: None,
+                        ..image
+                    })
+                    .map_err(|error| format!("{error:#}"))
+            })
+            .as_ref()
+            .map_err(|error| anyhow!("jpeg: {error}"))
     }
 }
 
@@ -255,8 +295,21 @@ impl Eq for Jpeg {}
 impl fmt::Debug for VideoImage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.jpeg {
-            Some(jpeg) => write!(formatter, "VideoImage({}x{} JPEG, {} bytes)", self.width, self.height, jpeg.bytes.len()),
-            None => write!(formatter, "VideoImage({}x{} {:?}, {} bytes)", self.width, self.height, self.format, self.data.len()),
+            Some(jpeg) => write!(
+                formatter,
+                "VideoImage({}x{} JPEG, {} bytes)",
+                self.width,
+                self.height,
+                jpeg.bytes.len()
+            ),
+            None => write!(
+                formatter,
+                "VideoImage({}x{} {:?}, {} bytes)",
+                self.width,
+                self.height,
+                self.format,
+                self.data.len()
+            ),
         }
     }
 }
@@ -265,16 +318,43 @@ impl VideoImage {
     /// Packed RGB8; fails unless `data` is exactly `width × height × 3` bytes and the picture isn't empty.
     pub fn rgb8(width: u32, height: u32, data: Vec<u8>) -> Result<Self> {
         ensure!(width > 0 && height > 0, "empty image ({width}x{height})");
-        ensure!(data.len() == width as usize * height as usize * 3, "rgb8 {width}x{height} needs {} bytes, got {}", width as usize * height as usize * 3, data.len());
-        Ok(VideoImage { width, height, format: PixelFormat::Rgb8, data, header: None, jpeg: None })
+        ensure!(
+            data.len() == width as usize * height as usize * 3,
+            "rgb8 {width}x{height} needs {} bytes, got {}",
+            width as usize * height as usize * 3,
+            data.len()
+        );
+        Ok(VideoImage {
+            width,
+            height,
+            format: PixelFormat::Rgb8,
+            data,
+            header: None,
+            jpeg: None,
+        })
     }
 
     /// Planar I420; fails unless both sizes are even and non-zero and `data` is exactly
     /// `width × height × 3 / 2` bytes.
     pub fn i420(width: u32, height: u32, data: Vec<u8>) -> Result<Self> {
-        ensure!(width > 0 && height > 0 && width.is_multiple_of(2) && height.is_multiple_of(2), "i420 needs even, non-zero sizes, got {width}x{height}");
-        ensure!(data.len() == width as usize * height as usize * 3 / 2, "i420 {width}x{height} needs {} bytes, got {}", width as usize * height as usize * 3 / 2, data.len());
-        Ok(VideoImage { width, height, format: PixelFormat::I420, data, header: None, jpeg: None })
+        ensure!(
+            width > 0 && height > 0 && width.is_multiple_of(2) && height.is_multiple_of(2),
+            "i420 needs even, non-zero sizes, got {width}x{height}"
+        );
+        ensure!(
+            data.len() == width as usize * height as usize * 3 / 2,
+            "i420 {width}x{height} needs {} bytes, got {}",
+            width as usize * height as usize * 3 / 2,
+            data.len()
+        );
+        Ok(VideoImage {
+            width,
+            height,
+            format: PixelFormat::I420,
+            data,
+            header: None,
+            jpeg: None,
+        })
     }
 
     /// A picture still in its JPEG, `width × height` (from its header): an encoder that takes JPEG (a hardware pipeline that
@@ -282,9 +362,25 @@ impl VideoImage {
     /// that reads [`format`](Self::format) or [`data`](Self::data) gets `decode`'s picture, made once on first use. On the
     /// R1 the 1920x1536 camera's decode, scale and the copies into the encoder took 26-60 ms a frame on a loaded CPU; the
     /// Jetson's JPEG decoder, converter and encoder in one pipeline took 4.
-    pub fn jpeg(width: u32, height: u32, bytes: Vec<u8>, decode: fn(&[u8]) -> Result<VideoImage>) -> Result<Self> {
+    pub fn jpeg(
+        width: u32,
+        height: u32,
+        bytes: Vec<u8>,
+        decode: fn(&[u8]) -> Result<VideoImage>,
+    ) -> Result<Self> {
         ensure!(width > 0 && height > 0, "empty image ({width}x{height})");
-        Ok(VideoImage { width, height, format: PixelFormat::I420, data: Vec::new(), header: None, jpeg: Some(Arc::new(Jpeg { bytes, decode, decoded: OnceLock::new() })) })
+        Ok(VideoImage {
+            width,
+            height,
+            format: PixelFormat::I420,
+            data: Vec::new(),
+            header: None,
+            jpeg: Some(Arc::new(Jpeg {
+                bytes,
+                decode,
+                decoded: OnceLock::new(),
+            })),
+        })
     }
 
     /// The JPEG of a picture made by [`jpeg`](Self::jpeg).
@@ -312,7 +408,8 @@ impl VideoImage {
 
     /// The pixel layout of [`data`](Self::data) (a JPEG's is its decode's: I420 if it failed).
     pub fn format(&self) -> PixelFormat {
-        self.pixels().map_or(PixelFormat::I420, |image| image.format)
+        self.pixels()
+            .map_or(PixelFormat::I420, |image| image.format)
     }
 
     /// The pixels, laid out as [`format`](Self::format) says (a JPEG that fails to decode has none).
@@ -341,7 +438,9 @@ impl VideoImage {
 
     /// The message header's stamp (seconds) and frame id, if there is one ([`with_header`](Self::with_header)).
     pub fn header(&self) -> Option<(f64, &str)> {
-        self.header.as_ref().map(|header| (header.stamp(), header.frame_id.as_str()))
+        self.header
+            .as_ref()
+            .map(|header| (header.stamp(), header.frame_id.as_str()))
     }
 
     /// The whole message header, if there is one.
@@ -351,12 +450,22 @@ impl VideoImage {
 
     /// Box-filtered to `width × height` as I420 (BT.601 limited range), e.g. to a [`VideoTarget`]'s size; keeps the header.
     pub fn to_i420(&self, width: u32, height: u32) -> Result<VideoImage> {
-        ensure!(width.is_multiple_of(2) && height.is_multiple_of(2), "i420 needs even sizes, got {width}x{height}");
+        ensure!(
+            width.is_multiple_of(2) && height.is_multiple_of(2),
+            "i420 needs even sizes, got {width}x{height}"
+        );
         let pixels = self.pixels()?;
         if (pixels.width, pixels.height, pixels.format) == (width, height, PixelFormat::I420) {
-            return Ok(VideoImage { header: self.header.clone(), jpeg: None, ..pixels.clone() });
+            return Ok(VideoImage {
+                header: self.header.clone(),
+                jpeg: None,
+                ..pixels.clone()
+            });
         }
-        Ok(VideoImage { header: self.header.clone(), ..VideoImage::i420(width, height, video::to_i420(pixels, width, height))? })
+        Ok(VideoImage {
+            header: self.header.clone(),
+            ..VideoImage::i420(width, height, video::to_i420(pixels, width, height))?
+        })
     }
 }
 
@@ -370,7 +479,13 @@ pub struct AudioPcm {
 
 impl fmt::Debug for AudioPcm {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "AudioPcm({} Hz x{}, {} samples)", self.sample_rate, self.channels, self.samples.len())
+        write!(
+            formatter,
+            "AudioPcm({} Hz x{}, {} samples)",
+            self.sample_rate,
+            self.channels,
+            self.samples.len()
+        )
     }
 }
 
@@ -378,9 +493,20 @@ impl AudioPcm {
     /// Fails unless the rate is one Opus takes (8, 12, 16, 24 or 48 kHz; resample others), there
     /// are 1 or 2 channels and the samples are a whole number of frames.
     pub fn new(sample_rate: u32, channels: u8, samples: Vec<i16>) -> Result<Self> {
-        ensure!([8000, 12000, 16000, 24000, 48000].contains(&sample_rate), "Opus takes 8, 12, 16, 24 or 48 kHz, not {sample_rate} Hz");
-        ensure!((1..=2).contains(&channels) && samples.len().is_multiple_of(channels as usize), "{} samples are not whole frames of {channels} (1 or 2) channels", samples.len());
-        Ok(AudioPcm { sample_rate, channels, samples })
+        ensure!(
+            [8000, 12000, 16000, 24000, 48000].contains(&sample_rate),
+            "Opus takes 8, 12, 16, 24 or 48 kHz, not {sample_rate} Hz"
+        );
+        ensure!(
+            (1..=2).contains(&channels) && samples.len().is_multiple_of(channels as usize),
+            "{} samples are not whole frames of {channels} (1 or 2) channels",
+            samples.len()
+        );
+        Ok(AudioPcm {
+            sample_rate,
+            channels,
+            samples,
+        })
     }
 
     /// Samples per second (per channel).
@@ -431,7 +557,9 @@ impl DecodedFrame {
     /// PCM, or another type).
     pub fn downcast<T: Any>(&self) -> Result<&T> {
         match self {
-            DecodedFrame::Data(value) => value.downcast_ref::<T>().ok_or_else(|| anyhow!("decoded frame is not a {}", std::any::type_name::<T>())),
+            DecodedFrame::Data(value) => value
+                .downcast_ref::<T>()
+                .ok_or_else(|| anyhow!("decoded frame is not a {}", std::any::type_name::<T>())),
             other => Err(anyhow!("{other:?} is not a {}", std::any::type_name::<T>())),
         }
     }
@@ -456,7 +584,11 @@ pub trait StreamDecoder: Send {
     ///
     /// `frame_id` numbers the samples given to this decoder, so a decoder whose output trails its input can say which
     /// sample the picture it returns belongs to ([`last_frame_id`](Self::last_frame_id)).
-    fn decode(&mut self, sample: &EncodingSample<'_>, frame_id: u64) -> Result<Option<DecodedFrame>>;
+    fn decode(
+        &mut self,
+        sample: &EncodingSample<'_>,
+        frame_id: u64,
+    ) -> Result<Option<DecodedFrame>>;
 
     /// Samples were lost before the next one: the queue dropped them while this subscription was behind, or it is
     /// starting. What comes next may refer to pictures this decoder never saw, so show nothing until the stream can be
@@ -517,14 +649,30 @@ pub trait MessageEncoding: Send + Sync {
     /// What it produces for a subscription on `channel` with these `encodeOptions` (without `quality`), or why it
     /// refuses them; checked when the subscription opens. Default: only its own output's channel (any video format),
     /// with no options.
-    fn output_on(&self, channel: Channel, options: &serde_json::Map<String, serde_json::Value>) -> Result<EncodingOutput, String> {
+    fn output_on(
+        &self,
+        channel: Channel,
+        options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EncodingOutput, String> {
         let own = self.output();
-        let wanted = if own == EncodingOutput::Fields { EncodingOutput::Data } else { own };
+        let wanted = if own == EncodingOutput::Fields {
+            EncodingOutput::Data
+        } else {
+            own
+        };
         if channel.kind() != wanted {
-            return Err(format!("{} sends {}, not on channel {}", self.name(), own.as_str(), channel.as_str()));
+            return Err(format!(
+                "{} sends {}, not on channel {}",
+                self.name(),
+                own.as_str(),
+                channel.as_str()
+            ));
         }
         if let Some(option) = options.keys().next() {
-            return Err(format!("{} takes no encodeOptions but quality, got {option:?}", self.name()));
+            return Err(format!(
+                "{} takes no encodeOptions but quality, got {option:?}",
+                self.name()
+            ));
         }
         Ok(own)
     }
@@ -584,7 +732,10 @@ pub trait MessageEncoding: Send + Sync {
     /// across frontends asking for the same options and quality (in 1/1000 steps). Video and audio never get this call.
     fn encode(&self, frame: &DecodedFrame, options: &EncodeOptions) -> Result<Vec<u8>> {
         let _ = (frame, options);
-        Err(anyhow!("encoding {:?} has no data-channel encoder", self.name()))
+        Err(anyhow!(
+            "encoding {:?} has no data-channel encoder",
+            self.name()
+        ))
     }
 
     /// The allocator's prior for the data channel: expected bytes per message as sent (after
@@ -612,13 +763,29 @@ mod tests {
 
     #[test]
     fn a_jpeg_picture_decodes_once_and_only_when_read() {
-        let image = VideoImage::jpeg(4, 2, b"jpeg".to_vec(), grey).unwrap().with_header(1.5, "cam");
+        let image = VideoImage::jpeg(4, 2, b"jpeg".to_vec(), grey)
+            .unwrap()
+            .with_header(1.5, "cam");
         let copy = image.clone();
-        assert_eq!((image.jpeg_bytes(), DECODES.load(Ordering::SeqCst)), (Some(&b"jpeg"[..]), 0), "the encoder's JPEG, no decode");
-        assert_eq!((copy.format(), copy.data().len(), image.data().len()), (PixelFormat::I420, 12, 12));
+        assert_eq!(
+            (image.jpeg_bytes(), DECODES.load(Ordering::SeqCst)),
+            (Some(&b"jpeg"[..]), 0),
+            "the encoder's JPEG, no decode"
+        );
+        assert_eq!(
+            (copy.format(), copy.data().len(), image.data().len()),
+            (PixelFormat::I420, 12, 12)
+        );
         let small = image.to_i420(2, 2).unwrap();
-        assert_eq!((small.jpeg_bytes(), small.header(), small.data().len()), (None, Some((1.5, "cam")), 6));
-        assert_eq!(DECODES.load(Ordering::SeqCst), 1, "clones share the one decode");
+        assert_eq!(
+            (small.jpeg_bytes(), small.header(), small.data().len()),
+            (None, Some((1.5, "cam")), 6)
+        );
+        assert_eq!(
+            DECODES.load(Ordering::SeqCst),
+            1,
+            "clones share the one decode"
+        );
         let broken = VideoImage::jpeg(4, 2, b"junk".to_vec(), grey).unwrap();
         assert!(broken.data().is_empty() && broken.to_i420(2, 2).is_err());
     }

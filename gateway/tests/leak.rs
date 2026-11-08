@@ -4,8 +4,13 @@
 use anyhow::Result;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
-use zenoh_gateway::client::{Client, ClientOptions, Delivery, Message, PublisherOptions, SubscribeOptions};
-use zenoh_gateway::{Channel, DecodedFrame, EncodingOutput, EncodingSample, MessageEncoding, Server, VideoImage, zenoh};
+use zenoh_gateway::client::{
+    Client, ClientOptions, Delivery, Message, PublisherOptions, SubscribeOptions,
+};
+use zenoh_gateway::{
+    Channel, DecodedFrame, EncodingOutput, EncodingSample, MessageEncoding, Server, VideoImage,
+    zenoh,
+};
 
 /// `[r, g, b, width u16, height u16]` → a solid picture.
 struct SolidColor;
@@ -21,8 +26,15 @@ impl MessageEncoding for SolidColor {
 
     fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
         let p = sample.payload;
-        let (width, height) = (u16::from_le_bytes([p[3], p[4]]) as u32, u16::from_le_bytes([p[5], p[6]]) as u32);
-        Ok(DecodedFrame::Video(VideoImage::rgb8(width, height, p[..3].repeat((width * height) as usize))?))
+        let (width, height) = (
+            u16::from_le_bytes([p[3], p[4]]) as u32,
+            u16::from_le_bytes([p[5], p[6]]) as u32,
+        );
+        Ok(DecodedFrame::Video(VideoImage::rgb8(
+            width,
+            height,
+            p[..3].repeat((width * height) as usize),
+        )?))
     }
 }
 
@@ -44,49 +56,108 @@ enum Leave {
 async fn wait_for(what: &str, limit: Duration, done: impl Fn() -> bool) {
     let started = Instant::now();
     while !done() {
-        assert!(started.elapsed() < limit, "{what}: still {} live peer states after {limit:?} (RSS {:.0} MB)", zenoh_gateway::live_peer_states(), rss_mb());
+        assert!(
+            started.elapsed() < limit,
+            "{what}: still {} live peer states after {limit:?} (RSS {:.0} MB)",
+            zenoh_gateway::live_peer_states(),
+            rss_mb()
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
 /// This process's resident set, in MB.
 fn rss_mb() -> f64 {
-    let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output().unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().unwrap_or(0.0) / 1024.0
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<f64>()
+        .unwrap_or(0.0)
+        / 1024.0
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn connections_that_come_and_go_leave_nothing_behind() {
     let mut config = zenoh::Config::default();
-    config.insert_json5("scouting/multicast/enabled", "false").unwrap();
+    config
+        .insert_json5("scouting/multicast/enabled", "false")
+        .unwrap();
     config.insert_json5("listen/endpoints", "[]").unwrap();
     let session = zenoh::open(config).await.unwrap();
-    let server = Server::builder().session(session.clone()).encoding(SolidColor).build().await.unwrap();
+    let server = Server::builder()
+        .session(session.clone())
+        .encoding(SolidColor)
+        .build()
+        .await
+        .unwrap();
     let running = server.bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", running.local_addr());
     let putter = {
         let session = session.clone();
         tokio::spawn(async move {
             loop {
-                session.put("camera/front", solid([200, 40, 90], 320, 240)).await.unwrap();
+                session
+                    .put("camera/front", solid([200, 40, 90], 320, 240))
+                    .await
+                    .unwrap();
                 session.put("map/local", vec![7u8; 200_000]).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(33)).await;
             }
         })
     };
     // batches of connections: each one's states must all go, and memory must level off rather than climb per batch
-    let batches: usize = std::env::var("LEAK_BATCHES").ok().and_then(|batches| batches.parse().ok()).unwrap_or(1);
+    let batches: usize = std::env::var("LEAK_BATCHES")
+        .ok()
+        .and_then(|batches| batches.parse().ok())
+        .unwrap_or(1);
     for batch in 0..batches {
         for round in 0..12 {
             let leave = [Leave::Close, Leave::Drop, Leave::Frozen][round % 3];
-            let client = Client::connect(&url, ClientOptions { heartbeat_hz: 10.0, heartbeat_misses: 3, ..Default::default() }).await.unwrap();
-            let mut camera = client.subscribe("camera/front", SubscribeOptions { encoding: Some("test-solid".into()), ..Default::default() }).await.unwrap();
-            let mut map = client.subscribe("map/local", SubscribeOptions { delivery: Some(Delivery::Reliable), ..Default::default() }).await.unwrap();
-            let publisher = client.publish("cmd/test", PublisherOptions::default()).await.unwrap();
+            let client = Client::connect(
+                &url,
+                ClientOptions {
+                    heartbeat_hz: 10.0,
+                    heartbeat_misses: 3,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let mut camera = client
+                .subscribe(
+                    "camera/front",
+                    SubscribeOptions {
+                        encoding: Some("test-solid".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let mut map = client
+                .subscribe(
+                    "map/local",
+                    SubscribeOptions {
+                        delivery: Some(Delivery::Reliable),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let publisher = client
+                .publish("cmd/test", PublisherOptions::default())
+                .await
+                .unwrap();
             publisher.set_deadman(b"stop").await.unwrap();
             for subscription in [&mut camera, &mut map] {
                 loop {
-                    match timeout(Duration::from_secs(10), subscription.recv()).await.expect("a message").expect("open") {
+                    match timeout(Duration::from_secs(10), subscription.recv())
+                        .await
+                        .expect("a message")
+                        .expect("open")
+                    {
                         Message::Video(_) | Message::Data(_) => break,
                         _ => continue,
                     }
@@ -103,16 +174,34 @@ async fn connections_that_come_and_go_leave_nothing_behind() {
             }
         }
         // a vanished page is let go after the ICE timeouts and DISCONNECTED_GRACE
-        wait_for("after 12 connections", Duration::from_secs(60), || zenoh_gateway::live_peer_states() == 0).await;
-        eprintln!("after {} connections: RSS {:.0} MB, no live peer states", 12 * (batch + 1), rss_mb());
+        wait_for("after 12 connections", Duration::from_secs(60), || {
+            zenoh_gateway::live_peer_states() == 0
+        })
+        .await;
+        eprintln!(
+            "after {} connections: RSS {:.0} MB, no live peer states",
+            12 * (batch + 1),
+            rss_mb()
+        );
     }
     // offers that fail once their connection is built (here a malformed SDP) must not leave it running
     let http = reqwest::Client::new();
     for _ in 0..5 {
-        let response = http.post(format!("{url}/offer")).json(&serde_json::json!({"type": "offer", "sdp": "v=0\r\n"})).send().await.unwrap();
-        assert!(!response.status().is_success(), "a malformed offer is refused");
+        let response = http
+            .post(format!("{url}/offer"))
+            .json(&serde_json::json!({"type": "offer", "sdp": "v=0\r\n"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            !response.status().is_success(),
+            "a malformed offer is refused"
+        );
     }
-    wait_for("after 5 failed offers", Duration::from_secs(10), || zenoh_gateway::live_peer_states() == 0).await;
+    wait_for("after 5 failed offers", Duration::from_secs(10), || {
+        zenoh_gateway::live_peer_states() == 0
+    })
+    .await;
     putter.abort();
     running.shutdown().await.unwrap();
 }

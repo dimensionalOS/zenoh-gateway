@@ -39,7 +39,17 @@ pub enum Dtype {
 }
 
 impl Dtype {
-    const ALL: [Dtype; 9] = [Dtype::U8, Dtype::I8, Dtype::U16, Dtype::I16, Dtype::U32, Dtype::I32, Dtype::F32, Dtype::F64, Dtype::Utf8];
+    const ALL: [Dtype; 9] = [
+        Dtype::U8,
+        Dtype::I8,
+        Dtype::U16,
+        Dtype::I16,
+        Dtype::U32,
+        Dtype::I32,
+        Dtype::F32,
+        Dtype::F64,
+        Dtype::Utf8,
+    ];
 
     /// Bytes per value.
     pub fn size(self) -> usize {
@@ -118,7 +128,9 @@ pub struct Fields {
 
 impl Default for Fields {
     fn default() -> Self {
-        Fields { bytes: vec![VERSION, 0] }
+        Fields {
+            bytes: vec![VERSION, 0],
+        }
     }
 }
 
@@ -140,20 +152,43 @@ impl Fields {
 
     /// `components` values per element, interleaved (e.g. x, y, z per point).
     pub fn vectors<T: Element>(self, name: &str, components: u8, values: &[T]) -> Self {
-        self.push(name, (T::DTYPE, components, values.len()), 0, None, |out| values.iter().for_each(|value| value.put(out)))
+        self.push(name, (T::DTYPE, components, values.len()), 0, None, |out| {
+            values.iter().for_each(|value| value.put(out))
+        })
     }
 
     /// Quantized integers the client turns into a `Float32Array` of `offset[c] + value × scale[c]`,
     /// one offset and scale per component (`offset.len()` components).
-    pub fn scaled<T: Element>(self, name: &str, offset: &[f64], scale: &[f64], values: &[T]) -> Self {
-        assert!(T::DTYPE.is_integer(), "fields: scaled field {name:?} must hold integers");
-        assert_eq!(offset.len(), scale.len(), "fields: {name:?} needs one offset and one scale per component");
-        self.push(name, (T::DTYPE, offset.len() as u8, values.len()), SCALED, Some((offset, scale)), |out| values.iter().for_each(|value| value.put(out)))
+    pub fn scaled<T: Element>(
+        self,
+        name: &str,
+        offset: &[f64],
+        scale: &[f64],
+        values: &[T],
+    ) -> Self {
+        assert!(
+            T::DTYPE.is_integer(),
+            "fields: scaled field {name:?} must hold integers"
+        );
+        assert_eq!(
+            offset.len(),
+            scale.len(),
+            "fields: {name:?} needs one offset and one scale per component"
+        );
+        self.push(
+            name,
+            (T::DTYPE, offset.len() as u8, values.len()),
+            SCALED,
+            Some((offset, scale)),
+            |out| values.iter().for_each(|value| value.put(out)),
+        )
     }
 
     /// UTF-8 text (the client gets a `string`).
     pub fn text(self, name: &str, text: &str) -> Self {
-        self.push(name, (Dtype::Utf8, 1, text.len()), 0, None, |out| out.extend_from_slice(text.as_bytes()))
+        self.push(name, (Dtype::Utf8, 1, text.len()), 0, None, |out| {
+            out.extend_from_slice(text.as_bytes())
+        })
     }
 
     /// The message bytes.
@@ -161,10 +196,24 @@ impl Fields {
         self.bytes
     }
 
-    fn push(mut self, name: &str, (dtype, components, values): (Dtype, u8, usize), flags: u8, scaling: Option<(&[f64], &[f64])>, write: impl FnOnce(&mut Vec<u8>)) -> Self {
-        assert!(name.len() <= 255 && self.bytes[1] < 255, "fields: at most 255 fields with names of at most 255 bytes ({name:?})");
-        assert!((1..=4).contains(&components) && values.is_multiple_of(components as usize), "fields: {name:?} has {values} values, not a whole number of {components}-component elements");
-        let count = u32::try_from(values / components as usize).expect("fields: more than u32::MAX elements");
+    fn push(
+        mut self,
+        name: &str,
+        (dtype, components, values): (Dtype, u8, usize),
+        flags: u8,
+        scaling: Option<(&[f64], &[f64])>,
+        write: impl FnOnce(&mut Vec<u8>),
+    ) -> Self {
+        assert!(
+            name.len() <= 255 && self.bytes[1] < 255,
+            "fields: at most 255 fields with names of at most 255 bytes ({name:?})"
+        );
+        assert!(
+            (1..=4).contains(&components) && values.is_multiple_of(components as usize),
+            "fields: {name:?} has {values} values, not a whole number of {components}-component elements"
+        );
+        let count = u32::try_from(values / components as usize)
+            .expect("fields: more than u32::MAX elements");
         let out = &mut self.bytes;
         out[1] += 1;
         out.push(name.len() as u8);
@@ -201,29 +250,43 @@ impl Field {
     /// Every value as f64, scaling applied.
     pub fn values(&self) -> Vec<f64> {
         let size = self.dtype.size();
-        self.data.chunks_exact(size).enumerate().map(|(index, bytes)| {
-            let value = self.dtype.read(bytes);
-            match &self.scaling {
-                Some((offset, scale)) => offset[index % offset.len()] + value * scale[index % scale.len()],
-                None => value,
-            }
-        }).collect()
+        self.data
+            .chunks_exact(size)
+            .enumerate()
+            .map(|(index, bytes)| {
+                let value = self.dtype.read(bytes);
+                match &self.scaling {
+                    Some((offset, scale)) => {
+                        offset[index % offset.len()] + value * scale[index % scale.len()]
+                    }
+                    None => value,
+                }
+            })
+            .collect()
     }
 
     /// A text field's string.
     pub fn text(&self) -> Option<&str> {
-        (self.dtype == Dtype::Utf8).then(|| std::str::from_utf8(&self.data).ok()).flatten()
+        (self.dtype == Dtype::Utf8)
+            .then(|| std::str::from_utf8(&self.data).ok())
+            .flatten()
     }
 }
 
 /// Parses a fields message by name.
 pub fn parse(bytes: &[u8]) -> Result<BTreeMap<String, Field>> {
-    ensure!(bytes.len() >= 2 && bytes[0] == VERSION, "not a fields v{VERSION} message");
+    ensure!(
+        bytes.len() >= 2 && bytes[0] == VERSION,
+        "not a fields v{VERSION} message"
+    );
     let mut at = 2usize;
     // the next n bytes, after padding to a multiple of `align`
     let mut take = |n: usize, align: usize| -> Result<&[u8]> {
         let start = at.next_multiple_of(align);
-        ensure!(start + n <= bytes.len(), "fields message truncated at byte {start}");
+        ensure!(
+            start + n <= bytes.len(),
+            "fields message truncated at byte {start}"
+        );
         at = start + n;
         Ok(&bytes[start..at])
     };
@@ -231,17 +294,43 @@ pub fn parse(bytes: &[u8]) -> Result<BTreeMap<String, Field>> {
     for _ in 0..bytes[1] {
         let name_len = take(1, 1)?[0] as usize;
         let name = String::from_utf8(take(name_len, 1)?.to_vec())?;
-        let &[dtype, components, flags, a, b, c, d] = take(7, 1)? else { unreachable!() };
-        let Some(&dtype) = Dtype::ALL.get(dtype as usize) else { bail!("field {name:?}: unknown dtype {dtype}") };
+        let &[dtype, components, flags, a, b, c, d] = take(7, 1)? else {
+            unreachable!()
+        };
+        let Some(&dtype) = Dtype::ALL.get(dtype as usize) else {
+            bail!("field {name:?}: unknown dtype {dtype}")
+        };
         let count = u32::from_le_bytes([a, b, c, d]);
         let scaling = if flags & SCALED != 0 {
-            let numbers: Vec<f64> = take(16 * components as usize, 1)?.as_chunks::<8>().0.iter().map(|bytes| f64::from_le_bytes(*bytes)).collect();
-            Some((numbers[..components as usize].to_vec(), numbers[components as usize..].to_vec()))
+            let numbers: Vec<f64> = take(16 * components as usize, 1)?
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|bytes| f64::from_le_bytes(*bytes))
+                .collect();
+            Some((
+                numbers[..components as usize].to_vec(),
+                numbers[components as usize..].to_vec(),
+            ))
         } else {
             None
         };
-        let data = take(count as usize * components as usize * dtype.size(), dtype.size())?.to_vec();
-        fields.insert(name, Field { dtype, components, count, scalar: flags & SCALAR != 0, scaling, data });
+        let data = take(
+            count as usize * components as usize * dtype.size(),
+            dtype.size(),
+        )?
+        .to_vec();
+        fields.insert(
+            name,
+            Field {
+                dtype,
+                components,
+                count,
+                scalar: flags & SCALAR != 0,
+                scaling,
+                data,
+            },
+        );
     }
     Ok(fields)
 }
@@ -257,7 +346,12 @@ mod tests {
             .scalar("width", 3u32)
             .array("data", &[1.5f32, -2.0, 0.25])
             .vectors("origin", 3, &[1.0f64, 2.0, 3.0])
-            .scaled("positions", &[1.0, 2.0, 3.0], &[0.5, 0.25, 2.0], &[2i16, -4, 1, 0, 0, 0])
+            .scaled(
+                "positions",
+                &[1.0, 2.0, 3.0],
+                &[0.5, 0.25, 2.0],
+                &[2i16, -4, 1, 0, 0, 0],
+            )
             .array("intensity", &[7u8, 9])
             .build();
         let fields = parse(&bytes).unwrap();
@@ -265,11 +359,17 @@ mod tests {
         assert_eq!(fields["width"].values(), [3.0]);
         assert!(fields["width"].scalar && !fields["intensity"].scalar);
         assert_eq!(fields["data"].values(), [1.5, -2.0, 0.25]);
-        assert_eq!((fields["origin"].components, fields["origin"].count), (3, 1));
+        assert_eq!(
+            (fields["origin"].components, fields["origin"].count),
+            (3, 1)
+        );
         assert_eq!(fields["positions"].values(), [2.0, 1.0, 5.0, 1.0, 2.0, 3.0]);
         assert_eq!(fields["intensity"].values(), [7.0, 9.0]);
         // each field's values start at a multiple of their size from the message start
-        let data_at = bytes.windows(12).position(|window| window == [0, 0, 0xc0, 0x3f, 0, 0, 0, 0xc0, 0, 0, 0x80, 0x3e]).unwrap();
+        let data_at = bytes
+            .windows(12)
+            .position(|window| window == [0, 0, 0xc0, 0x3f, 0, 0, 0, 0xc0, 0, 0, 0x80, 0x3e])
+            .unwrap();
         assert_eq!(data_at % 4, 0);
         assert!(parse(&bytes[..bytes.len() - 1]).is_err(), "truncated");
         assert!(parse(&[2, 0]).is_err(), "unknown version");
