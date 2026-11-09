@@ -21,6 +21,13 @@ pub(crate) mod registry;
 pub(crate) mod video;
 
 pub use video::{EncodedVideo, H264Encoder, VideoEncoder, VideoFormat, VideoPolicy, VideoTarget};
+/// Exported for the same reason [`H264Encoder`] is: an encoding that forwards frames a publisher already encoded
+/// ([`MessageEncoding::video_encoder`]) still has to encode the ones it cannot forward, and it can only do that with
+/// an encoder it can name. Without this an AV1 track is unreachable from such an encoding — returning `None` would
+/// leave the gateway's own encoder to handle a decoded picture, but then nothing would forward an AV1 source that
+/// needed no transcode at all.
+#[cfg(feature = "av1")]
+pub use av1::Av1Encoder;
 
 use anyhow::{Result, anyhow, ensure};
 use std::any::Any;

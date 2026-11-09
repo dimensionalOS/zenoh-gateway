@@ -61,6 +61,9 @@ mod server;
 mod subscription;
 
 pub use encoding::{AudioPcm, Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, MessageHeader, EncodedVideo, H264Encoder, PixelFormat, StreamDecoder, VideoEncoder, VideoFormat, VideoImage, VideoPolicy, VideoTarget};
+/// The built-in AV1 encoder (feature `av1`), beside [`H264Encoder`], for an encoding that supplies its own.
+#[cfg(feature = "av1")]
+pub use encoding::Av1Encoder;
 pub use auth::{Acl, AclMessage, AclRule, Flow, Grant, OnRefused, Permission};
 pub use fields::Fields;
 pub use ice::{ICE_HOOK_TIMEOUT, IceRequest, IceServer, IceServersFn, IceSide, turn_credentials};
