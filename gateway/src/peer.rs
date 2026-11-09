@@ -1999,6 +1999,77 @@ mod tests {
         assert!(on_this_machine("6f1c2a0e-9b1d-4e2f-8a3b-1c2d3e4f5a6b.local"), "a name is taken at the page's word");
     }
 
+    /// A tiny deterministic PRNG, as `allocator`'s sweeps use.
+    fn lcg(state: &mut u64) -> f64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*state >> 33) as f64) / ((1u64 << 31) as f64)
+    }
+
+    /// Invariants the video/data split must hold for any mix. It is a divider, and every bug in this system has been
+    /// in a divider, so it is worth sweeping rather than exampling -- and it has an `expect("every stream allocated")`
+    /// that a bad partition would turn into a panic in the allocation loop.
+    ///
+    /// 1. **Every stream gets an allocation** (the `expect` cannot fire) and none is NaN or negative.
+    /// 2. **Video together never exceeds its cap**, which is the whole point: those bytes leave through the GCC-paced
+    ///    RTP track, so granting more than GCC's target makes the encoders outrun the pacer and the excess becomes
+    ///    latency.
+    /// 3. **Total spend never exceeds the budget.**
+    /// 4. **Monotone in the budget** -- more budget never gives any stream less.
+    #[test]
+    fn video_cap_split_holds_its_invariants_over_a_sweep() {
+        let mut seed = 0xca9_5eed_u64;
+        for case in 0..300 {
+            let count = 1 + (lcg(&mut seed) * 5.0) as usize;
+            let mut demands = Vec::new();
+            let mut is_video = Vec::new();
+            let mut prices = Vec::new();
+            for _ in 0..count {
+                let price = 500.0 + lcg(&mut seed) * 90_000.0;
+                let hz = 1.0 + lcg(&mut seed) * 30.0;
+                prices.push(price);
+                demands.push(stream(price, hz));
+                is_video.push(lcg(&mut seed) < 0.4);
+            }
+            let video_cap = lcg(&mut seed) * 3_000_000.0;
+            let rebuild = || (0..count).map(|index| stream(prices[index], demands[index].max_hz)).collect::<Vec<_>>();
+
+            let mut previous: Option<Vec<allocator::Allocation>> = None;
+            for budget in [0.0, 25_000.0, 200_000.0, 1_500_000.0, 6_000_000.0] {
+                let got = allocate_within_video_cap(budget, video_cap, rebuild(), &is_video);
+                assert_eq!(got.len(), count, "case {case} budget {budget}");
+                for (index, allocation) in got.iter().enumerate() {
+                    assert!(
+                        allocation.hz.is_finite() && allocation.hz >= 0.0,
+                        "case {case} budget {budget}: stream {index} hz {}",
+                        allocation.hz
+                    );
+                    assert!(
+                        allocation.budget_bytes_per_sec.is_finite() && allocation.budget_bytes_per_sec >= 0.0,
+                        "case {case}: stream {index} budget"
+                    );
+                }
+                let video: f64 = got.iter().zip(&is_video).filter(|(_, v)| **v).map(|(a, _)| a.budget_bytes_per_sec).sum();
+                assert!(
+                    video <= video_cap.max(budget) + 1.0,
+                    "case {case} budget {budget}: video took {video:.0} over its cap {video_cap:.0}"
+                );
+                let total: f64 = got.iter().map(|a| a.budget_bytes_per_sec).sum();
+                assert!(total <= budget + 1.0, "case {case} budget {budget}: total {total:.0} over the budget");
+                if let Some(before) = &previous {
+                    for (index, (less, more)) in before.iter().zip(&got).enumerate() {
+                        assert!(
+                            more.hz >= less.hz - 1e-9,
+                            "case {case}: stream {index} got {:.4} Hz at budget {budget} but {:.4} Hz at a smaller one",
+                            more.hz,
+                            less.hz
+                        );
+                    }
+                }
+                previous = Some(got);
+            }
+        }
+    }
+
     fn stream(bytes_per_message: f64, hz: f64) -> allocator::Demand {
         allocator::Demand {
             priority: 1.0,

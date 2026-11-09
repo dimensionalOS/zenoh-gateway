@@ -845,6 +845,115 @@ mod tests {
         }
     }
 
+    /// Degenerate inputs must not panic and must not produce a NaN grant.
+    ///
+    /// A NaN is the worst outcome available here: it is not a crash anyone would notice, it propagates into
+    /// `key_interval` and the encoder's target, and a stream whose rate is NaN simply stops while every stat still
+    /// reads plausibly. The arithmetic has divisions by a total weight, by a price and by `max_hz`, so every one of
+    /// those being zero is worth asserting rather than assuming.
+    #[test]
+    fn degenerate_demands_neither_panic_nor_produce_nan() {
+        // every divisor in the arithmetic at zero, plus a demand far past any budget, plus an empty set
+        let sets: Vec<fn() -> Vec<Demand>> = vec![
+            || vec![raw(1.0, 10.0, 0.0)],                                                   // price 0
+            || vec![raw(1.0, 0.0, 50_000.0)],                                               // max_hz 0
+            || vec![raw(0.0, 10.0, 50_000.0)],                                              // priority 0 (its own phase)
+            || vec![Demand { fixed_bytes_per_sec: Some(0.0), ..raw(1.0, 10.0, 50_000.0) }], // reserved at nothing
+            || vec![Demand { shrinks_last: true, ..raw(1.0, 10.0, 50_000.0) }],             // shrinks last
+            || vec![transcoded(0.5, 10.0)],                                                 // a quality range
+            || vec![raw(1.0, 1_000_000.0, 1e12)],                                           // past any budget
+            || {
+                vec![
+                    raw(1.0, 10.0, 0.0),
+                    raw(1.0, 0.0, 50_000.0),
+                    raw(0.0, 10.0, 50_000.0),
+                    Demand { fixed_bytes_per_sec: Some(0.0), ..raw(1.0, 10.0, 50_000.0) },
+                    Demand { shrinks_last: true, ..raw(1.0, 10.0, 50_000.0) },
+                    transcoded(0.5, 10.0),
+                    raw(1.0, 1_000_000.0, 1e12),
+                ]
+            },
+            Vec::new,
+        ];
+        for budget in [0.0, -1.0, 1e-9, 1.0, 64_000.0, 1e12] {
+            for (index, make) in sets.iter().enumerate() {
+                let demands = make();
+                let got = allocate(budget, &demands);
+                assert_eq!(got.len(), demands.len(), "budget {budget}, set {index}");
+                for (slot, allocation) in got.iter().enumerate() {
+                    assert!(allocation.hz.is_finite(), "budget {budget}, set {index}, stream {slot}: hz is {}", allocation.hz);
+                    assert!(allocation.hz >= 0.0, "budget {budget}, set {index}, stream {slot}: hz is negative");
+                    if let Some(quality) = allocation.quality {
+                        assert!(
+                            quality.is_finite() && (0.0..=1.0).contains(&quality),
+                            "budget {budget}, set {index}, stream {slot}: quality {quality}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// And the window must stay finite and sane for a link model in any state, including the ones a seed or a bad
+    /// measurement could put it in.
+    #[test]
+    fn degenerate_link_states_give_a_finite_window() {
+        let target = Some(Duration::from_millis(300));
+        for bandwidth in [0.0, 1e-9, 1.0, 1e12] {
+            for rtt in [None, Some(0.0), Some(1e-9), Some(1.0), Some(1e9)] {
+                for gain in [0.0, 0.75, 1.0, STARTUP_GAIN, 1e6] {
+                    let mut model = LinkModel::default();
+                    model.bandwidth_bytes_per_sec = bandwidth;
+                    model.gain = gain;
+                    (model.min_rtt_ms, model.typical_rtt_ms, model.path_rtt_ms) = (rtt, rtt, rtt);
+                    model.extra_acked = 1e9;
+                    let (window, _) = model.window(target);
+                    assert!(window >= MIN_WINDOW, "bandwidth {bandwidth}, rtt {rtt:?}, gain {gain}: {window}");
+                    let (rate, paced) = model.pacing(target);
+                    assert!(rate.is_finite() && rate >= 0.0, "pacing rate {rate} for bandwidth {bandwidth}, gain {gain}");
+                    assert!(paced >= MIN_WINDOW);
+                }
+            }
+        }
+    }
+
+    /// The fix's own failure mode: what happens when the path's **floor** goes over the target, and does it come back?
+    ///
+    /// `path_floor_ms` resists a queue and resists a transient, which is why it is the right signal -- but it is not
+    /// unconditionally queue-proof. If every round trip in ten seconds is slow then the least one is slow too, the
+    /// wider mode engages, and from there we are back to the dynamics the latch lived in, with no hysteresis on the
+    /// way out. Measured in the harshest simulated schedule, `minRtt` itself reached 173 ms against a 300 ms target --
+    /// under it, so the fix held, but not by a margin anyone should rely on.
+    ///
+    /// So: a path that is genuinely slow for 30 s and then becomes fast must end up **capped again**. If it did not,
+    /// the latch would have been moved rather than removed, and this test is how that would be found.
+    #[test]
+    fn a_path_that_was_slow_and_got_better_is_capped_again() {
+        let target = Some(Duration::from_millis(300));
+        let mut link = sim::Link::new(2_500_000.0, 12.0)
+            .with_trickle(7_000.0)
+            .with_path_delay(|elapsed| if elapsed.as_secs_f64() < 30.0 { 650.0 } else { 12.0 });
+        let mut model = LinkModel::default();
+        let rounds = link.run(&mut model, Instant::now(), 480, 0.25, 2_000_000.0, target);
+
+        // while the path really is slow, the wider mode is correct and the window must still be finite
+        let slow: Vec<_> = rounds.iter().filter(|round| round.at.as_secs_f64() < 30.0).collect();
+        let peak_slow = slow.iter().map(|round| round.window_bytes as f64).fold(0.0, f64::max);
+        assert!(peak_slow.is_finite() && peak_slow > 0.0, "a slow path still gets a window: {peak_slow}");
+
+        // ... and once it is fast again, the cap comes back. `min_rtt_ms` is a ten-second minimum, so allow it that
+        // long to age out before judging: anything after 45 s is well clear
+        let after: Vec<_> = rounds.iter().filter(|round| round.at.as_secs_f64() > 45.0).collect();
+        assert!(after.len() > 50, "enough rounds after the path recovers: {}", after.len());
+        let floor = model.path_floor_ms().expect("a floor was measured");
+        assert!(floor < 300.0, "the floor comes back under the target once the path does: {floor:.0} ms");
+        let latched = after.iter().filter(|round| !round.latency_first).count();
+        assert_eq!(latched, 0, "{latched} of {} rounds stayed in the wider mode after the path recovered", after.len());
+        let over =
+            after.iter().filter(|round| round.window_bytes as f64 > round.estimate_bytes_per_sec * round.gain.max(1.0) * 0.3 + 1.0).count();
+        assert_eq!(over, 0, "{over} of {} rounds kept a window over the cap after recovering", after.len());
+    }
+
     /// A slow path is not a trap on its own: startup ends and the estimate reaches what the link carries.
     ///
     /// Worth pinning, because the cold-start failure on a robot *looked* like "a slow path stops startup" and it is
