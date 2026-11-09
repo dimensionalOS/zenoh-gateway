@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
@@ -284,8 +284,6 @@ pub struct SubShared {
     /// this frontend's shared send gate, and this stream's id in it
     gate: Arc<SendGate>,
     stream_id: usize,
-    /// published priority of the latest sample (used when the subscription sets none)
-    sample_priority: AtomicU8,
     /// the send loop built a `StreamDecoder` for this stream, so it must see every sample (see [`SubShared::reserved`]).
     /// Set where the decoder is built rather than asked of the encoding here, because `reserved` is consulted on every
     /// sample and building a decoder is not cheap; the first samples may be thinned before it is set, which costs one
@@ -335,7 +333,6 @@ impl SubShared {
         SubShared {
             gate,
             stream_id: NEXT_STREAM.fetch_add(1, Ordering::Relaxed),
-            sample_priority: AtomicU8::new(0),
             stream_decoded: AtomicBool::new(false),
             delivery: opts.delivery(),
             reliable_max_backlog,
@@ -426,11 +423,21 @@ impl SubShared {
         Some(max_age.max(message_bytes / bandwidth.max(1.0)))
     }
 
-    /// Strict-priority tier: its priority (subscribe option, else as published) is
-    /// `STRICT_PRIORITY` or more urgent. Strict streams bypass allocation and pacing and preempt bulk streams.
+    /// Strict-priority tier: the **subscribe option** is `STRICT_PRIORITY` or more urgent. Strict streams bypass
+    /// allocation and pacing and preempt bulk streams.
+    ///
+    /// **The consumer decides this, never the publisher.** It used to fall back to the arriving sample's own zenoh
+    /// priority when a subscription set none, which let a *publisher* promote its stream on every page that watched
+    /// it -- and strictness is not only "goes first", it is also [`reserved`](Self::reserved): a reservation at the
+    /// stream's measured rate, taken off the top of the budget and never shrunk. Measured on a robot, a 900 KB/s
+    /// point cloud published at `INTERACTIVE_HIGH` therefore took an uncapped reservation and drove the camera a
+    /// human was watching to **exactly 0.00**, with no viewer having any say. A publisher cannot know what else a
+    /// page is showing, so it cannot be the one to decide what gets starved.
+    ///
+    /// A sample's published priority still orders items *within* a stream's own queue (see `pick`); what it no longer
+    /// does is move a stream into a tier that preempts other streams.
     pub fn is_strict(&self) -> bool {
-        let priority = self.priority_override.unwrap_or_else(|| self.sample_priority.load(Ordering::Relaxed));
-        priority != 0 && priority <= STRICT_PRIORITY
+        self.priority_override.is_some_and(|priority| priority != 0 && priority <= STRICT_PRIORITY)
     }
 
     /// Quality to transcode at now: the allocation's, or the best allowed before the first one.
@@ -756,7 +763,6 @@ impl SubShared {
             return;
         }
         let payload_len = sample.payload().len();
-        self.sample_priority.store(sample.priority() as u8, Ordering::Relaxed);
         {
             let mut state = self.state.lock();
             let seq = state.next_seq;
@@ -1434,14 +1440,18 @@ mod tests {
         let _ = sub.pick(Instant::now());
     }
 
+    /// The strict tier is the subscriber's choice and nothing else: a publisher cannot promote its own stream into a
+    /// tier that preempts, and reserves bandwidth against, every other stream on the page.
     #[test]
-    fn strict_tier_by_option_or_published_priority() {
-        assert!(shared(r#"{"priority":2}"#).is_strict());
-        assert!(!shared(r#"{"priority":3}"#).is_strict());
+    fn only_the_subscriber_can_ask_for_the_strict_tier() {
+        assert!(shared(r#"{"priority":2}"#).is_strict(), "the subscribe option is what grants it");
+        assert!(!shared(r#"{"priority":3}"#).is_strict(), "and only at STRICT_PRIORITY or more urgent");
         let unset = shared(r#"{}"#);
-        assert!(!unset.is_strict(), "no sample yet");
-        unset.sample_priority.store(1, Ordering::Relaxed);
-        assert!(unset.is_strict());
+        assert!(!unset.is_strict(), "a subscription that asked for nothing is not strict");
+        // a sample published at zenoh REAL_TIME (1) used to make this true, which is the bug: the robot's point cloud
+        // promoted itself and the camera on the same page was allocated exactly 0
+        assert!(!unset.is_strict(), "and no sample's own priority can change that");
+        assert!(!unset.reserved(), "so it takes no uncapped reservation either");
     }
 
     fn pending(seq: u32, priority: u8, arrived: Instant) -> Pending {

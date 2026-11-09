@@ -573,7 +573,22 @@ impl LinkModel {
                 });
                 ((wanted.min(most) as usize).max(MIN_WINDOW), most < wanted)
             }
-            (false, None) => (INITIAL_WINDOW, false),
+            // Nothing measured yet, so there is no round trip to hold the link's bandwidth over -- but the gain's
+            // headroom still applies, and leaving it out is a trap rather than a conservative default. Delivery is
+            // capped at `window / rtt`, the bandwidth is a max filter over delivery, and this branch does not depend
+            // on the bandwidth at all: so with a fixed window the estimate can never learn that the link carries more
+            // than the window already permits, and the window never grows because it does not look at the estimate.
+            // The startup gain is the only thing that breaks that circle -- it is what lets delivery *exceed* the
+            // estimate so the estimate can rise -- and the measured branch above has it as `(gain - 1) * held`.
+            //
+            // Measured on a robot: 200 rounds of demonstrably delivering 38 KB/s with not one round trip sampled, the
+            // bandwidth correctly learned as 38 KB/s, startup over, and the window still at exactly 12,000 -- which at
+            // that path's round trip is *below* what the link was carrying. The browser had 8 MB in the same window,
+            // so the link was never the limit; this was.
+            //
+            // Bounded by construction: there is no round-trip term here, so it is a constant times a gain that falls
+            // back to 1.0 when startup ends, not a feedback loop.
+            (false, None) => (((INITIAL_WINDOW as f64 * self.gain.max(1.0)) as usize).max(INITIAL_WINDOW), false),
         }
     }
 }
@@ -609,6 +624,102 @@ mod tests {
             price: Box::new(|q| 100.0 + 1000.0 * q),
             fixed_bytes_per_sec: None,
             shrinks_last: false,
+        }
+    }
+
+    /// A link that is demonstrably delivering must not be held at the no-measurement window for ever.
+    ///
+    /// The robot's cold start: not one round trip sampled over 70 s, the bandwidth correctly learned, startup over,
+    /// and the window still at exactly `INITIAL_WINDOW` -- which at that path's round trip was *below* what the link
+    /// was already carrying. The circle is that delivery is capped at `window / rtt`, the bandwidth is a max filter
+    /// over delivery, and the no-measurement branch does not look at the bandwidth: so the estimate cannot learn past
+    /// the window and the window cannot grow from the estimate. The startup gain's headroom is what breaks it.
+    #[test]
+    fn a_link_with_no_round_trip_sample_still_gets_the_gains_headroom() {
+        let target = Some(Duration::from_millis(300));
+        let mut model = LinkModel::default();
+        let start = Instant::now();
+        // what the gate reports when it never matches an ack to a frame: rates, but no round trip of any kind
+        let blind = |rate: f64| crate::pacing::RoundSamples {
+            link_limited_rate: Some(rate),
+            min_rtt_ms: None,
+            typical_rtt_ms: None,
+            path_rtt_ms: None,
+            drained: true,
+            window_waited: true,
+            ..Default::default()
+        };
+        // while starting up, the window must be above the bare default, or delivery can never exceed the estimate
+        model.update(start, 0.25, blind(38_000.0), 0.0, false, 38_000.0);
+        assert!(model.starting_up, "a first round does not end startup");
+        let (starting, _) = model.window(target);
+        assert!(
+            starting > INITIAL_WINDOW,
+            "starting up with nothing measured: {starting} is the bare default {INITIAL_WINDOW}, so the estimate can \
+             never learn the link carries more than the window already allows"
+        );
+        assert_eq!(starting, (INITIAL_WINDOW as f64 * STARTUP_GAIN) as usize, "and it is the gain's headroom, nothing else");
+        assert!(model.min_rtt_ms.is_none() && model.typical_rtt_ms.is_none(), "still nothing measured");
+
+        // ... and once startup is over the gain falls back to 1, so this is not a permanent inflation
+        for round in 1..200u64 {
+            model.update(start + Duration::from_millis(250 * round), 0.25, blind(38_000.0), 0.0, false, 38_000.0);
+        }
+        assert!(!model.starting_up, "200 rounds of flat delivery ends startup");
+        let (settled, _) = model.window(target);
+        // not back to exactly the default: past startup the gain cycles through `PROBE_GAINS`, and a probe round is
+        // *meant* to have headroom. What matters is that startup's 2.89x is gone, so this is not a standing inflation
+        let most = (INITIAL_WINDOW as f64 * PROBE_UP_GAIN) as usize;
+        assert!(settled <= most, "settled with nothing measured: {settled} is over the probe gain's {most} (gain {})", model.gain);
+        assert!(settled < starting, "and below startup's window {starting}, so the headroom is not permanent");
+    }
+
+    #[test]
+    fn probe_cold_start_slow_path() {
+        // the robot's cold start: a genuinely slow path (the browser measured 810 ms min / 1.66 s p50) carrying a
+        // modest rate, 24 channels asking for far more than it has. Does startup ever end, and does the window grow?
+        let target = Some(Duration::from_millis(300));
+        for (path_ms, capacity) in [(810.0, 150_000.0), (810.0, 2_000_000.0), (12.0, 150_000.0)] {
+            let mut link = sim::Link::new(capacity, path_ms).with_trickle(7_000.0);
+            let mut model = LinkModel::default();
+            let rounds = link.run(&mut model, Instant::now(), 300, 0.25, 2_000_000.0, target);
+            let last = rounds.last().unwrap();
+            eprintln!(
+                "COLD path={path_ms:>5.0}ms cap={capacity:>9.0} | startingUp {}/{} | final est={:>9.0} window={:>8} gain={:.2} | delivered p50={:>9.0} | minRtt={:?}",
+                rounds.iter().filter(|r| r.starting_up).count(),
+                rounds.len(),
+                last.estimate_bytes_per_sec,
+                last.window_bytes,
+                last.gain,
+                sim::settled(&rounds, |r| r.delivered_bytes_per_sec),
+                model.min_rtt_ms.map(|v| v.round()),
+            );
+        }
+    }
+
+    #[test]
+    fn probe_near_zero_budget() {
+        // the robot's cold start: a tiny budget shared between a forwarded camera and a bulk point cloud
+        let camera_price = 25_000.0; // ~25 KB per 720p frame
+        let cloud_price = 90_000.0;
+        for reserved in [false, true] {
+            let camera = if reserved {
+                Demand { fixed_bytes_per_sec: Some(760_000.0), ..raw(1.0, 30.0, camera_price) }
+            } else {
+                raw(1.0, 30.0, camera_price)
+            };
+            let cloud = raw(1.0, 10.0, cloud_price);
+            let demands = vec![camera, cloud];
+            let wants: Vec<f64> = demands.iter().map(Demand::wants).collect();
+            for budget in [64_000.0, 500_000.0, 3_000_000.0] {
+                let got = allocate(budget, &demands);
+                eprintln!(
+                    "PROBE reserved={reserved} budget={budget:>9.0} wants={:?} -> hz={:?} grantSum={:.0}",
+                    wants.iter().map(|w| *w as u64).collect::<Vec<_>>(),
+                    got.iter().map(|a| (a.hz * 100.0).round() / 100.0).collect::<Vec<_>>(),
+                    got.iter().zip(&demands).map(|(a, d)| (d.price)(1.0) * a.hz).sum::<f64>()
+                );
+            }
         }
     }
 
