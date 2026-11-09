@@ -493,12 +493,42 @@ impl LinkModel {
         (self.bandwidth_bytes_per_sec * self.gain, self.window(latency_target).0)
     }
 
+    /// What the path costs with none of our queue in it, for deciding which mode [`window`](Self::window) is in: the
+    /// least round trip over `RTT_WINDOW`, and `path_rtt_ms` only when there is no least yet.
+    ///
+    /// **`path_rtt_ms` cannot be used for this, and that is a measurement fact, not a preference.** It is the median of
+    /// frames sent while at most `QUIET_BYTES` (8 KB) of *ours* was in flight — but in-flight counts what we have not
+    /// had acked, and on a path holding a standing queue most of those bytes are sitting in a router, not on the wire.
+    /// So the quiet condition is satisfied at the very moment the queue is deepest, and such a frame honestly takes as
+    /// long as the queue ahead of it: measured on a robot, `path_rtt_ms` never once dipped below 57 ms and tracked the
+    /// queued round trip to 569 ms while the least round trip over the same seconds was **5.8 ms**. (An earlier attempt
+    /// moved this sample off ProbeRTT's drain for the same reason, and it was not enough: a queue the drain does not
+    /// empty reads as the path.)
+    ///
+    /// A minimum is the right shape for the question. It cannot be pushed up by our own queue, and it cannot be pushed
+    /// up by a transient either — a spike does not raise a minimum — so the slow-path mode is entered only when *every*
+    /// round trip in ten seconds was slow, which is what "the path alone is slow" means. On the robot that mattered
+    /// exactly: the sample that tripped the latch was a lone 494 ms least-round-trip with 25 KB in flight, one poll
+    /// before the flip, and a ten-second minimum rejects it.
+    pub fn path_floor_ms(&self) -> Option<f64> {
+        self.min_rtt_ms.or(self.path_rtt_ms)
+    }
+
     /// The most that may be in flight (bytes), and whether `latency_target` set it. Two modes:
     /// - the path's own round trip under the target: latency first, nothing in flight longer than the target (beyond the
     ///   path itself it would stand queued);
     /// - the path alone at or over it (Wi-Fi whose delay swings to 400 ms): throughput first, the target scaled by the
     ///   square root of the speed over `SLOW_LINK` (a 2.4 Mbit/s link 600 ms), never under the path's own round trip (a
     ///   cap under what the path takes only starved it).
+    ///
+    /// Which mode is chosen is read from [`path_floor_ms`](Self::path_floor_ms), and it has to be a floor because the
+    /// two modes are not symmetric: the second one *raises* the ceiling (at 2.8 MB/s the square root makes it 2.0 s,
+    /// 6.7x the target), and a higher ceiling deepens the queue that chose it. Decided on anything our own queue can
+    /// inflate, that is a one-way door — measured on a robot: one round trip crossed 300 ms, the window went from
+    /// 986 KB to 1.66 MB in a single round, the queue stayed full so the round trip never came back, and **delivery
+    /// fell 31% for the rest of the run**. A floor under the target cannot be reached by queueing, so the door stays
+    /// open. (And capping at the target starves nothing while the floor is under it: the cap is then at least
+    /// `bandwidth x floor`, a full bandwidth-delay product, which is what the starvation note above is about.)
     ///
     /// A round the target limits delivers less than the link could, so it must not lower the bandwidth (the gate counts
     /// it as app-limited), else the bandwidth, the target's bytes and what got through fell together.
@@ -511,7 +541,7 @@ impl LinkModel {
                 // and the ack aggregation
                 let held = self.bandwidth_bytes_per_sec * rtt / 1000.0;
                 let wanted = held + (self.gain.max(1.0) - 1.0) * held + self.extra_acked;
-                let path_rtt = self.path_rtt_ms.or(self.min_rtt_ms).unwrap_or(rtt) / 1000.0;
+                let path_rtt = self.path_floor_ms().unwrap_or(rtt) / 1000.0;
                 let most = latency_target.map_or(f64::INFINITY, |target| {
                     let target = target.as_secs_f64();
                     let limit = if path_rtt < target { target } else { (target * (self.bandwidth_bytes_per_sec / SLOW_LINK).sqrt()).max(path_rtt) };
@@ -524,6 +554,11 @@ impl LinkModel {
         }
     }
 }
+
+/// A bottleneck link with a queue, to drive the model above the way a network drives it. Every bandwidth bug here has
+/// needed a standing queue to show itself, and a link modelled as a bare rate cannot make one.
+#[cfg(test)]
+mod sim;
 
 #[cfg(test)]
 mod tests {
@@ -717,10 +752,168 @@ mod tests {
         let target = Some(Duration::from_millis(300));
         let (window, capped) = model.window(target);
         assert!(capped && (window as f64) <= (model.bandwidth_bytes_per_sec * 0.3).max(MIN_WINDOW as f64) + 1.0, "a queue doesn't hold itself up: {window}");
-        model.path_rtt_ms = Some(400.0);
+        // the path's own *floor* over the target is what "the path alone is slow" means; a single round trip over it
+        // can be our own queue, and `path_floor_ms` says why that may not decide this
+        model.min_rtt_ms = Some(400.0);
         let (window, _) = model.window(target);
         let at_least = model.bandwidth_bytes_per_sec * 0.4;
         assert!(window as f64 >= at_least - 1.0, "a path slower than the target alone: never capped under it ({window} < {at_least})");
+    }
+
+    /// The window must not be unlatched by a round trip our own queue inflated — the robot's shape, with its numbers.
+    #[test]
+    fn a_queue_of_ours_over_the_target_leaves_the_window_capped() {
+        let mut model = LinkModel::default();
+        run(&mut model, Instant::now(), 0..40, 2_800_000.0, true);
+        let target = Some(Duration::from_millis(300));
+        // a fast link whose floor is milliseconds, carrying enough that the queued round trip passed 300 ms
+        (model.min_rtt_ms, model.typical_rtt_ms, model.path_rtt_ms) = (Some(6.0), Some(362.0), Some(561.0));
+        model.extra_acked = 513_000.0;
+        let (window, capped) = model.window(target);
+        // deciding on the queued round trip put the limit at 300 ms x sqrt(bandwidth / SLOW_LINK) = 2.0 s here, 6.7x
+        // the target, so the ceiling stopped binding, the window went 986 KB -> 1.66 MB in one round, the bigger window
+        // kept the queue full, the round trip never came back and delivery fell 31% for the rest of the run
+        let most = model.bandwidth_bytes_per_sec * model.gain.max(1.0) * 0.3;
+        assert!(capped, "the target still sets the window when only our own queue is past it: {window} bytes, gain {}", model.gain);
+        assert!((window as f64) <= most + 1.0, "{window} bytes is over bandwidth x gain x the target ({most})");
+        // and nothing about a queue can raise a ten-second minimum, so the way back is always open
+        assert!(model.path_floor_ms().is_some_and(|floor| floor < 300.0), "the floor stays under the target: {:?}", model.path_floor_ms());
+    }
+
+    /// The latch, end to end, through a queue rather than through hand-set fields.
+    ///
+    /// A varying link asked for more than its slow phase carries, plus a small stream that keeps sampling the path the
+    /// way `tf` and odometry do. The queue fills while the link is slow, the round trip a sender sees crosses the
+    /// 300 ms target, and the question is whether the window stays bounded through that.
+    ///
+    /// | over 480 rounds | rounds that left latency-first | peak window |
+    /// |---|---|---|
+    /// | the least round trip (now) | **0** | 2.17 MB |
+    /// | `path_rtt_ms` (before) | **447** | **9.82 MB** |
+    ///
+    /// Note the statistics. The crossing is a **transient** and the damage is **permanent**, so what matters is the
+    /// peak window (did the ceiling ever let go?) and the count of rounds that left the mode — a median of the round
+    /// trip sits at the path's 12 ms, because most rounds are fine.
+    #[test]
+    fn a_full_queue_does_not_raise_the_window_through_the_target() {
+        let target = Some(Duration::from_millis(300));
+        // the robot's shape: a 12 ms path on a varying link (a tunnel over Wi-Fi, 3.5 MB/s at its best and 1.2 at its
+        // worst), a page asking for 2.5 MB/s of point cloud, map and camera, and 7 KB/s of small frequent topics
+        let mut link = sim::Link::new(3_500_000.0, 12.0)
+            .with_trickle(7_000.0)
+            .with_capacity(|elapsed| if elapsed.as_secs_f64() % 10.0 < 3.0 { 3_500_000.0 } else { 1_200_000.0 });
+        let mut model = LinkModel::default();
+        let rounds = link.run(&mut model, Instant::now(), 480, 0.25, 2_500_000.0, target);
+
+        let peak_rtt = sim::peak(&rounds, |round| round.rtt_ms);
+        assert!(peak_rtt > 300.0, "the link has to queue past the target for this test to mean anything: {peak_rtt:.0} ms");
+        let floor = model.path_floor_ms().expect("a floor was measured");
+        assert!(floor < 300.0, "and the path's own floor stays under it: {floor:.0} ms");
+        // The queue-blind sample is NOT asserted to be over the target here, and the reason is worth keeping: with the
+        // window held down the queue never gets deep enough to fool it, so `path_rtt_ms` settles around 74 ms. It
+        // reaches 620 ms only in the run where it is *also* the signal being trusted — the corruption and the damage
+        // have the same cause, which is why reading the least round trip removes both.
+        let sampled = model.path_rtt_ms.expect("the trickle sampled the path");
+
+        let left = rounds.iter().filter(|round| !round.latency_first).count();
+        assert_eq!(left, 0, "{left} of {} rounds left latency-first", rounds.len());
+        let peak_window = sim::peak(&rounds, |round| round.window_bytes as f64);
+        let most = sim::peak(&rounds, |round| round.estimate_bytes_per_sec * round.gain.max(1.0) * 0.3);
+        assert!(
+            peak_window <= most + 1.0,
+            "window peaked at {peak_window:.0} bytes, over bandwidth x gain x the target ({most:.0}); reading \
+             `path_rtt_ms` ({sampled:.0} ms here) instead of the least took this to 9.82 MB"
+        );
+    }
+
+    /// And the queue is what the older helpers could not make: a link with no buffer keeps the round trip at the path
+    /// itself forever, so nothing that reacts to a growing round trip is ever asked anything. This is the hole `sim`
+    /// exists to close, asserted so that a future "simplification" back to a rate-only link fails here instead of on a
+    /// robot.
+    #[test]
+    fn a_link_with_no_queue_cannot_show_a_queueing_bug() {
+        let target = Some(Duration::from_millis(300));
+        let mut link = sim::Link::new(1_700_000.0, 12.0).with_queue_limit(0.0);
+        let mut model = LinkModel::default();
+        let rounds = link.run(&mut model, Instant::now(), 240, 0.25, 2_500_000.0, target);
+        let queued = sim::settled(&rounds, |round| round.rtt_ms);
+        assert!((queued - 12.0).abs() < 1e-6, "with no buffer the round trip is the path itself: {queued} ms");
+    }
+
+    /// Every link shape that has caused trouble here, scored on outcomes rather than on internals.
+    ///
+    /// This is the regression suite the crate was missing. The assertions are deliberately about what a reviewer would
+    /// argue over — how much of the link arrived, how deep the standing queue got, whether the window ever let go — so
+    /// the mechanism underneath can be rewritten without rewriting the test.
+    ///
+    /// Against `path_rtt_ms` these same profiles fail four assertions, with 447 of 480 rounds latched and a window of
+    /// 9.82 MB against the 3.03 MB its own bandwidth and gain allowed.
+    #[test]
+    fn every_link_shape_keeps_its_queue_and_its_window() {
+        let target = Some(Duration::from_millis(300));
+        let mut failures = vec![];
+        for profile in sim::profiles() {
+            let (outcome, model) = profile.score(480, 0.25, target);
+            let floor = model.path_floor_ms().unwrap_or(f64::INFINITY);
+            // from the profile, NOT from `floor`: see `Outcome::path_was_slow` for why taking the oracle from the model
+            // let an earlier version of this test pass against the bug it exists to catch
+            let slow_path = outcome.path_was_slow;
+            let report = format!(
+                "{:42} delivered {:.0}% peakQueue {:5.0}ms peakWindow {:8.0} of {:8.0} allowed, latched {}/{}, the \
+                 path's floor was {:.0}ms and the model read it as {:.0}ms",
+                profile.name,
+                outcome.delivered_fraction * 100.0,
+                outcome.peak_queue_ms,
+                outcome.peak_window_bytes,
+                outcome.peak_allowed_window_bytes,
+                outcome.rounds_latched,
+                outcome.rounds,
+                outcome.true_path_floor_ms,
+                floor
+            );
+            eprintln!("PROFILE {report}");
+
+            // the latch: never, on any shape, while the path itself is fine
+            if !slow_path && outcome.rounds_latched > 0 {
+                failures.push(format!("left latency-first on a path that was not slow -- {report}"));
+            }
+            // a genuinely slow path is allowed its wider window; everything else is held to the target
+            if !slow_path && outcome.peak_window_bytes > outcome.peak_allowed_window_bytes + 1.0 {
+                failures.push(format!("window over bandwidth x gain x the target -- {report}"));
+            }
+            // And the link has to actually be used: a cap that holds latency must not cost throughput. The floor is
+            // deliberately loose, because this is the first time anything here has asked the question and the figure it
+            // answers with is not yet understood. It guards against a collapse; it does not bless the present number.
+            if outcome.delivered_fraction < 0.6 {
+                failures.push(format!("under 60% of what was wanted and available arrived -- {report}"));
+            }
+        }
+        assert!(failures.is_empty(), "{} profile(s) failed:\n  {}", failures.len(), failures.join("\n  "));
+    }
+
+    #[test]
+    #[ignore = "a sweep, not an assertion: run it with --ignored when this model needs tuning again"]
+    fn sweep_schedules() {
+        let target = Some(Duration::from_millis(300));
+        for (fast_s, slow_s) in [(4.0, 4.0), (3.0, 7.0), (2.0, 8.0), (2.0, 18.0), (20.0, 60.0), (1.0, 9.0)] {
+            let period = fast_s + slow_s;
+            let mut link = sim::Link::new(3_500_000.0, 12.0).with_trickle(7_000.0).with_capacity(move |elapsed| {
+                if elapsed.as_secs_f64() % period < fast_s { 3_500_000.0 } else { 1_200_000.0 }
+            });
+            let mut model = LinkModel::default();
+            let rounds = link.run(&mut model, Instant::now(), 480, 0.25, 2_500_000.0, target);
+            eprintln!(
+                "SWEEP fast={fast_s:4.0} slow={slow_s:4.0} peakRtt={:6.0} pathRtt={:?} minRtt={:?} est={:8.0} peakWin={:8.0} relaxedCeiling={:6.0}ms leftLatencyFirst={}/{}",
+                sim::peak(&rounds, |r| r.rtt_ms),
+                model.path_rtt_ms.map(|v| v.round()),
+                model.min_rtt_ms.map(|v| v.round()),
+                model.bandwidth_bytes_per_sec,
+                sim::peak(&rounds, |r| r.window_bytes as f64),
+                sim::throughput_first_limit_ms(model.bandwidth_bytes_per_sec, Duration::from_millis(300)),
+                rounds.iter().filter(|r| !r.latency_first).count(),
+                rounds.len()
+            );
+        }
     }
 
     #[test]

@@ -474,7 +474,9 @@ impl PeerState {
             probing_rtt: link.probing_rtt(),
             latency_target_ms: latency_target.as_secs_f64() * 1000.0,
             path_rtt_ms: link.path_rtt_ms,
-            latency_first: latency_capped || link.path_rtt_ms.or(link.min_rtt_ms).is_some_and(|rtt| rtt < latency_target.as_secs_f64() * 1000.0),
+            // the same floor `LinkModel::window` decides on, so this reports the mode that actually ran rather than a
+            // second opinion computed from a different signal
+            latency_first: latency_capped || link.path_floor_ms().is_some_and(|rtt| rtt < latency_target.as_secs_f64() * 1000.0),
             in_flight_bytes: self.gate.in_flight(),
             window_bytes: window,
             reserved_bytes_per_sec: reserved,
