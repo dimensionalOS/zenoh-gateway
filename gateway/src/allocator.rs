@@ -723,6 +723,190 @@ mod tests {
         }
     }
 
+    /// A tiny deterministic PRNG, so the sweep below is reproducible without a dev-dependency.
+    fn lcg(state: &mut u64) -> f64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*state >> 33) as f64) / ((1u64 << 31) as f64)
+    }
+
+    /// Invariants `allocate` must satisfy for **any** set of demands, not just the shapes someone thought to write a
+    /// test for. Every bandwidth bug this crate has had was a case nobody imagined, so the useful question is which
+    /// properties hold over a sweep rather than which examples pass.
+    ///
+    /// 1. **Nothing is granted more than it asked for.**
+    /// 2. **Never spends past the budget** on shrinkable streams. Reserved demands are excluded: they are measured
+    ///    rates of streams that send regardless, so the allocator reports them rather than granting them.
+    /// 3. **Monotone in the budget** -- more budget never gives any single stream *less*. A divider that is not
+    ///    monotone oscillates, and oscillation in a loop whose input is its own output is how the window latch began.
+    /// 4. **Deterministic**, so a stream's rate cannot depend on iteration order.
+    #[test]
+    fn allocation_holds_its_invariants_over_a_sweep() {
+        let mut seed = 0x5eed_1234_u64;
+        for case in 0..400 {
+            let count = 1 + (lcg(&mut seed) * 6.0) as usize;
+            let mut demands = Vec::new();
+            for _ in 0..count {
+                let price = 500.0 + lcg(&mut seed) * 120_000.0;
+                let hz = 1.0 + lcg(&mut seed) * 30.0;
+                let priority = if lcg(&mut seed) < 0.2 { 0.0 } else { lcg(&mut seed) * 4.0 };
+                let mut demand = raw(priority, hz, price);
+                if lcg(&mut seed) < 0.2 {
+                    demand.fixed_bytes_per_sec = Some(lcg(&mut seed) * 400_000.0);
+                }
+                demand.shrinks_last = lcg(&mut seed) < 0.2;
+                demands.push(demand);
+            }
+            let wants: Vec<f64> = demands.iter().map(Demand::wants).collect();
+            let spend = |got: &[Allocation]| -> f64 {
+                got.iter().zip(&demands).map(|(a, d)| if d.fixed_bytes_per_sec.is_some() { 0.0 } else { (d.price)(1.0) * a.hz }).sum()
+            };
+
+            let mut previous: Option<Vec<Allocation>> = None;
+            for budget in [1_000.0, 50_000.0, 250_000.0, 1_000_000.0, 8_000_000.0] {
+                let got = allocate(budget, &demands);
+                assert_eq!(got.len(), demands.len(), "case {case}");
+                for (index, (allocation, want)) in got.iter().zip(&wants).enumerate() {
+                    if demands[index].fixed_bytes_per_sec.is_none() {
+                        let granted = (demands[index].price)(1.0) * allocation.hz;
+                        assert!(granted <= want + 1.0, "case {case} budget {budget}: {index} got {granted:.0} over its want {want:.0}");
+                    }
+                }
+                assert!(spend(&got) <= budget + 1.0, "case {case} budget {budget}: spent {:.0}", spend(&got));
+                let again = allocate(budget, &demands);
+                for (a, b) in got.iter().zip(&again) {
+                    assert_eq!(a.hz.to_bits(), b.hz.to_bits(), "case {case} budget {budget}: not deterministic");
+                }
+                if let Some(before) = &previous {
+                    for (index, (less, more)) in before.iter().zip(&got).enumerate() {
+                        assert!(
+                            more.hz >= less.hz - 1e-9,
+                            "case {case}: stream {index} got {:.4} Hz at budget {budget} but {:.4} Hz at a smaller one",
+                            more.hz,
+                            less.hz
+                        );
+                    }
+                }
+                previous = Some(got);
+            }
+        }
+    }
+
+    /// Invariants `window` must satisfy for any state the link model can be in. This is the function the latch lived
+    /// in, so it is the one worth sweeping rather than exampling.
+    ///
+    /// 1. **Never below `MIN_WINDOW`**, or the sender stalls outright.
+    /// 2. **With nothing measured, never below `INITIAL_WINDOW`** -- the no-measurement arm must stay a floor and not
+    ///    become a ceiling (the bug fixed in `a_link_with_no_round_trip_sample_still_gets_the_gains_headroom`).
+    /// 3. **While the path's own floor is under the target, never above `bandwidth x max(gain, 1) x target`.** This is
+    ///    the latch invariant: the wider mode is only for a path that is genuinely slow, and the *floor* is what says
+    ///    so, because a queue of ours can inflate everything else. Asserted here directly, as well as through `sim`.
+    /// 4. **Monotone in the bandwidth** at a fixed round trip -- a faster link never gets a smaller window.
+    #[test]
+    fn window_holds_its_invariants_over_a_sweep() {
+        let target = Duration::from_millis(300);
+        let target_secs = target.as_secs_f64();
+        let mut seed = 0xb0ff_1111_u64;
+        for case in 0..600 {
+            let mut model = LinkModel::default();
+            model.bandwidth_bytes_per_sec = 1_000.0 + lcg(&mut seed) * 4_000_000.0;
+            model.gain = [0.75, 1.0, 1.25, STARTUP_GAIN][(lcg(&mut seed) * 4.0) as usize % 4];
+            model.extra_acked = lcg(&mut seed) * 1_500_000.0;
+            // every combination of "measured / not", including the floor above and below the target
+            let least = (lcg(&mut seed) < 0.85).then(|| lcg(&mut seed) * 900.0);
+            let typical = (lcg(&mut seed) < 0.85).then(|| lcg(&mut seed) * 5_000.0);
+            let quiet = (lcg(&mut seed) < 0.6).then(|| lcg(&mut seed) * 6_000.0);
+            (model.min_rtt_ms, model.typical_rtt_ms, model.path_rtt_ms) = (least, typical, quiet);
+
+            let (window, _) = model.window(Some(target));
+            assert!(window >= MIN_WINDOW, "case {case}: {window} is under MIN_WINDOW");
+            if model.typical_rtt_ms.or(model.min_rtt_ms).is_none() {
+                assert!(window >= INITIAL_WINDOW, "case {case}: nothing measured, {window} is under INITIAL_WINDOW");
+            }
+            if let Some(floor) = model.path_floor_ms() {
+                if floor < target_secs * 1000.0 {
+                    let ceiling = model.bandwidth_bytes_per_sec * model.gain.max(1.0) * target_secs;
+                    assert!(
+                        window as f64 <= ceiling.max(MIN_WINDOW as f64) + 1.0,
+                        "case {case}: floor {floor:.0} ms is under the target but the window is {window} over a ceiling of {ceiling:.0} \
+                         (bandwidth {:.0}, gain {:.2}, typical {:?}, quiet {:?}, extraAcked {:.0})",
+                        model.bandwidth_bytes_per_sec,
+                        model.gain,
+                        model.typical_rtt_ms.map(|v| v.round()),
+                        model.path_rtt_ms.map(|v| v.round()),
+                        model.extra_acked
+                    );
+                }
+            }
+            // (4) a faster link never gets a smaller window
+            let mut faster = LinkModel { bandwidth_bytes_per_sec: model.bandwidth_bytes_per_sec * 2.0, ..model.clone() };
+            faster.extra_acked = model.extra_acked;
+            let (bigger, _) = faster.window(Some(target));
+            assert!(bigger >= window, "case {case}: doubling the bandwidth shrank the window, {window} -> {bigger}");
+        }
+    }
+
+    /// A slow path is not a trap on its own: startup ends and the estimate reaches what the link carries.
+    ///
+    /// Worth pinning, because the cold-start failure on a robot *looked* like "a slow path stops startup" and it is
+    /// not -- driven through `sim` at the browser's measured floor of 810 ms, startup ends within tens of rounds and
+    /// the bandwidth converges on the link every time. What trapped it was having no round trip sampled at all
+    /// (`a_link_with_no_round_trip_sample_still_gets_the_gains_headroom`), a different thing. This fails if a future
+    /// change makes a slow path stop startup, and stops that wrong diagnosis being re-derived.
+    #[test]
+    fn a_slow_path_does_not_stop_startup() {
+        let target = Some(Duration::from_millis(300));
+        for (path_ms, capacity) in [(810.0, 150_000.0), (810.0, 2_000_000.0), (12.0, 150_000.0)] {
+            let mut link = sim::Link::new(capacity, path_ms).with_trickle(7_000.0);
+            let mut model = LinkModel::default();
+            let rounds = link.run(&mut model, Instant::now(), 300, 0.25, 2_000_000.0, target);
+            let still_starting = rounds.iter().filter(|round| round.starting_up).count();
+            assert!(
+                still_starting < rounds.len() / 2,
+                "{path_ms:.0} ms / {capacity:.0} B/s: starting up for {still_starting} of {} rounds",
+                rounds.len()
+            );
+            let settled = sim::settled(&rounds, |round| round.delivered_bytes_per_sec);
+            assert!(settled >= capacity * 0.9, "{path_ms:.0} ms / {capacity:.0} B/s: settled at {settled:.0}");
+        }
+    }
+
+    /// What a reservation means when the budget cannot cover it, and who is allowed to ask for one.
+    ///
+    /// A reserved demand (`fixed_bytes_per_sec`: a strict stream, audio, a forwarded video channel) is taken off the
+    /// top at its measured rate and never shrunk, because what it sends does not depend on what it is granted. The
+    /// consequence, pinned here rather than fixed: when a reservation alone exceeds the budget, **every shrinkable
+    /// stream is granted exactly zero**. On a robot that was a camera at 0.00 while a point cloud was served.
+    ///
+    /// That is tolerable only because a reservation is now the *subscriber's* explicit choice
+    /// (`SubShared::is_strict`): a page asking for one has accepted what it costs its own other streams. It was not
+    /// tolerable while a **publisher** could impose it on every page watching, which
+    /// `subscription::tests::only_the_subscriber_can_ask_for_the_strict_tier` now prevents.
+    #[test]
+    fn a_reservation_bigger_than_the_budget_zeroes_the_rest() {
+        let camera = |reserved: bool| {
+            let base = raw(1.0, 30.0, 25_000.0);
+            if reserved { Demand { fixed_bytes_per_sec: Some(760_000.0), ..base } } else { base }
+        };
+        let cloud = || raw(1.0, 10.0, 90_000.0);
+
+        // the reservation alone is 12x the budget: the shrinkable stream gets nothing
+        let got = allocate(64_000.0, &[camera(true), cloud()]);
+        assert_eq!(got[0].hz, 30.0, "a reservation is never shrunk");
+        assert_eq!(got[1].hz, 0.0, "and what is left over is nothing");
+
+        // without it, the same budget is shared and neither is silenced
+        let shared = allocate(64_000.0, &[camera(false), cloud()]);
+        assert!(shared[0].hz > 0.0 && shared[1].hz > 0.0, "both get a share: {:?}", (shared[0].hz, shared[1].hz));
+        let spend: f64 = shared.iter().zip([25_000.0, 90_000.0]).map(|(a, price)| a.hz * price).sum();
+        assert!((spend - 64_000.0).abs() < 1.0, "and the shares add up to the budget, not past it: {spend:.0}");
+
+        // a budget that covers everything grants everything, reserved or not
+        for reserved in [false, true] {
+            let plenty = allocate(3_000_000.0, &[camera(reserved), cloud()]);
+            assert_eq!((plenty[0].hz, plenty[1].hz), (30.0, 10.0), "reserved={reserved}");
+        }
+    }
+
     #[test]
     fn the_first_guess_is_configurable() {
         let model = LinkModel::new(250_000.0);
