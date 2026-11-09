@@ -179,9 +179,15 @@ impl GetOptions {
 pub(super) fn parse_reply(reply: &Value) -> Result<GetReply> {
     let encoding = reply["encoding"].as_str().map(str::to_owned);
     Ok(match reply.get("error") {
-        Some(error) => {
-            GetReply { key: None, bytes: decoded(error)?.unwrap_or_default(), error: true, encoding, attachment: None, delete: false, timestamp_ms: None }
-        }
+        Some(error) => GetReply {
+            key: None,
+            bytes: decoded(error)?.unwrap_or_default(),
+            error: true,
+            encoding,
+            attachment: None,
+            delete: false,
+            timestamp_ms: None,
+        },
         None => GetReply {
             key: reply["key"].as_str().map(str::to_owned),
             bytes: decoded(&reply["bytes"])?.unwrap_or_default(),
@@ -304,20 +310,33 @@ impl Client {
 
     /// The keys of the liveliness tokens alive under `key`.
     pub async fn liveliness_get(&self, key: &str, timeout: Duration) -> Result<Vec<String>> {
-        let reply =
-            self.api_request(json!({"op": "livelinessGet", "key": key, "timeoutMs": timeout.as_millis() as u64}), timeout + Duration::from_secs(2)).await?;
-        Ok(reply["tokens"].as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(|key| key.as_str().map(str::to_owned)).collect())
+        let reply = self
+            .api_request(
+                json!({"op": "livelinessGet", "key": key, "timeoutMs": timeout.as_millis() as u64}),
+                timeout + Duration::from_secs(2),
+            )
+            .await?;
+        Ok(reply["tokens"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|key| key.as_str().map(str::to_owned))
+            .collect())
     }
 
     /// Whether a publisher (subscribers) or a querier (queryables) on `key` would reach anyone now.
     pub async fn matching_status(&self, key: &str, target: MatchingTarget) -> Result<bool> {
-        let reply = self.api_request(json!({"op": "matchingStatus", "key": key, "matching": target.as_str()}), PING_TIMEOUT + Duration::from_secs(5)).await?;
+        let reply = self
+            .api_request(json!({"op": "matchingStatus", "key": key, "matching": target.as_str()}), PING_TIMEOUT + Duration::from_secs(5))
+            .await?;
         reply["matching"].as_bool().ok_or_else(|| anyhow!("no matching"))
     }
 
     /// Notified each time [`Client::matching_status`] for `key` changes.
     pub async fn matching_listener(&self, key: &str, target: MatchingTarget) -> Result<MatchingListener> {
-        let reply = self.api_request(json!({"op": "declareMatchingListener", "key": key, "matching": target.as_str()}), PING_TIMEOUT).await?;
+        let reply =
+            self.api_request(json!({"op": "declareMatchingListener", "key": key, "matching": target.as_str()}), PING_TIMEOUT).await?;
         let id = reply["listenerId"].as_u64().ok_or_else(|| anyhow!("no listenerId"))?;
         let (route, receiver) = self.route("matching", id);
         Ok(MatchingListener { client: Client { inner: self.inner.clone() }, id, receiver, _route: route })
@@ -326,9 +345,14 @@ impl Client {
     /// The gateway's zenoh session: its id, and the routers and peers it is connected to.
     pub async fn info(&self) -> Result<SessionInfo> {
         let reply = self.api_request(json!({"op": "info"}), PING_TIMEOUT).await?;
-        let strings =
-            |value: &Value| value.as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(|item| item.as_str().map(str::to_owned)).collect();
-        Ok(SessionInfo { zid: reply["zid"].as_str().unwrap_or_default().to_owned(), routers: strings(&reply["routers"]), peers: strings(&reply["peers"]) })
+        let strings = |value: &Value| {
+            value.as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(|item| item.as_str().map(str::to_owned)).collect()
+        };
+        Ok(SessionInfo {
+            zid: reply["zid"].as_str().unwrap_or_default().to_owned(),
+            routers: strings(&reply["routers"]),
+            peers: strings(&reply["peers"]),
+        })
     }
 }
 

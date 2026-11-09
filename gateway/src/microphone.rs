@@ -3,14 +3,16 @@
 //! lease, deadman and latency rules as a data-channel publisher.
 
 use crate::encoding::{AudioPcm, MessageEncoding};
+use crate::media::SenderReports;
 use crate::options::{Label, PubOpts};
 use crate::publisher::{self, Admission, PubShared};
 use anyhow::{Result, ensure};
 use log::debug;
-use std::sync::Arc;
-use crate::media::SenderReports;
 use parking_lot::Mutex;
-use unsafe_libopus::{OpusDecoder, opus_decode, opus_decoder_create, opus_decoder_destroy, opus_packet_get_nb_channels, opus_packet_get_nb_samples};
+use std::sync::Arc;
+use unsafe_libopus::{
+    OpusDecoder, opus_decode, opus_decoder_create, opus_decoder_destroy, opus_packet_get_nb_channels, opus_packet_get_nb_samples,
+};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 
@@ -87,7 +89,15 @@ pub struct Microphone {
 
 /// Publishes the browser's microphone track: each Opus packet decoded, encoded by its encoding and put on the key, until
 /// the channel or the track closes.
-pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session: zenoh::Session, shared: Arc<PubShared>, microphone: Microphone, blocker: impl Fn() -> Option<String>) {
+pub async fn run(
+    dc: Arc<dyn DataChannel>,
+    label: Label,
+    opts: PubOpts,
+    session: zenoh::Session,
+    shared: Arc<PubShared>,
+    microphone: Microphone,
+    blocker: impl Fn() -> Option<String>,
+) {
     let Microphone { track, encoding, sender_reports, clock_offset_ms } = microphone;
     let Some(zenoh_publisher) = publisher::declare(&dc, &label, &opts, &session).await else { return };
     let sample_rate = opts.sample_rate.unwrap_or(OPUS_RTP_CLOCK_HZ as u32);
@@ -109,7 +119,8 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
             continue;
         }
         // the page's capture time for the packet, as a data publisher stamps its puts: aged the same way
-        let captured_ms = sender_reports.get(packet.header.ssrc).map(|report| capture_ms(packet.header.timestamp, report, OPUS_RTP_CLOCK_HZ));
+        let captured_ms =
+            sender_reports.get(packet.header.ssrc).map(|report| capture_ms(packet.header.timestamp, report, OPUS_RTP_CLOCK_HZ));
         if !publisher::fresh(&shared, captured_ms, &clock_offset_ms, opts.latency_limit) {
             continue;
         }
@@ -179,7 +190,9 @@ mod tests {
         // SAFETY: valid rate and channel count; checked below
         let encoder = unsafe { opus_encoder_create(48000, channels as i32, OPUS_APPLICATION_VOIP, &mut error) };
         assert!(!encoder.is_null() && error == 0);
-        let tone: Vec<i16> = (0..960 * channels as usize).map(|index| ((index as f64 * 440.0 / 48000.0 * std::f64::consts::TAU).sin() * 8000.0) as i16).collect();
+        let tone: Vec<i16> = (0..960 * channels as usize)
+            .map(|index| ((index as f64 * 440.0 / 48000.0 * std::f64::consts::TAU).sin() * 8000.0) as i16)
+            .collect();
         let mut packet = vec![0u8; 1500];
         // SAFETY: 960 frames of `channels` samples in, a writable buffer out
         let length = unsafe { opus_encode(encoder, tone.as_ptr(), 960, packet.as_mut_ptr(), packet.len() as i32) };

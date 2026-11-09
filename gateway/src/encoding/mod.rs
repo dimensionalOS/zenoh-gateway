@@ -20,7 +20,6 @@ pub(crate) mod av1;
 pub(crate) mod registry;
 pub(crate) mod video;
 
-pub use video::{EncodedVideo, H264Encoder, VideoEncoder, VideoFormat, VideoPolicy, VideoTarget};
 /// Exported for the same reason [`H264Encoder`] is: an encoding that forwards frames a publisher already encoded
 /// ([`MessageEncoding::video_encoder`]) still has to encode the ones it cannot forward, and it can only do that with
 /// an encoder it can name. Without this an AV1 track is unreachable from such an encoding — returning `None` would
@@ -28,6 +27,7 @@ pub use video::{EncodedVideo, H264Encoder, VideoEncoder, VideoFormat, VideoPolic
 /// needed no transcode at all.
 #[cfg(feature = "av1")]
 pub use av1::Av1Encoder;
+pub use video::{EncodedVideo, H264Encoder, VideoEncoder, VideoFormat, VideoPolicy, VideoTarget};
 
 use anyhow::{Result, anyhow, ensure};
 use std::any::Any;
@@ -222,7 +222,12 @@ impl MessageHeader {
     /// From a stamp in seconds, which is all some sources have.
     pub fn from_stamp(stamp: f64, frame_id: impl Into<String>) -> Self {
         let sec = stamp.floor();
-        MessageHeader { sec: sec as i32, nanosec: (((stamp - sec) * 1e9).round() as u32).min(999_999_999), frame_id: frame_id.into(), seq: None }
+        MessageHeader {
+            sec: sec as i32,
+            nanosec: (((stamp - sec) * 1e9).round() as u32).min(999_999_999),
+            frame_id: frame_id.into(),
+            seq: None,
+        }
     }
 }
 
@@ -247,7 +252,14 @@ struct Jpeg {
 
 impl Jpeg {
     fn decoded(&self) -> Result<&VideoImage> {
-        self.decoded.get_or_init(|| (self.decode)(&self.bytes).map(|image| VideoImage { jpeg: None, header: None, ..image }).map_err(|error| format!("{error:#}"))).as_ref().map_err(|error| anyhow!("jpeg: {error}"))
+        self.decoded
+            .get_or_init(|| {
+                (self.decode)(&self.bytes)
+                    .map(|image| VideoImage { jpeg: None, header: None, ..image })
+                    .map_err(|error| format!("{error:#}"))
+            })
+            .as_ref()
+            .map_err(|error| anyhow!("jpeg: {error}"))
     }
 }
 
@@ -272,15 +284,28 @@ impl VideoImage {
     /// Packed RGB8; fails unless `data` is exactly `width × height × 3` bytes and the picture isn't empty.
     pub fn rgb8(width: u32, height: u32, data: Vec<u8>) -> Result<Self> {
         ensure!(width > 0 && height > 0, "empty image ({width}x{height})");
-        ensure!(data.len() == width as usize * height as usize * 3, "rgb8 {width}x{height} needs {} bytes, got {}", width as usize * height as usize * 3, data.len());
+        ensure!(
+            data.len() == width as usize * height as usize * 3,
+            "rgb8 {width}x{height} needs {} bytes, got {}",
+            width as usize * height as usize * 3,
+            data.len()
+        );
         Ok(VideoImage { width, height, format: PixelFormat::Rgb8, data, header: None, jpeg: None })
     }
 
     /// Planar I420; fails unless both sizes are even and non-zero and `data` is exactly
     /// `width × height × 3 / 2` bytes.
     pub fn i420(width: u32, height: u32, data: Vec<u8>) -> Result<Self> {
-        ensure!(width > 0 && height > 0 && width.is_multiple_of(2) && height.is_multiple_of(2), "i420 needs even, non-zero sizes, got {width}x{height}");
-        ensure!(data.len() == width as usize * height as usize * 3 / 2, "i420 {width}x{height} needs {} bytes, got {}", width as usize * height as usize * 3 / 2, data.len());
+        ensure!(
+            width > 0 && height > 0 && width.is_multiple_of(2) && height.is_multiple_of(2),
+            "i420 needs even, non-zero sizes, got {width}x{height}"
+        );
+        ensure!(
+            data.len() == width as usize * height as usize * 3 / 2,
+            "i420 {width}x{height} needs {} bytes, got {}",
+            width as usize * height as usize * 3 / 2,
+            data.len()
+        );
         Ok(VideoImage { width, height, format: PixelFormat::I420, data, header: None, jpeg: None })
     }
 
@@ -291,7 +316,14 @@ impl VideoImage {
     /// Jetson's JPEG decoder, converter and encoder in one pipeline took 4.
     pub fn jpeg(width: u32, height: u32, bytes: Vec<u8>, decode: fn(&[u8]) -> Result<VideoImage>) -> Result<Self> {
         ensure!(width > 0 && height > 0, "empty image ({width}x{height})");
-        Ok(VideoImage { width, height, format: PixelFormat::I420, data: Vec::new(), header: None, jpeg: Some(Arc::new(Jpeg { bytes, decode, decoded: OnceLock::new() })) })
+        Ok(VideoImage {
+            width,
+            height,
+            format: PixelFormat::I420,
+            data: Vec::new(),
+            header: None,
+            jpeg: Some(Arc::new(Jpeg { bytes, decode, decoded: OnceLock::new() })),
+        })
     }
 
     /// The JPEG of a picture made by [`jpeg`](Self::jpeg).
@@ -389,7 +421,11 @@ impl AudioPcm {
     /// are 1 or 2 channels and the samples are a whole number of frames.
     pub fn new(sample_rate: u32, channels: u8, samples: Vec<i16>) -> Result<Self> {
         ensure!(Self::SAMPLE_RATES.contains(&sample_rate), "Opus takes 8, 12, 16, 24 or 48 kHz, not {sample_rate} Hz");
-        ensure!((1..=2).contains(&channels) && samples.len().is_multiple_of(channels as usize), "{} samples are not whole frames of {channels} (1 or 2) channels", samples.len());
+        ensure!(
+            (1..=2).contains(&channels) && samples.len().is_multiple_of(channels as usize),
+            "{} samples are not whole frames of {channels} (1 or 2) channels",
+            samples.len()
+        );
         Ok(AudioPcm { sample_rate, channels, samples })
     }
 
@@ -441,7 +477,9 @@ impl DecodedFrame {
     /// PCM, or another type).
     pub fn downcast<T: Any>(&self) -> Result<&T> {
         match self {
-            DecodedFrame::Data(value) => value.downcast_ref::<T>().ok_or_else(|| anyhow!("decoded frame is not a {}", std::any::type_name::<T>())),
+            DecodedFrame::Data(value) => {
+                value.downcast_ref::<T>().ok_or_else(|| anyhow!("decoded frame is not a {}", std::any::type_name::<T>()))
+            }
             other => Err(anyhow!("{other:?} is not a {}", std::any::type_name::<T>())),
         }
     }

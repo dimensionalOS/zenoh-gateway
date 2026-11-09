@@ -90,8 +90,9 @@ pub fn allocate(budget: f64, demands: &[Demand]) -> Vec<Allocation> {
         (false, false) => Phase::Rest,
     };
     for phase in [Phase::ZeroPriority, Phase::Rest, Phase::Reliable] {
-        let mut active: Vec<usize> =
-            (0..demands.len()).filter(|&i| demands[i].fixed_bytes_per_sec.is_none() && grants[i] > 0.0 && phase_of(&demands[i]) == phase).collect();
+        let mut active: Vec<usize> = (0..demands.len())
+            .filter(|&i| demands[i].fixed_bytes_per_sec.is_none() && grants[i] > 0.0 && phase_of(&demands[i]) == phase)
+            .collect();
         let weight = |i: usize| if demands[i].priority == 0.0 { wants[i] } else { wants[i] / demands[i].priority };
         while over > 1e-9 && !active.is_empty() {
             let total: f64 = active.iter().map(|&i| weight(i)).sum();
@@ -307,7 +308,15 @@ impl LinkModel {
     /// One round of `secs`: the gate's samples, what video got through (bytes/s over a sample's span, `media::Delivery`;
     /// added to each data sample, on its own when no data was acked: a page with only video otherwise never measured the link, and its video stayed at the
     /// first guess's 1.5 Mbit/s), whether video was held back by the link (queued there, `video_held_by_link`), and what was delivered in all (bytes/s, reported).
-    pub fn update(&mut self, now: std::time::Instant, secs: f64, round: crate::pacing::RoundSamples, video_bytes_per_sec: f64, video_link_limited: bool, delivered_bytes_per_sec: f64) {
+    pub fn update(
+        &mut self,
+        now: std::time::Instant,
+        secs: f64,
+        round: crate::pacing::RoundSamples,
+        video_bytes_per_sec: f64,
+        video_link_limited: bool,
+        delivered_bytes_per_sec: f64,
+    ) {
         if secs <= 0.0 {
             return;
         }
@@ -325,7 +334,11 @@ impl LinkModel {
             self.target_limited_samples.push_back((now, rate + video_bytes_per_sec));
         }
         // (data under its share while video queues at the link: the link was busy all the same, and what got through is its rate)
-        if let Some(rate) = round.app_limited_rate.map(|rate| rate + video_bytes_per_sec).filter(|rate| video_link_limited || *rate > self.bandwidth_bytes_per_sec) {
+        if let Some(rate) = round
+            .app_limited_rate
+            .map(|rate| rate + video_bytes_per_sec)
+            .filter(|rate| video_link_limited || *rate > self.bandwidth_bytes_per_sec)
+        {
             self.samples.push_back((now, rate));
         }
         let no_data_sample = round.link_limited_rate.is_none() && round.app_limited_rate.is_none() && round.latency_limited_rate.is_none();
@@ -357,7 +370,13 @@ impl LinkModel {
             }
         }
         self.extra_acked = self.extra_acked_samples.iter().map(|(_, extra)| *extra).fold(0.0, f64::max);
-        let measured = self.samples.iter().map(|(_, rate)| *rate).reduce(f64::max).or_else(|| self.target_limited_samples.iter().map(|(_, rate)| *rate).reduce(f64::max)).unwrap_or(0.0);
+        let measured = self
+            .samples
+            .iter()
+            .map(|(_, rate)| *rate)
+            .reduce(f64::max)
+            .or_else(|| self.target_limited_samples.iter().map(|(_, rate)| *rate).reduce(f64::max))
+            .unwrap_or(0.0);
         if self.starting_up {
             // the first guess stands until a round measures more (the first rounds, while the channels open, deliver next
             // to nothing); growth is judged on what was measured, once anything got through
@@ -467,7 +486,10 @@ impl LinkModel {
 
     /// What a reconnect within `ServerBuilder::link_memory` starts from (`seeded`): the bandwidth and the path's round trip.
     pub fn seed(&self) -> Option<LinkSeed> {
-        (!self.starting_up).then_some(LinkSeed { bandwidth_bytes_per_sec: self.bandwidth_bytes_per_sec, path_rtt_ms: self.path_rtt_ms.or(self.min_rtt_ms) })
+        (!self.starting_up).then_some(LinkSeed {
+            bandwidth_bytes_per_sec: self.bandwidth_bytes_per_sec,
+            path_rtt_ms: self.path_rtt_ms.or(self.min_rtt_ms),
+        })
     }
 
     /// Starts from a link measured moments ago in place of startup's first guess: the estimate is the seed's and the probe
@@ -544,7 +566,8 @@ impl LinkModel {
                 let path_rtt = self.path_floor_ms().unwrap_or(rtt) / 1000.0;
                 let most = latency_target.map_or(f64::INFINITY, |target| {
                     let target = target.as_secs_f64();
-                    let limit = if path_rtt < target { target } else { (target * (self.bandwidth_bytes_per_sec / SLOW_LINK).sqrt()).max(path_rtt) };
+                    let limit =
+                        if path_rtt < target { target } else { (target * (self.bandwidth_bytes_per_sec / SLOW_LINK).sqrt()).max(path_rtt) };
                     // (times the gain, so a probe can still show the link carries more)
                     self.bandwidth_bytes_per_sec * self.gain.max(1.0) * limit
                 });
@@ -565,12 +588,28 @@ mod tests {
     use super::*;
 
     fn raw(priority: f64, max_hz: f64, bytes: f64) -> Demand {
-        Demand { priority, max_hz, quality_range: None, tradeoff: 0.5, price: Box::new(move |_| bytes), fixed_bytes_per_sec: None, shrinks_last: false }
+        Demand {
+            priority,
+            max_hz,
+            quality_range: None,
+            tradeoff: 0.5,
+            price: Box::new(move |_| bytes),
+            fixed_bytes_per_sec: None,
+            shrinks_last: false,
+        }
     }
 
     fn transcoded(tradeoff: f64, max_hz: f64) -> Demand {
         // price grows with quality: 100 bytes at q=0 .. 1100 at q=1
-        Demand { priority: 1.0, max_hz, quality_range: Some((0.0, 1.0)), tradeoff, price: Box::new(|q| 100.0 + 1000.0 * q), fixed_bytes_per_sec: None, shrinks_last: false }
+        Demand {
+            priority: 1.0,
+            max_hz,
+            quality_range: Some((0.0, 1.0)),
+            tradeoff,
+            price: Box::new(|q| 100.0 + 1000.0 * q),
+            fixed_bytes_per_sec: None,
+            shrinks_last: false,
+        }
     }
 
     #[test]
@@ -661,7 +700,17 @@ mod tests {
     fn sample(rate: f64, link_limited: bool, rtt_ms: f64) -> crate::pacing::RoundSamples {
         let rate = Some(rate);
         let (link_limited_rate, app_limited_rate) = if link_limited { (rate, None) } else { (None, rate) };
-        crate::pacing::RoundSamples { link_limited_rate, app_limited_rate, latency_limited_rate: None, min_rtt_ms: Some(rtt_ms), typical_rtt_ms: Some(rtt_ms), path_rtt_ms: Some(rtt_ms), extra_acked: 0.0, drained: true, window_waited: link_limited }
+        crate::pacing::RoundSamples {
+            link_limited_rate,
+            app_limited_rate,
+            latency_limited_rate: None,
+            min_rtt_ms: Some(rtt_ms),
+            typical_rtt_ms: Some(rtt_ms),
+            path_rtt_ms: Some(rtt_ms),
+            extra_acked: 0.0,
+            drained: true,
+            window_waited: link_limited,
+        }
     }
 
     const ROUND_MS: u64 = 600;
@@ -751,7 +800,10 @@ mod tests {
         model.typical_rtt_ms = Some(2000.0);
         let target = Some(Duration::from_millis(300));
         let (window, capped) = model.window(target);
-        assert!(capped && (window as f64) <= (model.bandwidth_bytes_per_sec * 0.3).max(MIN_WINDOW as f64) + 1.0, "a queue doesn't hold itself up: {window}");
+        assert!(
+            capped && (window as f64) <= (model.bandwidth_bytes_per_sec * 0.3).max(MIN_WINDOW as f64) + 1.0,
+            "a queue doesn't hold itself up: {window}"
+        );
         // the path's own *floor* over the target is what "the path alone is slow" means; a single round trip over it
         // can be our own queue, and `path_floor_ms` says why that may not decide this
         model.min_rtt_ms = Some(400.0);
@@ -897,9 +949,9 @@ mod tests {
         let target = Some(Duration::from_millis(300));
         for (fast_s, slow_s) in [(4.0, 4.0), (3.0, 7.0), (2.0, 8.0), (2.0, 18.0), (20.0, 60.0), (1.0, 9.0)] {
             let period = fast_s + slow_s;
-            let mut link = sim::Link::new(3_500_000.0, 12.0).with_trickle(7_000.0).with_capacity(move |elapsed| {
-                if elapsed.as_secs_f64() % period < fast_s { 3_500_000.0 } else { 1_200_000.0 }
-            });
+            let mut link = sim::Link::new(3_500_000.0, 12.0)
+                .with_trickle(7_000.0)
+                .with_capacity(move |elapsed| if elapsed.as_secs_f64() % period < fast_s { 3_500_000.0 } else { 1_200_000.0 });
             let mut model = LinkModel::default();
             let rounds = link.run(&mut model, Instant::now(), 480, 0.25, 2_500_000.0, target);
             eprintln!(
@@ -1046,7 +1098,14 @@ mod tests {
     /// A page with only a camera wanting `camera` bytes/s on a `capacity` link with a drop-tail-free queue: video sends
     /// min(camera, budget, GCC's limit), the link drains the queue at `capacity`, and `video_held_by_link` judges each
     /// round from the queue left. Returns the bandwidth after each round.
-    fn video_page(model: &mut LinkModel, start: Instant, rounds: std::ops::Range<u64>, capacity: f64, camera: f64, gcc: impl Fn(u64) -> Option<f64>) -> Vec<f64> {
+    fn video_page(
+        model: &mut LinkModel,
+        start: Instant,
+        rounds: std::ops::Range<u64>,
+        capacity: f64,
+        camera: f64,
+        gcc: impl Fn(u64) -> Option<f64>,
+    ) -> Vec<f64> {
         let mut queued = 0.0;
         let mut estimates = vec![];
         for round in rounds {
@@ -1067,7 +1126,8 @@ mod tests {
         // video_slow: a camera on a 125 KB/s link; startup's overshoot queued, GCC cut to 25 KB/s and held it there for
         // 20 s while the link sat idle. Counted as the link's rate, its rounds took the estimate to 2 KB/s.
         let mut model = LinkModel::default();
-        let estimates = video_page(&mut model, Instant::now(), 0..240, 125_000.0, 1_000_000.0, |round| (16..96).contains(&round).then_some(25_000.0));
+        let estimates =
+            video_page(&mut model, Instant::now(), 0..240, 125_000.0, 1_000_000.0, |round| (16..96).contains(&round).then_some(25_000.0));
         let peak = estimates.iter().copied().fold(0.0, f64::max);
         let least = estimates[40..].iter().copied().fold(f64::INFINITY, f64::min);
         assert!(peak <= 1.25 * 125_000.0 && least >= 0.5 * peak, "peak {peak}, then {least}: {:?}", &estimates[40..]);
@@ -1110,12 +1170,23 @@ mod tests {
             durations.push((round - map * 80) as f64 * 0.25);
             // idle until the next map
             for idle in round..(map + 1) * 80 {
-                model.update(start + Duration::from_millis(250 * idle), 0.25, crate::pacing::RoundSamples { drained: true, ..Default::default() }, 0.0, false, 0.0);
+                model.update(
+                    start + Duration::from_millis(250 * idle),
+                    0.25,
+                    crate::pacing::RoundSamples { drained: true, ..Default::default() },
+                    0.0,
+                    false,
+                    0.0,
+                );
             }
         }
         // (out of startup it is paced at the learned rate, not startup's 2.89x: a burst shorter than a round can't show more)
         let at_learned = (400_000.0 / learned[3] / 0.25).ceil() * 0.25;
-        assert!(learned[3] >= learned[1] && durations[3] <= at_learned, "400 KB on 2.5 MB/s, seconds per map: {durations:?}, learned {learned:?} (starting_up {})", model.starting_up);
+        assert!(
+            learned[3] >= learned[1] && durations[3] <= at_learned,
+            "400 KB on 2.5 MB/s, seconds per map: {durations:?}, learned {learned:?} (starting_up {})",
+            model.starting_up
+        );
     }
 
     #[test]
@@ -1125,7 +1196,14 @@ mod tests {
         let now = run(&mut model, start, 0..40, 1_000_000.0, true);
         let mut probing = 0;
         for round in 1..=120u64 {
-            model.update(now + Duration::from_millis(250 * round), 0.25, crate::pacing::RoundSamples { drained: true, ..Default::default() }, 0.0, false, 0.0);
+            model.update(
+                now + Duration::from_millis(250 * round),
+                0.25,
+                crate::pacing::RoundSamples { drained: true, ..Default::default() },
+                0.0,
+                false,
+                0.0,
+            );
             probing += model.probing_rtt() as u32;
         }
         assert!(probing <= 12, "30 s idle: ProbeRTT (window {MIN_WINDOW} B) in {probing} of 120 rounds");
@@ -1166,7 +1244,14 @@ mod tests {
         let now = run(&mut model, start, 0..40, 1_000_000.0, true);
         let before = model.bandwidth_bytes_per_sec;
         for round in 1..40 {
-            model.update(now + Duration::from_millis(ROUND_MS * round), ROUND_MS as f64 / 1000.0, sample(400.0, false, 20.0), 0.0, false, 400.0);
+            model.update(
+                now + Duration::from_millis(ROUND_MS * round),
+                ROUND_MS as f64 / 1000.0,
+                sample(400.0, false, 20.0),
+                0.0,
+                false,
+                400.0,
+            );
         }
         assert_eq!(model.bandwidth_bytes_per_sec, before, "the streams wanted no more: the link wasn't measured");
     }
@@ -1181,7 +1266,14 @@ mod tests {
         for round in 40..80u32 {
             let now = start + Duration::from_millis(ROUND_MS * round as u64);
             let jitter = if round % 3 == 0 { 0.5 } else { 1.25 };
-            model.update(now, ROUND_MS as f64 / 1000.0, sample(300_000.0 * jitter, true, 5.0 + (round % 7) as f64 * 60.0), 0.0, false, 300_000.0 * jitter);
+            model.update(
+                now,
+                ROUND_MS as f64 / 1000.0,
+                sample(300_000.0 * jitter, true, 5.0 + (round % 7) as f64 * 60.0),
+                0.0,
+                false,
+                300_000.0 * jitter,
+            );
         }
         assert!(model.bandwidth_bytes_per_sec >= settled, "{model:?}");
     }
@@ -1193,7 +1285,14 @@ mod tests {
         let now = run(&mut model, start, 0..40, 1_000_000.0, true);
         let gains: Vec<f64> = (1..=8)
             .map(|round| {
-                model.update(now + Duration::from_millis(ROUND_MS * round), ROUND_MS as f64 / 1000.0, sample(1_000_000.0, true, 20.0), 0.0, false, 1_000_000.0);
+                model.update(
+                    now + Duration::from_millis(ROUND_MS * round),
+                    ROUND_MS as f64 / 1000.0,
+                    sample(1_000_000.0, true, 20.0),
+                    0.0,
+                    false,
+                    1_000_000.0,
+                );
                 model.gain
             })
             .collect();

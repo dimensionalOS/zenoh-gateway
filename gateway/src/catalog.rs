@@ -39,7 +39,12 @@ fn token_topic(token: &str) -> (&str, &'static str) {
 impl TopicCatalog {
     /// Starts following liveliness tokens on `session` (with their history, so tokens declared earlier count too).
     pub async fn start(session: &zenoh::Session, sample_memory: Duration) -> anyhow::Result<Arc<Self>> {
-        let catalog = Arc::new(TopicCatalog { entries: Mutex::default(), sample_memory, last_prune: Mutex::new(Instant::now()), _liveliness: Mutex::new(None) });
+        let catalog = Arc::new(TopicCatalog {
+            entries: Mutex::default(),
+            sample_memory,
+            last_prune: Mutex::new(Instant::now()),
+            _liveliness: Mutex::new(None),
+        });
         let weak = Arc::downgrade(&catalog);
         let subscriber = session
             .liveliness()
@@ -133,7 +138,12 @@ mod tests {
     use super::*;
 
     fn catalog(memory: Duration) -> TopicCatalog {
-        TopicCatalog { entries: Mutex::default(), sample_memory: memory, last_prune: Mutex::new(Instant::now()), _liveliness: Mutex::new(None) }
+        TopicCatalog {
+            entries: Mutex::default(),
+            sample_memory: memory,
+            last_prune: Mutex::new(Instant::now()),
+            _liveliness: Mutex::new(None),
+        }
     }
 
     fn listed(catalog: &TopicCatalog, filter: &str) -> Vec<(String, Vec<&'static str>)> {
@@ -145,7 +155,10 @@ mod tests {
         let catalog = catalog(Duration::from_secs(60));
         catalog.note_token("robot/arm", true);
         catalog.note_token("robot/cam/@adv/pub/abc/1/2", true);
-        assert_eq!(listed(&catalog, "robot/**"), vec![("robot/arm".into(), vec!["token"]), ("robot/cam".into(), vec!["advancedPublisher"])]);
+        assert_eq!(
+            listed(&catalog, "robot/**"),
+            vec![("robot/arm".into(), vec!["token"]), ("robot/cam".into(), vec!["advancedPublisher"])]
+        );
         catalog.note_token("robot/arm", false);
         assert_eq!(listed(&catalog, "robot/**"), vec![("robot/cam".into(), vec!["advancedPublisher"])]);
         assert!(listed(&catalog, "other/**").is_empty());

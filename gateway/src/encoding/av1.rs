@@ -3,8 +3,8 @@
 //! out 3 frames late (100 ms at 30 Hz); a hardware AV1 encoder ([`ServerBuilder::video_encoder`](crate::ServerBuilder::video_encoder))
 //! has none of that.
 
-use super::video::{EncodedVideo, VideoEncoder, VideoFormat, VideoTarget};
 use super::DecodedFrame;
+use super::video::{EncodedVideo, VideoEncoder, VideoFormat, VideoTarget};
 use anyhow::{Result, bail};
 
 /// Keyframe at least this often (frames), on top of PLI/FIR requests from the browser.
@@ -37,17 +37,24 @@ impl VideoEncoder for Av1Encoder {
         let wanted = Settings { width: target.width, height: target.height, bitrate_bps: target.bitrate_bps, fps: target.fps };
         let drifted = |old: f64, new: f64| old / new > RECONFIGURE_RATIO || new / old > RECONFIGURE_RATIO;
         let reconfigure = self.context.as_ref().is_none_or(|(_, current)| {
-            (current.width, current.height) != (wanted.width, wanted.height) || drifted(current.bitrate_bps as f64, wanted.bitrate_bps as f64) || drifted(current.fps, wanted.fps)
+            (current.width, current.height) != (wanted.width, wanted.height)
+                || drifted(current.bitrate_bps as f64, wanted.bitrate_bps as f64)
+                || drifted(current.fps, wanted.fps)
         });
         if reconfigure {
             let mut config = rav1e::config::EncoderConfig::with_speed_preset(10);
-            (config.width, config.height, config.bitrate) = (wanted.width as usize, wanted.height as usize, wanted.bitrate_bps.min(i32::MAX as u32) as i32);
+            (config.width, config.height, config.bitrate) =
+                (wanted.width as usize, wanted.height as usize, wanted.bitrate_bps.min(i32::MAX as u32) as i32);
             config.time_base = rav1e::data::Rational::new(1, wanted.fps.round().max(1.0) as u64);
             (config.low_latency, config.max_key_frame_interval, config.speed_settings.rdo_lookahead_frames) = (true, KEYFRAME_FRAMES, 1);
             config.speed_settings.scene_detection_mode = rav1e::prelude::SceneDetectionSpeed::None;
             let threads = std::thread::available_parallelism().map_or(1, |cores| cores.get()).min(8);
             config.tiles = threads;
-            let context = rav1e::Config::new().with_encoder_config(config).with_threads(threads).new_context().map_err(|error| anyhow::anyhow!("rav1e: {error}"))?;
+            let context = rav1e::Config::new()
+                .with_encoder_config(config)
+                .with_threads(threads)
+                .new_context()
+                .map_err(|error| anyhow::anyhow!("rav1e: {error}"))?;
             self.context = Some((context, wanted));
         }
         let (context, _) = self.context.as_mut().expect("created above");
@@ -60,11 +67,19 @@ impl VideoEncoder for Av1Encoder {
             plane.copy_from_raw_u8(data, stride as usize, 1);
         }
         // a new encoder starts with a keyframe anyway
-        let keyframe = (target.keyframe && !reconfigure).then(|| rav1e::prelude::FrameParameters { frame_type_override: rav1e::prelude::FrameTypeOverride::Key, ..Default::default() });
+        let keyframe = (target.keyframe && !reconfigure)
+            .then(|| rav1e::prelude::FrameParameters { frame_type_override: rav1e::prelude::FrameTypeOverride::Key, ..Default::default() });
         context.send_frame((input, keyframe)).map_err(|error| anyhow::anyhow!("rav1e: {error}"))?;
         loop {
             match context.receive_packet() {
-                Ok(packet) => return Ok(Some(EncodedVideo { data: packet.data, width, height, keyframe: packet.frame_type == rav1e::prelude::FrameType::KEY })),
+                Ok(packet) => {
+                    return Ok(Some(EncodedVideo {
+                        data: packet.data,
+                        width,
+                        height,
+                        keyframe: packet.frame_type == rav1e::prelude::FrameType::KEY,
+                    }));
+                }
                 Err(rav1e::EncoderStatus::Encoded) => continue,
                 Err(rav1e::EncoderStatus::NeedMoreData) => return Ok(None),
                 Err(error) => bail!("rav1e: {error}"),

@@ -4,7 +4,7 @@ use crate::auth::{Grant, Leases};
 use crate::encoding::registry::{EncodingRegistry, VideoEncoderFactory};
 use crate::encoding::{MessageEncoding, VideoEncoder, VideoFormat, VideoPolicy};
 use crate::ice::{self, IceHook, IceRequest, IceServer, IceSide};
-use crate::peer::{AllocationConfig, Gateway, ConnectConfig};
+use crate::peer::{AllocationConfig, ConnectConfig, Gateway};
 use anyhow::{Context, Result, anyhow, ensure};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -12,13 +12,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use log::{error, info};
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::ToSocketAddrs;
@@ -400,17 +400,30 @@ impl ServerBuilder {
         ensure!(initial.is_finite() && initial > 0.0, "initial bandwidth must be a positive number of bytes/s, got {initial}");
         ensure!(!self.reliable_max_backlog.is_zero(), "reliable_max_backlog must be more than 0");
         ensure!(!self.stale_after.is_zero(), "stale_after must be more than 0");
-        ensure!(!self.put_timeout.is_zero() && !self.encode_timeout.is_zero() && !self.signalling_timeout.is_zero(), "put, encode and signalling timeouts must be more than 0");
-        ensure!(!self.disconnected_grace.is_zero() && !self.connect_timeout.is_zero(), "disconnected_grace and connect_timeout must be more than 0");
+        ensure!(
+            !self.put_timeout.is_zero() && !self.encode_timeout.is_zero() && !self.signalling_timeout.is_zero(),
+            "put, encode and signalling timeouts must be more than 0"
+        );
+        ensure!(
+            !self.disconnected_grace.is_zero() && !self.connect_timeout.is_zero(),
+            "disconnected_grace and connect_timeout must be more than 0"
+        );
         self.video_policy.validate()?;
-        let codecs = EncodingRegistry::new(self.encodings)?.with_video(self.video_encoders, self.video_policy).with_encode_timeout(self.encode_timeout);
+        let codecs = EncodingRegistry::new(self.encodings)?
+            .with_video(self.video_encoders, self.video_policy)
+            .with_encode_timeout(self.encode_timeout);
         let mut config = self.zenoh_config.unwrap_or_default();
         if config.get_json("adminspace/enabled").is_ok_and(|enabled| enabled == "true") {
-            log::warn!("adminspace/enabled: zenoh 1.7.0 through 1.10.1 deadlock answering the admin space while a declaration waits for the routing tables");
+            log::warn!(
+                "adminspace/enabled: zenoh 1.7.0 through 1.10.1 deadlock answering the admin space while a declaration waits for the routing tables"
+            );
         }
         let (session, owns_session) = match self.session {
             Some(session) => {
-                ensure!(self.connect.is_empty(), "connect endpoints only apply to a session zenoh-gateway opens; configure them on the session you pass instead");
+                ensure!(
+                    self.connect.is_empty(),
+                    "connect endpoints only apply to a session zenoh-gateway opens; configure them on the session you pass instead"
+                );
                 (session, false)
             }
             None => {
@@ -420,34 +433,58 @@ impl ServerBuilder {
                 (zenoh::open(config).await.map_err(|error| anyhow!("opening the zenoh session: {error}"))?, true)
             }
         };
-        ensure!(self.connect_config.udp_ports.as_ref().is_none_or(|ports| !ports.is_empty() && *ports.start() > 0), "the UDP port range must be non-empty and above 0");
+        ensure!(
+            self.connect_config.udp_ports.as_ref().is_none_or(|ports| !ports.is_empty() && *ports.start() > 0),
+            "the UDP port range must be non-empty and above 0"
+        );
         let tls = match self.tls {
             None => None,
             Some(TlsSource::Pem { cert_chain, private_key }) => Some(tls::server_config(&cert_chain, &private_key)?),
             Some(TlsSource::Files { cert_chain, private_key }) => {
-                let cert_pem = std::fs::read(&cert_chain).with_context(|| format!("reading the TLS certificate chain {}", cert_chain.display()))?;
-                let key_pem = std::fs::read(&private_key).with_context(|| format!("reading the TLS private key {}", private_key.display()))?;
+                let cert_pem =
+                    std::fs::read(&cert_chain).with_context(|| format!("reading the TLS certificate chain {}", cert_chain.display()))?;
+                let key_pem =
+                    std::fs::read(&private_key).with_context(|| format!("reading the TLS private key {}", private_key.display()))?;
                 Some(tls::server_config(&cert_pem, &key_pem)?)
             }
         };
         let leases = Leases::new(self.lease_groups, self.slowest_lease_heartbeat_allowed);
         let catalog = crate::catalog::TopicCatalog::start(&session, self.topic_memory).await?;
-        let gateway = Gateway::new(session.clone(), codecs, catalog, AllocationConfig {
-            max_bandwidth: self.max_bandwidth_bytes_per_sec,
-            latency_target: self.latency_target,
-            stale_after: self.stale_after,
-            put_timeout: self.put_timeout,
-            signalling_timeout: self.signalling_timeout,
-            initial_bandwidth: self.initial_bandwidth_bytes_per_sec,
-            reliable_max_backlog: self.reliable_max_backlog,
-            disconnected_grace: self.disconnected_grace,
-            connect_timeout: self.connect_timeout,
-            stream_decode_backlog: self.stream_decode_backlog,
-            link_memory: self.link_memory,
-        }, leases, self.connect_config);
-        let inner = Arc::new(Inner { gateway, session, owns_session, serve_dir: self.serve_dir, tls, shut_down: AtomicBool::new(false), authorize: self.authorize, signalling: Mutex::new(Vec::new()) });
+        let gateway = Gateway::new(
+            session.clone(),
+            codecs,
+            catalog,
+            AllocationConfig {
+                max_bandwidth: self.max_bandwidth_bytes_per_sec,
+                latency_target: self.latency_target,
+                stale_after: self.stale_after,
+                put_timeout: self.put_timeout,
+                signalling_timeout: self.signalling_timeout,
+                initial_bandwidth: self.initial_bandwidth_bytes_per_sec,
+                reliable_max_backlog: self.reliable_max_backlog,
+                disconnected_grace: self.disconnected_grace,
+                connect_timeout: self.connect_timeout,
+                stream_decode_backlog: self.stream_decode_backlog,
+                link_memory: self.link_memory,
+            },
+            leases,
+            self.connect_config,
+        );
+        let inner = Arc::new(Inner {
+            gateway,
+            session,
+            owns_session,
+            serve_dir: self.serve_dir,
+            tls,
+            shut_down: AtomicBool::new(false),
+            authorize: self.authorize,
+            signalling: Mutex::new(Vec::new()),
+        });
         if let Some(name) = self.zenoh_signalling {
-            ensure!(!name.is_empty() && !name.contains(['/', '*', '$', '?', '#']), "zenoh signalling name {name:?} must be one key chunk (no '/', '*', '$')");
+            ensure!(
+                !name.is_empty() && !name.contains(['/', '*', '$', '?', '#']),
+                "zenoh signalling name {name:?} must be one key chunk (no '/', '*', '$')"
+            );
             let tasks = signalling::serve(&inner, &name).await?;
             *inner.signalling.lock() = tasks;
             info!("answering offers over zenoh on {SIGNALLING_PREFIX}/{name}/offer");
@@ -472,7 +509,11 @@ struct Inner {
 impl Inner {
     /// The request's bearer token and what the hook grants it.
     fn authorize(&self, headers: &HeaderMap) -> Result<(Option<String>, Grant), String> {
-        let token = headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()).and_then(|value| value.strip_prefix("Bearer ")).map(str::to_owned);
+        let token = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::to_owned);
         let grant = self.authorize.as_ref().map_or_else(|| Ok(Grant::all()), |hook| hook(token.as_deref(), headers))?;
         Ok((token, grant))
     }
@@ -555,7 +596,9 @@ impl Server {
         };
         let task = match self.inner.tls.clone() {
             None => tokio::spawn(async move { axum::serve(listener, app).with_graceful_shutdown(stopped).await }),
-            Some(config) => tokio::spawn(async move { axum::serve(tls::Listener::new(listener, config), app).with_graceful_shutdown(stopped).await }),
+            Some(config) => {
+                tokio::spawn(async move { axum::serve(tls::Listener::new(listener, config), app).with_graceful_shutdown(stopped).await })
+            }
         };
         Ok(RunningServer { server: self, local_addr, stop: Some(stop), task })
     }
@@ -595,7 +638,10 @@ impl Server {
         self.inner.gateway.shutdown().await;
         if self.inner.owns_session {
             let timeout = self.inner.gateway.signalling_timeout();
-            tokio::time::timeout(timeout, self.inner.session.close()).await.map_err(|_| anyhow!("closing the zenoh session took over {timeout:?}"))?.map_err(|error| anyhow!("closing the zenoh session: {error}"))?;
+            tokio::time::timeout(timeout, self.inner.session.close())
+                .await
+                .map_err(|_| anyhow!("closing the zenoh session took over {timeout:?}"))?
+                .map_err(|error| anyhow!("closing the zenoh session: {error}"))?;
         }
         info!("shut down");
         Ok(())
@@ -689,7 +735,13 @@ async fn answer(inner: &Inner, headers: &HeaderMap, offer: RTCSessionDescription
 /// `{"iceServers": [...]}` for a browser connecting with `token`.
 async fn minted_ice_servers(inner: &Inner, token: Option<String>) -> serde_json::Value {
     let config = &inner.gateway.connect_config;
-    let servers = ice::servers(&config.ice_servers, config.turn_secret.as_ref(), config.ice_servers_fn.as_ref(), IceRequest { side: IceSide::Browser, token }).await;
+    let servers = ice::servers(
+        &config.ice_servers,
+        config.turn_secret.as_ref(),
+        config.ice_servers_fn.as_ref(),
+        IceRequest { side: IceSide::Browser, token },
+    )
+    .await;
     serde_json::json!({"iceServers": servers})
 }
 
@@ -707,7 +759,11 @@ mod signalling {
     pub(super) async fn serve(inner: &Arc<Inner>, name: &str) -> Result<Vec<JoinHandle<()>>> {
         let mut tasks = Vec::new();
         for op in ["offer", "ice"] {
-            let queryable = inner.session.declare_queryable(format!("{SIGNALLING_PREFIX}/{name}/{op}")).await.map_err(|error| anyhow!("declaring the signalling queryable: {error}"))?;
+            let queryable = inner
+                .session
+                .declare_queryable(format!("{SIGNALLING_PREFIX}/{name}/{op}"))
+                .await
+                .map_err(|error| anyhow!("declaring the signalling queryable: {error}"))?;
             let inner = Arc::downgrade(inner);
             tasks.push(tokio::spawn(async move {
                 // each query's answer runs here, so aborting this task at shutdown aborts them too
@@ -722,12 +778,19 @@ mod signalling {
                     };
                     let Some(inner) = inner.upgrade() else { break };
                     answering.spawn(async move {
-                        let reply = respond(&inner, op, query.payload().map(|payload| payload.to_bytes().to_vec()).unwrap_or_default()).await;
+                        let reply =
+                            respond(&inner, op, query.payload().map(|payload| payload.to_bytes().to_vec()).unwrap_or_default()).await;
                         let key = query.key_expr().clone();
                         let timeout = inner.gateway.signalling_timeout();
                         let sent = match reply {
                             Ok(body) => tokio::time::timeout(timeout, query.reply(key, body.to_string())).await,
-                            Err((status, reason)) => tokio::time::timeout(timeout, query.reply_err(serde_json::json!({"status": status.as_u16(), "error": reason}).to_string())).await,
+                            Err((status, reason)) => {
+                                tokio::time::timeout(
+                                    timeout,
+                                    query.reply_err(serde_json::json!({"status": status.as_u16(), "error": reason}).to_string()),
+                                )
+                                .await
+                            }
                         };
                         match sent {
                             Ok(Ok(())) => {}
@@ -742,7 +805,11 @@ mod signalling {
     }
 
     async fn respond(inner: &Inner, op: &str, payload: Vec<u8>) -> Result<serde_json::Value, (StatusCode, String)> {
-        let request: Request = if payload.is_empty() { Request::default() } else { serde_json::from_slice(&payload).map_err(|error| (StatusCode::BAD_REQUEST, format!("bad signalling request: {error}")))? };
+        let request: Request = if payload.is_empty() {
+            Request::default()
+        } else {
+            serde_json::from_slice(&payload).map_err(|error| (StatusCode::BAD_REQUEST, format!("bad signalling request: {error}")))?
+        };
         let mut headers = HeaderMap::new();
         if let Some(token) = &request.token {
             let value = format!("Bearer {token}").parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad token".to_owned()))?;
@@ -767,15 +834,17 @@ mod tls {
     use std::sync::Arc;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::task::JoinSet;
+    use tokio_rustls::TlsAcceptor;
     use tokio_rustls::rustls::pki_types::pem::PemObject;
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use tokio_rustls::rustls::{ServerConfig, crypto};
     use tokio_rustls::server::TlsStream;
-    use tokio_rustls::TlsAcceptor;
 
     /// A rustls server config (ring, HTTP/1.1) from a PEM certificate chain and private key.
     pub(super) fn server_config(cert_chain_pem: &[u8], private_key_pem: &[u8]) -> Result<Arc<ServerConfig>> {
-        let cert_chain = CertificateDer::pem_slice_iter(cert_chain_pem).collect::<Result<Vec<_>, _>>().context("reading the TLS certificate chain (PEM)")?;
+        let cert_chain = CertificateDer::pem_slice_iter(cert_chain_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .context("reading the TLS certificate chain (PEM)")?;
         ensure!(!cert_chain.is_empty(), "the TLS certificate chain PEM has no certificate");
         let private_key = PrivateKeyDer::from_pem_slice(private_key_pem).context("reading the TLS private key (PEM)")?;
         let mut config = ServerConfig::builder_with_provider(Arc::new(crypto::ring::default_provider()))

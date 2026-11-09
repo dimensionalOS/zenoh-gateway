@@ -197,7 +197,9 @@ impl Path {
         let lost: Vec<u64> = self
             .frames
             .iter()
-            .filter(|(_, frame)| (frame.lossy && now.duration_since(frame.sent_at) > timeout) || now.duration_since(frame.sent_at) > stale_after)
+            .filter(|(_, frame)| {
+                (frame.lossy && now.duration_since(frame.sent_at) > timeout) || now.duration_since(frame.sent_at) > stale_after
+            })
             .map(|(order, _)| *order)
             .collect();
         for order in lost {
@@ -267,7 +269,8 @@ impl SendGate {
             path.rtts.pop_front();
         }
         let drained = path.in_flight <= path.window.max(2 * self.chunk_bytes());
-        let mut recent: Vec<f64> = path.rtts.iter().filter(|(at, _)| now.duration_since(*at) <= TYPICAL_RTT_WINDOW).map(|(_, rtt)| *rtt).collect();
+        let mut recent: Vec<f64> =
+            path.rtts.iter().filter(|(at, _)| now.duration_since(*at) <= TYPICAL_RTT_WINDOW).map(|(_, rtt)| *rtt).collect();
         recent.sort_by(f64::total_cmp);
         let typical_rtt_ms = recent.get(recent.len() / 2).copied();
         while path.quiet_rtts.front().is_some_and(|(at, _)| now.duration_since(*at) > RTT_WINDOW) {
@@ -317,7 +320,8 @@ impl SendGate {
         path.next += 1;
         let quiet = path.in_flight <= QUIET_BYTES;
         path.in_flight += bytes;
-        let (link_limited, latency_limited) = if strict { (false, false) } else { (std::mem::take(&mut path.held), std::mem::take(&mut path.held_by_target)) };
+        let (link_limited, latency_limited) =
+            if strict { (false, false) } else { (std::mem::take(&mut path.held), std::mem::take(&mut path.held_by_target)) };
         let frame = Frame { stream, bytes, lossy, lifetime, sent_at: now, link_limited, latency_limited, quiet };
         path.frames.insert(order, frame);
         order
@@ -387,7 +391,8 @@ impl SendGate {
             path.round.extra_acked = path.round.extra_acked.max(extra);
         }
         if let Some((newest, stream)) = newest.zip(newest_acked.as_ref().map(|frame| frame.stream)) {
-            let lost: Vec<u64> = path.frames.range(..newest).filter(|(_, frame)| frame.lossy && frame.stream == stream).map(|(order, _)| *order).collect();
+            let lost: Vec<u64> =
+                path.frames.range(..newest).filter(|(_, frame)| frame.lossy && frame.stream == stream).map(|(order, _)| *order).collect();
             for order in lost {
                 path.remove(order);
             }

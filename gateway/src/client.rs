@@ -31,6 +31,7 @@ pub use api::*;
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
 use log::{debug, warn};
+use parking_lot::Mutex;
 use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp::Packet;
@@ -43,7 +44,6 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit, RTCDataChannelState};
@@ -693,14 +693,27 @@ impl Inner {
         self.connection.set_remote_description(serde_json::from_value(reply["sdp"].clone())?).await?;
         let mid = transceiver.mid().await?.context("the transceiver has no mid")?;
         ensure!(reply["mid"] == mid.as_str(), "gateway bound mid {}, expected {mid}", reply["mid"]);
-        let slot = Arc::new(MediaSlot { mid, codec: codec.to_owned(), transceiver, track: OnceLock::new(), ssrc: AtomicU32::new(0), sink: Mutex::new(None) });
+        let slot = Arc::new(MediaSlot {
+            mid,
+            codec: codec.to_owned(),
+            transceiver,
+            track: OnceLock::new(),
+            ssrc: AtomicU32::new(0),
+            sink: Mutex::new(None),
+        });
         self.shared.media.lock().push(slot.clone());
         Ok(slot)
     }
 
     /// Opens a `sub`/`pub` channel, runs `task` on its events, and waits until the gateway accepted
     /// it and it is open here (the gateway's `accepted` can beat the channel's own open).
-    async fn open_endpoint<F>(&self, label: Value, init: RTCDataChannelInit, publisher: Option<Arc<PubState>>, task: impl FnOnce(Arc<dyn DataChannel>, oneshot::Sender<()>) -> F) -> Result<Arc<dyn DataChannel>>
+    async fn open_endpoint<F>(
+        &self,
+        label: Value,
+        init: RTCDataChannelInit,
+        publisher: Option<Arc<PubState>>,
+        task: impl FnOnce(Arc<dyn DataChannel>, oneshot::Sender<()>) -> F,
+    ) -> Result<Arc<dyn DataChannel>>
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -708,7 +721,11 @@ impl Inner {
         let (accepted_tx, accepted_rx) = oneshot::channel();
         self.shared.endpoints.lock().insert(id, Endpoint { accepted: Some(accepted_tx), publisher });
         let opened = async {
-            let channel = self.connection.create_data_channel(&label.to_string(), Some(init)).await.map_err(|error| anyhow!("creating the channel: {error}"))?;
+            let channel = self
+                .connection
+                .create_data_channel(&label.to_string(), Some(init))
+                .await
+                .map_err(|error| anyhow!("creating the channel: {error}"))?;
             let (opened_tx, opened_rx) = oneshot::channel();
             tokio::spawn(task(channel.clone(), opened_tx));
             let ready = async {
@@ -783,18 +800,34 @@ impl Client {
 
     async fn connect_with(signalling: Signalling, options: ClientOptions) -> Result<Client> {
         let (state, _) = watch::channel(ConnectionState::Connecting);
-        let shared = Arc::new(Shared { requests: Mutex::default(), endpoints: Mutex::default(), clock: Mutex::default(), state, gathered: Notify::new(), media: Mutex::default(), leases: Mutex::default(), pending_leases: Mutex::default(), api_routes: Mutex::default(), api_early: Mutex::default() });
+        let shared = Arc::new(Shared {
+            requests: Mutex::default(),
+            endpoints: Mutex::default(),
+            clock: Mutex::default(),
+            state,
+            gathered: Notify::new(),
+            media: Mutex::default(),
+            leases: Mutex::default(),
+            pending_leases: Mutex::default(),
+            api_routes: Mutex::default(),
+            api_early: Mutex::default(),
+        });
         let (ice_servers, server_relay_only) = match &options.ice_servers {
             Some(servers) => (servers.clone(), false),
             None => signalling.ice_servers(options.token.as_deref()).await?,
         };
-        let ice_servers = ice_servers.into_iter().map(|server| RTCIceServer { urls: server.urls, username: server.username, credential: server.credential }).collect();
+        let ice_servers = ice_servers
+            .into_iter()
+            .map(|server| RTCIceServer { urls: server.urls, username: server.username, credential: server.credential })
+            .collect();
         let policy = if options.relay_only || server_relay_only { RTCIceTransportPolicy::Relay } else { RTCIceTransportPolicy::All };
         let (media_engine, interceptors, _, _) = media::media_setup(crate::allocator::DEFAULT_INITIAL_BANDWIDTH)?;
         let connection: Arc<dyn PeerConnection> = Arc::new(
             PeerConnectionBuilder::new()
                 .with_configuration(RTCConfigurationBuilder::new().with_ice_servers(ice_servers).with_ice_transport_policy(policy).build())
-                .with_setting_engine(SettingEngineBuilder::new().with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_MESSAGE_SIZE)).build())
+                .with_setting_engine(
+                    SettingEngineBuilder::new().with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_MESSAGE_SIZE)).build(),
+                )
                 .with_media_engine(media_engine)
                 .with_interceptor_registry(interceptors)
                 .with_handler(Arc::new(Handler { shared: shared.clone() }))
@@ -817,7 +850,10 @@ impl Client {
             let _ = tokio::time::timeout(GATHER_TIMEOUT, shared.gathered.notified()).await;
             let offer = connection.local_description().await.context("no local description")?;
             connection.set_remote_description(signalling.offer(options.token.as_deref(), &offer).await?).await?;
-            tokio::time::timeout(OPEN_TIMEOUT, control_open_rx).await.map_err(|_| anyhow!("control channel open timed out"))?.map_err(|_| anyhow!("control channel closed before opening"))?;
+            tokio::time::timeout(OPEN_TIMEOUT, control_open_rx)
+                .await
+                .map_err(|_| anyhow!("control channel open timed out"))?
+                .map_err(|_| anyhow!("control channel closed before opening"))?;
             let mut inner = Inner {
                 connection: connection.clone(),
                 control,
@@ -877,7 +913,10 @@ impl Client {
     /// enumeration"); `probe_ms` (default 0) also listens on `filter` that long first, to catch quiet publishers.
     pub async fn list_topics(&self, filter: &str, probe_ms: Option<u64>) -> Result<Vec<Topic>> {
         let probe_ms = probe_ms.unwrap_or(0);
-        let mut reply = self.inner.request(json!({"op": "listTopics", "key": filter, "probeMs": probe_ms}), Duration::from_millis(probe_ms + 5000)).await?;
+        let mut reply = self
+            .inner
+            .request(json!({"op": "listTopics", "key": filter, "probeMs": probe_ms}), Duration::from_millis(probe_ms + 5000))
+            .await?;
         Ok(serde_json::from_value(reply["topics"].take())?)
     }
 
@@ -900,7 +939,10 @@ impl Client {
     /// refusing). Video and audio channels first renegotiate a track (or reuse a closed subscription's).
     pub async fn subscribe(&self, key: &str, options: SubscribeOptions) -> Result<Subscription> {
         let inner = &self.inner;
-        let output = options.encoding.as_ref().map(|name| inner.encodings.iter().find(|info| &info.name == name).map_or("data", |info| info.output.as_str()));
+        let output = options
+            .encoding
+            .as_ref()
+            .map(|name| inner.encodings.iter().find(|info| &info.name == name).map_or("data", |info| info.output.as_str()));
         let channel = options.channel.clone().unwrap_or_else(|| match output {
             Some("video") => "video-h264".to_owned(),
             Some("audio") => "audio-opus".to_owned(),
@@ -930,7 +972,13 @@ impl Client {
         unreachable!("the second attempt returns")
     }
 
-    async fn subscribe_on(&self, key: &str, options: &SubscribeOptions, kind: Option<String>, slot: Option<Arc<MediaSlot>>) -> Result<Subscription> {
+    async fn subscribe_on(
+        &self,
+        key: &str,
+        options: &SubscribeOptions,
+        kind: Option<String>,
+        slot: Option<Arc<MediaSlot>>,
+    ) -> Result<Subscription> {
         let inner = &self.inner;
         let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
         let mut label = json!({"type": "sub", "key": key, "id": id, "opts": options_json(options)});
@@ -943,7 +991,12 @@ impl Client {
             packets = Some(packets_rx);
         }
         let task = SubscriptionTask { kind, slot: slot.clone(), messages: messages_tx, packets, client: Arc::downgrade(inner) };
-        match inner.open_endpoint(label, channel_init(options.delivery.unwrap_or_default(), options.max_age), None, |channel, opened| task.run(channel, opened)).await {
+        match inner
+            .open_endpoint(label, channel_init(options.delivery.unwrap_or_default(), options.max_age), None, |channel, opened| {
+                task.run(channel, opened)
+            })
+            .await
+        {
             Ok(channel) => Ok(Subscription { key: key.to_owned(), id, messages, channel, slot, client: Arc::downgrade(inner) }),
             // the channel's task frees the slot when it ends
             Err(error) => Err(error),
@@ -955,11 +1008,22 @@ impl Client {
         let inner = &self.inner;
         let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
         let delivery = options.delivery.unwrap_or_default();
-        let state = Arc::new(PubState { tripped: Ending::new(), deadman_armed: AtomicBool::new(false), last: Mutex::new(None), blocked: Mutex::new(None) });
+        let state = Arc::new(PubState {
+            tripped: Ending::new(),
+            deadman_armed: AtomicBool::new(false),
+            last: Mutex::new(None),
+            blocked: Mutex::new(None),
+        });
         let task_state = state.clone();
         let label = json!({"type": "pub", "key": key, "id": id, "opts": options_json(&options)});
-        let channel = inner.open_endpoint(label, channel_init(delivery, None), Some(state.clone()), |channel, opened| run_publisher_channel(channel, opened, task_state)).await?;
-        let repeat = options.repeat_ms.map(|ms| tokio::spawn(repeat_puts(channel.clone(), state.clone(), delivery, Duration::from_millis(ms.max(1)))));
+        let channel = inner
+            .open_endpoint(label, channel_init(delivery, None), Some(state.clone()), |channel, opened| {
+                run_publisher_channel(channel, opened, task_state)
+            })
+            .await?;
+        let repeat = options
+            .repeat_ms
+            .map(|ms| tokio::spawn(repeat_puts(channel.clone(), state.clone(), delivery, Duration::from_millis(ms.max(1)))));
         Ok(Publisher { key: key.to_owned(), id, channel, state, delivery, repeat, client: Arc::downgrade(inner) })
     }
 
@@ -967,7 +1031,13 @@ impl Client {
     /// server's group, or `keys` for one it doesn't define (SPEC "Leases"). Needs a heartbeat; it ends
     /// when the heartbeat stops, at `max_seconds`, on disconnect, on [`Lease::release`] or by force-expiry.
     pub async fn lease(&self, group: &str, keys: Option<Vec<String>>, max_seconds: Option<f64>) -> Result<Lease> {
-        self.lease_with(LeaseOptions { group: Some(group.to_owned()), publish: keys.unwrap_or_default(), max_seconds, ..Default::default() }).await
+        self.lease_with(LeaseOptions {
+            group: Some(group.to_owned()),
+            publish: keys.unwrap_or_default(),
+            max_seconds,
+            ..Default::default()
+        })
+        .await
     }
 
     /// Takes a lease on keys to publish and keys to subscribe to (SPEC "Leases"): while held, the gateway drops other
@@ -1017,7 +1087,9 @@ fn options_json(options: &impl Serialize) -> Value {
 fn channel_init(delivery: Delivery, max_age_ms: Option<f64>) -> RTCDataChannelInit {
     match (delivery, max_age_ms) {
         (Delivery::Reliable, _) => RTCDataChannelInit { ordered: true, ..Default::default() },
-        (Delivery::Latest, Some(age)) => RTCDataChannelInit { ordered: false, max_packet_life_time: Some(age.round().clamp(1.0, 65535.0) as u16), ..Default::default() },
+        (Delivery::Latest, Some(age)) => {
+            RTCDataChannelInit { ordered: false, max_packet_life_time: Some(age.round().clamp(1.0, 65535.0) as u16), ..Default::default() }
+        }
         // as the JS client: a lost chunk is retransmitted for 1 s rather than losing its whole message
         (Delivery::Latest, None) => RTCDataChannelInit { ordered: false, max_packet_life_time: Some(1000), ..Default::default() },
     }
@@ -1295,7 +1367,13 @@ fn reassemble(partials: &mut BTreeMap<u32, Partial>, header: &frame::FrameHeader
         return Some((header.key.to_owned(), header.timestamp_ms, header.flags, chunk.to_vec()));
     }
     let count = header.chunk_count as usize;
-    let partial = partials.entry(header.seq).or_insert_with(|| Partial { key: header.key.to_owned(), timestamp_ms: header.timestamp_ms, flags: header.flags, chunks: vec![None; count], received: 0 });
+    let partial = partials.entry(header.seq).or_insert_with(|| Partial {
+        key: header.key.to_owned(),
+        timestamp_ms: header.timestamp_ms,
+        flags: header.flags,
+        chunks: vec![None; count],
+        received: 0,
+    });
     if let Some(slot @ None) = partial.chunks.get_mut(header.chunk_index as usize) {
         *slot = Some(chunk.to_vec());
         partial.received += 1;
@@ -1314,7 +1392,9 @@ fn reassemble(partials: &mut BTreeMap<u32, Partial>, header: &frame::FrameHeader
 /// A whole data-channel message as what the subscription's channel makes of it (fields when the frame says so).
 fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flags: u8, bytes: Vec<u8>) -> Result<Option<Message>> {
     let (header, sample, bytes) = match flags & frame::HEADER != 0 {
-        true => frame::split_header(&bytes).map(|(header, sample, rest)| (Some(header), sample, rest.to_vec())).context("bad message header")?,
+        true => {
+            frame::split_header(&bytes).map(|(header, sample, rest)| (Some(header), sample, rest.to_vec())).context("bad message header")?
+        }
         false => (None, None, bytes),
     };
     let bytes = if flags & frame::ZSTD != 0 { zstd::decode_all(&bytes[..])? } else { bytes };
@@ -1323,7 +1403,10 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
             ensure!(bytes.len() >= media::METADATA_LEN_V1 && bytes[0] == 1, "not a video metadata frame");
             let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
             let float = |at: usize| f64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
-            let (header, sample) = match (bytes[1] & media::METADATA_FLAG_HEADER != 0).then(|| bytes.get(media::METADATA_LEN..).and_then(frame::decode_header)).flatten() {
+            let (header, sample) = match (bytes[1] & media::METADATA_FLAG_HEADER != 0)
+                .then(|| bytes.get(media::METADATA_LEN..).and_then(frame::decode_header))
+                .flatten()
+            {
                 Some((header, sample)) => (Some(header), sample),
                 None => (None, None),
             };
@@ -1370,7 +1453,9 @@ fn to_message(kind: Option<&str>, key: String, timestamp_ms: f64, seq: u32, flag
 }
 
 fn video_format(mime: &str) -> Option<VideoFormat> {
-    [VideoFormat::H264, VideoFormat::Vp8, VideoFormat::Vp9, VideoFormat::Av1, VideoFormat::H265].into_iter().find(|format| format.mime_type() == mime)
+    [VideoFormat::H264, VideoFormat::Vp8, VideoFormat::Vp9, VideoFormat::Av1, VideoFormat::H265]
+        .into_iter()
+        .find(|format| format.mime_type() == mime)
 }
 
 /// Annex-B start code, which [`H265Depacketizer`] puts in front of every NAL unit it rebuilds.
@@ -1747,7 +1832,9 @@ impl Signalling {
     async fn offer(&self, token: Option<&str>, offer: &RTCSessionDescription) -> Result<RTCSessionDescription> {
         match self {
             Signalling::Http { url, http } => {
-                let response = refuse_unauthorized(bearer(http.post(format!("{url}/offer")).json(offer), token).send().await.context("POST /offer")?).await?;
+                let response =
+                    refuse_unauthorized(bearer(http.post(format!("{url}/offer")).json(offer), token).send().await.context("POST /offer")?)
+                        .await?;
                 let status = response.status();
                 ensure!(status.is_success(), "gateway refused the offer: {status} {}", response.text().await.unwrap_or_default());
                 Ok(response.json::<RTCSessionDescription>().await?)
@@ -1760,8 +1847,11 @@ impl Signalling {
     async fn query(&self, op: &str, body: Value) -> Result<Value> {
         let Signalling::Zenoh { session, name } = self else { unreachable!("zenoh signalling only") };
         let key = format!("{}/{name}/{op}", crate::SIGNALLING_PREFIX);
-        let replies = session.get(&key).payload(body.to_string()).timeout(OPEN_TIMEOUT).await.map_err(|error| anyhow!("querying {key}: {error}"))?;
-        let reply = replies.recv_async().await.map_err(|_| anyhow!("no zenoh-gateway server answered on {key} (is it built with zenoh_signalling({name:?}) and reachable over zenoh?)"))?;
+        let replies =
+            session.get(&key).payload(body.to_string()).timeout(OPEN_TIMEOUT).await.map_err(|error| anyhow!("querying {key}: {error}"))?;
+        let reply = replies.recv_async().await.map_err(|_| {
+            anyhow!("no zenoh-gateway server answered on {key} (is it built with zenoh_signalling({name:?}) and reachable over zenoh?)")
+        })?;
         match reply.result() {
             Ok(sample) => Ok(serde_json::from_slice(&sample.payload().to_bytes())?),
             Err(error) => {

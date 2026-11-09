@@ -7,12 +7,12 @@
 
 use crate::auth::{Access, AclMessage, Action};
 use base64::Engine;
+use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zenoh::bytes::{Encoding, ZBytes};
 use zenoh::liveliness::LivelinessToken;
@@ -227,7 +227,8 @@ fn consolidation(value: &Option<String>) -> Result<Option<ConsolidationMode>, St
 
 fn timestamp(session: &Session, ms: Option<f64>) -> Option<Timestamp> {
     // NTP64 holds 32-bit seconds: a time past 2106 (or NaN) gets zenoh's own timestamp instead
-    ms.filter(|ms| (0.0..4_294_967_295_000.0).contains(ms)).map(|ms| Timestamp::new(NTP64::from(Duration::from_secs_f64(ms / 1000.0)), session.zid().into()))
+    ms.filter(|ms| (0.0..4_294_967_295_000.0).contains(ms))
+        .map(|ms| Timestamp::new(NTP64::from(Duration::from_secs_f64(ms / 1000.0)), session.zid().into()))
 }
 
 fn timestamp_ms(timestamp: Option<&Timestamp>) -> Option<f64> {
@@ -319,7 +320,13 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
                     if let Some(congestion_control) = congestion_control(&request.congestion_control)? {
                         builder = builder.congestion_control(congestion_control);
                     }
-                    tokio::time::timeout(put_timeout, builder.express(request.express.unwrap_or(false)).timestamp(timestamp(session, request.timestamp))).await.map_err(|_| timed_out())?.map_err(error)?;
+                    tokio::time::timeout(
+                        put_timeout,
+                        builder.express(request.express.unwrap_or(false)).timestamp(timestamp(session, request.timestamp)),
+                    )
+                    .await
+                    .map_err(|_| timed_out())?
+                    .map_err(error)?;
                 }};
             }
             if put {
@@ -495,7 +502,8 @@ async fn run(context: Context<'_>, request: ApiRequest) -> Result<Value, String>
             Ok(json!({"subId": sub_id}))
         }
         "livelinessUnsubscribe" => {
-            let subscriber = api.liveliness_subscribers.lock().remove(&request.sub_id.unwrap_or_default()).ok_or("no such liveliness subscriber")?;
+            let subscriber =
+                api.liveliness_subscribers.lock().remove(&request.sub_id.unwrap_or_default()).ok_or("no such liveliness subscriber")?;
             subscriber.undeclare().await.map_err(error)?;
             Ok(json!({}))
         }

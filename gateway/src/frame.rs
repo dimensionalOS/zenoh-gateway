@@ -154,7 +154,15 @@ pub fn decode(frame: &[u8]) -> Option<(FrameHeader<'_>, &[u8])> {
     let key = std::str::from_utf8(frame.get(2..2 + key_len)?).ok()?;
     let fixed = frame.get(2 + key_len..HEADER_FIXED_LEN + key_len)?;
     let word = |at: usize| u32::from_le_bytes(fixed[at..at + 4].try_into().unwrap());
-    let header = FrameHeader { key, timestamp_ms: f64::from_le_bytes(fixed[..8].try_into().unwrap()), seq: word(8), frame_id: word(12), chunk_index: word(16), chunk_count: word(20), flags: fixed[24] };
+    let header = FrameHeader {
+        key,
+        timestamp_ms: f64::from_le_bytes(fixed[..8].try_into().unwrap()),
+        seq: word(8),
+        frame_id: word(12),
+        chunk_index: word(16),
+        chunk_count: word(20),
+        flags: fixed[24],
+    };
     Some((header, &frame[HEADER_FIXED_LEN + key_len..]))
 }
 
@@ -181,7 +189,11 @@ mod tests {
         let (old, _) = super::decode_header(short).unwrap();
         assert_eq!((old.sec, old.frame_id.as_str(), old.seq), (header.sec, "mid360_link", None), "0.5.31: stamp and frame id only");
         assert!((old.nanosec as i64 - 123_456_789).abs() < 1_000, "rounded from the f64 stamp");
-        assert_eq!(super::encode_header(&crate::MessageHeader { frame_id: "x".repeat(70_000), ..header }, &None), None, "no frame id is that long");
+        assert_eq!(
+            super::encode_header(&crate::MessageHeader { frame_id: "x".repeat(70_000), ..header }, &None),
+            None,
+            "no frame id is that long"
+        );
         assert_eq!(super::decode_header(&bytes[..9]), None, "cut short");
     }
 
@@ -201,7 +213,19 @@ mod tests {
         assert_eq!(frame[29], ZSTD);
         assert_eq!(&frame[30..], &[9, 9]);
         let (decoded, chunk) = decode(&frame).unwrap();
-        assert_eq!((decoded.key, decoded.timestamp_ms, decoded.seq, decoded.frame_id, decoded.chunk_index, decoded.chunk_count, decoded.flags, chunk), ("a/b", 1.5, 7, 9, 1, 3, ZSTD, &[9u8, 9][..]));
+        assert_eq!(
+            (
+                decoded.key,
+                decoded.timestamp_ms,
+                decoded.seq,
+                decoded.frame_id,
+                decoded.chunk_index,
+                decoded.chunk_count,
+                decoded.flags,
+                chunk
+            ),
+            ("a/b", 1.5, 7, 9, 1, 3, ZSTD, &[9u8, 9][..])
+        );
         assert!(decode(&frame[..20]).is_none());
     }
 

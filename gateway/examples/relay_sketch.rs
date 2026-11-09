@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use zenoh_gateway::client::{Client, ClientOptions, Message, SubscribeOptions};
-use zenoh_gateway::{Channel, MessageEncoding, EncodingOutput, EncodingSample, DecodedFrame, RunningServer, Server, VideoImage};
+use zenoh_gateway::{Channel, DecodedFrame, EncodingOutput, EncodingSample, MessageEncoding, RunningServer, Server, VideoImage};
 
 /// B's encoding: `u32 width | u32 height | RGB8` → a picture for B's H.264 encoder.
 pub struct RelayRgb;

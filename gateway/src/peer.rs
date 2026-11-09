@@ -3,34 +3,34 @@
 use crate::allocator::{self, LinkModel};
 use crate::api::{self, fail, ok};
 use crate::auth::{Grant, Leases};
-use crate::ice::{self, IceServer};
-use crate::encoding::registry::{EncodingRegistry, Resolved};
 use crate::encoding::Channel;
+use crate::encoding::registry::{EncodingRegistry, Resolved};
+use crate::ice::{self, IceServer};
+use crate::media::{self, MediaTrack, TrackClaim};
+use crate::microphone;
 use crate::options::{HeartbeatOpts, Label, PubOpts, SubOpts};
 use crate::pacing::SendGate;
 use crate::publisher::{self, PubShared};
 use crate::subscription::{self, SubShared, now_unix_ms};
-use crate::media::{self, MediaTrack, TrackClaim};
-use crate::microphone;
-use webrtc::media_stream::track_remote::TrackRemote;
 use base64::Engine;
 use log::{debug, info, warn};
+use parking_lot::Mutex;
+use rtc::peer_connection::configuration::RTCIceServer;
+use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
+use webrtc::media_stream::track_remote::TrackRemote;
 use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
-    RTCIceGatheringState, RTCPeerConnectionState, RTCSessionDescription, SettingEngineBuilder,
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceGatheringState,
+    RTCPeerConnectionState, RTCSessionDescription, SettingEngineBuilder,
 };
-use rtc::peer_connection::configuration::RTCIceServer;
-use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
 use zenoh::qos::{CongestionControl, Priority, Reliability};
 
 /// Largest message we accept from (and advertise to) the browser; Chrome sends 256 KiB too.
@@ -342,7 +342,10 @@ impl PeerState {
 
     fn subscriptions(&self) -> Vec<Arc<SubShared>> {
         let channels = self.channels.lock();
-        channels.values().filter_map(|entry| if let ChannelStats::Sub(shared) = &entry.stats { Some(shared.clone()) } else { None }).collect()
+        channels
+            .values()
+            .filter_map(|entry| if let ChannelStats::Sub(shared) = &entry.stats { Some(shared.clone()) } else { None })
+            .collect()
     }
 
     /// Sizes of everything this frontend holds (each must stay flat while the page runs; growth is a resource not freed).
@@ -392,10 +395,18 @@ impl PeerState {
             // video is held back by the link while it queues there (not by a cut, GCC's or its own brake's: those hold it
             // under the link, and counting their rounds as the link's speed lowered the bandwidth with every cut, a spiral)
             let delivery = self.video_rate.delivery();
-            let video_link_limited = delivery.is_some_and(|delivery| allocator::video_held_by_link(delivery.least_queue_ms, self.config.latency_target));
+            let video_link_limited =
+                delivery.is_some_and(|delivery| allocator::video_held_by_link(delivery.least_queue_ms, self.config.latency_target));
             let round = self.gate.take_round();
             log::debug!(target: "zenoh_gateway::link", "peer {}: round {round:?} video {:?} link-limited {video_link_limited} delivered {:.0}", self.peer_id, delivery.map(|delivery| delivery.bytes_per_sec), per_sec(delivered));
-            link.update(now, interval_secs, round, delivery.map_or(0.0, |delivery| delivery.bytes_per_sec), video_link_limited, per_sec(delivered));
+            link.update(
+                now,
+                interval_secs,
+                round,
+                delivery.map_or(0.0, |delivery| delivery.bytes_per_sec),
+                video_link_limited,
+                per_sec(delivered),
+            );
             if let Some(cap) = self.config.max_bandwidth {
                 link.capped(cap);
             }
@@ -435,7 +446,10 @@ impl PeerState {
             self.video_rate.set_size_ratio(sized_for / video_estimate);
             // (only while fresh feedback shows video isn't queued at the link: on a 100 kbit/s link the startup's guess, 15x
             // the link, grew the picture and its keyframes jammed the link for seconds)
-            let unqueued = self.video_rate.delivery().is_some_and(|delivery| !allocator::video_held_by_link(delivery.least_queue_ms, self.config.latency_target));
+            let unqueued = self
+                .video_rate
+                .delivery()
+                .is_some_and(|delivery| !allocator::video_held_by_link(delivery.least_queue_ms, self.config.latency_target));
             self.video_rate.set_starting_up(link.starting_up && unqueued);
         }
         let is_video: Vec<bool> = usages.iter().map(|usage| usage.on_track).collect();
@@ -446,7 +460,8 @@ impl PeerState {
         let (window, latency_capped) = link.window(Some(latency_target));
         self.video_rate.pacer.set_queue_limit(latency_target);
         self.gate.configure(link.bandwidth_bytes_per_sec, budget, window, latency_capped);
-        let video_granted: f64 = allocations.iter().zip(&is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
+        let video_granted: f64 =
+            allocations.iter().zip(&is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
         self.video_rate.set_cap_bytes_per_sec(video_granted);
         self.video_rate.set_link_bytes_per_sec(budget);
         self.video_rate.pacer.set_rate(self.video_rate.pacing_bps());
@@ -615,7 +630,9 @@ impl PeerState {
             match tokio::time::timeout(self.config.put_timeout, put).await {
                 Ok(Ok(())) => info!("peer {}: deadman fired on {:?} ({reason})", self.peer_id, deadman.key),
                 Ok(Err(error)) => warn!("peer {}: deadman on {:?} failed: {error}", self.peer_id, deadman.key),
-                Err(_) => warn!("peer {}: deadman on {:?} failed: zenoh held it past {:?}", self.peer_id, deadman.key, self.config.put_timeout),
+                Err(_) => {
+                    warn!("peer {}: deadman on {:?} failed: zenoh held it past {:?}", self.peer_id, deadman.key, self.config.put_timeout)
+                }
             }
             let control = self.control.lock().clone();
             if let Some(control) = control {
@@ -654,7 +671,14 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    pub fn new(session: zenoh::Session, codecs: EncodingRegistry, catalog: Arc<crate::catalog::TopicCatalog>, allocation: AllocationConfig, leases: Leases, connect_config: ConnectConfig) -> Arc<Self> {
+    pub fn new(
+        session: zenoh::Session,
+        codecs: EncodingRegistry,
+        catalog: Arc<crate::catalog::TopicCatalog>,
+        allocation: AllocationConfig,
+        leases: Leases,
+        connect_config: ConnectConfig,
+    ) -> Arc<Self> {
         let codecs = Arc::new(codecs);
         // the shared decode/encode results, and the links' seeds, expire whether or not any frontend is left to ask
         let link_seeds: Arc<Mutex<HashMap<String, (allocator::LinkSeed, Instant)>>> = Default::default();
@@ -710,10 +734,20 @@ impl Gateway {
     /// Every open subscription: its key expression and encoding.
     pub fn subscriptions(&self) -> Vec<(String, Option<String>)> {
         let peers = self.peers.lock();
-        let channels = peers.values().flat_map(|entry| entry.state.channels.lock().values().filter_map(|channel| match &channel.stats {
-            ChannelStats::Sub(shared) => Some((channel.label.key.clone(), shared.codec.as_ref().map(|codec| codec.name().to_owned()))),
-            _ => None,
-        }).collect::<Vec<_>>());
+        let channels = peers.values().flat_map(|entry| {
+            entry
+                .state
+                .channels
+                .lock()
+                .values()
+                .filter_map(|channel| match &channel.stats {
+                    ChannelStats::Sub(shared) => {
+                        Some((channel.label.key.clone(), shared.codec.as_ref().map(|codec| codec.name().to_owned())))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
         channels.collect()
     }
 
@@ -722,14 +756,30 @@ impl Gateway {
     async fn end_leased_subscriptions(&self, keys: &[String], holder: u64) {
         let ended: Vec<(Arc<PeerState>, Option<u64>, String)> = {
             let peers = self.peers.lock();
-            peers.iter().filter(|(peer_id, _)| **peer_id != holder).flat_map(|(peer_id, entry)| entry.state.channels.lock().values().filter_map(|channel| match &channel.stats {
-                ChannelStats::Sub(shared) if !shared.is_closed() && let Some(reason) = self.leases.subscribe_blocker(*peer_id, &channel.label.key) && crate::auth::overlaps(keys, std::slice::from_ref(&channel.label.key)) => {
-                    shared.leased_away.store(true, Ordering::Relaxed);
-                    shared.close();
-                    Some((entry.state.clone(), channel.label.id, reason))
-                }
-                _ => None,
-            }).collect::<Vec<_>>()).collect()
+            peers
+                .iter()
+                .filter(|(peer_id, _)| **peer_id != holder)
+                .flat_map(|(peer_id, entry)| {
+                    entry
+                        .state
+                        .channels
+                        .lock()
+                        .values()
+                        .filter_map(|channel| match &channel.stats {
+                            ChannelStats::Sub(shared)
+                                if !shared.is_closed()
+                                    && let Some(reason) = self.leases.subscribe_blocker(*peer_id, &channel.label.key)
+                                    && crate::auth::overlaps(keys, std::slice::from_ref(&channel.label.key)) =>
+                            {
+                                shared.leased_away.store(true, Ordering::Relaxed);
+                                shared.close();
+                                Some((entry.state.clone(), channel.label.id, reason))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
         };
         for (state, sub_id, reason) in ended {
             info!("peer {}: subscription {sub_id:?} ended: {reason}", state.peer_id);
@@ -750,7 +800,8 @@ impl Gateway {
 
     /// Closes every connection made with `token`.
     pub fn revoke(&self, token: &str) -> usize {
-        let revoked: Vec<u64> = self.peers.lock().iter().filter(|(_, entry)| entry.state.token.as_deref() == Some(token)).map(|(id, _)| *id).collect();
+        let revoked: Vec<u64> =
+            self.peers.lock().iter().filter(|(_, entry)| entry.state.token.as_deref() == Some(token)).map(|(id, _)| *id).collect();
         for peer_id in &revoked {
             self.drop_peer(*peer_id, "revoked");
         }
@@ -758,12 +809,23 @@ impl Gateway {
     }
 
     /// Non-trickle signaling: take an offer, return an answer with all our candidates in it.
-    pub async fn answer(self: &Arc<Self>, offer: RTCSessionDescription, token: Option<String>, grant: Grant) -> anyhow::Result<RTCSessionDescription> {
+    pub async fn answer(
+        self: &Arc<Self>,
+        offer: RTCSessionDescription,
+        token: Option<String>,
+        grant: Grant,
+    ) -> anyhow::Result<RTCSessionDescription> {
         let peer_id = self.next_peer.fetch_add(1, Ordering::Relaxed);
         self.answer_as(peer_id, offer, token, grant).await
     }
 
-    async fn answer_as(self: &Arc<Self>, peer_id: u64, offer: RTCSessionDescription, token: Option<String>, grant: Grant) -> anyhow::Result<RTCSessionDescription> {
+    async fn answer_as(
+        self: &Arc<Self>,
+        peer_id: u64,
+        offer: RTCSessionDescription,
+        token: Option<String>,
+        grant: Grant,
+    ) -> anyhow::Result<RTCSessionDescription> {
         let request = ice::IceRequest { side: ice::IceSide::Gateway, token: token.clone() };
         let (gathered_tx, mut gathered_rx) = mpsc::channel::<()>(1);
         let (media_engine, interceptors, video_rate, sender_reports) = media::media_setup(self.allocation.initial_bandwidth)?;
@@ -799,18 +861,18 @@ impl Gateway {
             .map(|server| RTCIceServer { urls: server.urls, username: server.username, credential: server.credential })
             .collect();
         let handler = Arc::new(Handler { gateway: Arc::downgrade(self), peer_id, gathered_tx, state: Arc::downgrade(&state) });
-        let setting_engine = SettingEngineBuilder::new()
-            .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_MESSAGE_SIZE))
-            .build();
-        let peer_connection: Arc<dyn PeerConnection> = Arc::new(PeerConnectionBuilder::new()
-            .with_configuration(RTCConfigurationBuilder::new().with_ice_servers(ice_servers).build())
-            .with_setting_engine(setting_engine)
-            .with_media_engine(media_engine)
-            .with_interceptor_registry(interceptors)
-            .with_handler(handler)
-            .with_udp_addrs(vec![format!("0.0.0.0:{port}"), format!("127.0.0.1:{port}")])
-            .build()
-            .await?);
+        let setting_engine = SettingEngineBuilder::new().with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_MESSAGE_SIZE)).build();
+        let peer_connection: Arc<dyn PeerConnection> = Arc::new(
+            PeerConnectionBuilder::new()
+                .with_configuration(RTCConfigurationBuilder::new().with_ice_servers(ice_servers).build())
+                .with_setting_engine(setting_engine)
+                .with_media_engine(media_engine)
+                .with_interceptor_registry(interceptors)
+                .with_handler(handler)
+                .with_udp_addrs(vec![format!("0.0.0.0:{port}"), format!("127.0.0.1:{port}")])
+                .build()
+                .await?,
+        );
         pending.connection = Some(peer_connection.clone());
         peer_connection.set_remote_description(offer).await?;
         let answer = peer_connection.create_answer(None).await?;
@@ -818,10 +880,7 @@ impl Gateway {
         if tokio::time::timeout(GATHER_TIMEOUT, gathered_rx.recv()).await.is_err() {
             warn!("peer {peer_id}: ICE gathering timed out, answering with what we have");
         }
-        let local = peer_connection
-            .local_description()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("no local description"))?;
+        let local = peer_connection.local_description().await.ok_or_else(|| anyhow::anyhow!("no local description"))?;
         let connection = peer_connection;
         *state.connection.lock() = Some(connection.clone());
         let gateway = Arc::downgrade(self);
@@ -845,7 +904,9 @@ impl Gateway {
                 () = tokio::time::sleep(connect_timeout) => {}
                 () = watched.wait_gone() => return,
             }
-            if !watched.ever_connected.load(Ordering::Relaxed) && let Some(gateway) = gateway.upgrade() {
+            if !watched.ever_connected.load(Ordering::Relaxed)
+                && let Some(gateway) = gateway.upgrade()
+            {
                 gateway.drop_peer(peer_id, "never connected");
             }
         });
@@ -994,7 +1055,10 @@ impl PeerConnectionEventHandler for Handler {
                 let Some(outage) = state.upgrade().map(|state| state.disconnects.fetch_add(1, Ordering::Relaxed) + 1) else { return };
                 tokio::spawn(async move {
                     tokio::time::sleep(grace).await;
-                    let still_down = state.upgrade().is_some_and(|state| state.disconnects.load(Ordering::Relaxed) == outage && *state.connection_state.lock() != Some(RTCPeerConnectionState::Connected));
+                    let still_down = state.upgrade().is_some_and(|state| {
+                        state.disconnects.load(Ordering::Relaxed) == outage
+                            && *state.connection_state.lock() != Some(RTCPeerConnectionState::Connected)
+                    });
                     if still_down && let Some(gateway) = gateway.upgrade() {
                         gateway.drop_peer(peer_id, "disconnected");
                     }
@@ -1085,70 +1149,122 @@ async fn run_channel(dc: Arc<dyn DataChannel>, gateway: std::sync::Weak<Gateway>
     let register = |opts: Value, stats: ChannelStats| {
         state.channels.lock().insert(entry_id, ChannelEntry { label: label.clone(), opts, stats });
     };
-    let work = async { match label.kind.as_str() {
-        "sub" => match state.access().check(crate::auth::Action::Subscribe, &label.key).and_then(|()| SubOpts::parse(&label.opts)).and_then(|mut opts| {
-            let resolved = opts.resolve_encoding(&state.codecs)?;
-            let track = bind_track(&state, &resolved, &label)?;
-            Ok((opts, resolved, track))
-        }) {
-            Ok((opts, resolved, track)) => {
-                let shared = Arc::new(SubShared::new(&opts, resolved, state.codecs.clone(), state.gate.clone(), state.config.reliable_max_backlog, state.config.stream_decode_backlog));
-                register(opts.normalized(matches!(shared.channel, Channel::Video(_))), ChannelStats::Sub(shared.clone()));
-                // checked once registered, so a lease taken meanwhile either sees this subscription or is seen here
-                if let Some(reason) = state.leases.subscribe_blocker(peer_id, &label.key) {
-                    return Some(reason);
-                }
-                state.leases.changed();
-                state.send_accepted(label.id).await;
-                subscription::run(dc.clone(), label.clone(), session, state.catalog.clone(), shared.clone(), track, state.grant.acl.is_some().then(|| Arc::new(state.grant.clone()))).await;
-                // like a rejected channel, the client closes it itself
-                if shared.leased_away.load(Ordering::Relaxed) {
-                    close_after_client(&dc).await;
-                }
-                None
-            }
-            Err(error) => Some(error),
-        },
-        "pub" => match state.access().check(crate::auth::Action::Publish, &label.key).and_then(|()| PubOpts::parse(&label.opts)).and_then(|opts| {
-            let encoding = microphone_encoding(&state, &label, &opts)?;
-            Ok((opts, encoding))
-        }) {
-            Ok((opts, encoding)) => {
-                let shared = Arc::new(PubShared::default());
-                register(
-                    json!({"delivery": opts.delivery, "priority": opts.priority, "latencyLimit": opts.latency_limit, "encoding": opts.encoding, "sampleRate": opts.sample_rate}),
-                    ChannelStats::Pub(shared.clone()),
-                );
-                state.send_accepted(label.id).await;
-                let (leases, key) = (state.leases.clone(), label.key.clone());
-                let blocker = move || leases.blocker(peer_id, &key);
-                match (encoding, label.mid.as_deref()) {
-                    (Some(encoding), Some(mid)) => {
-                        // the microphone's first packet may come after its channel opens; the channel may close first
-                        let track = tokio::select! {
-                            track = state.take_remote_track(mid) => Some(track),
-                            () = microphone::closed(&dc) => None,
-                        };
-                        if let Some(track) = track {
-                            microphone::run(dc.clone(), label.clone(), opts, session, shared, microphone::Microphone { track, encoding, sender_reports: state.sender_reports.clone(), clock_offset_ms: state.clock_offset_ms.clone() }, blocker).await;
+    let work = async {
+        match label.kind.as_str() {
+            "sub" => {
+                match state.access().check(crate::auth::Action::Subscribe, &label.key).and_then(|()| SubOpts::parse(&label.opts)).and_then(
+                    |mut opts| {
+                        let resolved = opts.resolve_encoding(&state.codecs)?;
+                        let track = bind_track(&state, &resolved, &label)?;
+                        Ok((opts, resolved, track))
+                    },
+                ) {
+                    Ok((opts, resolved, track)) => {
+                        let shared = Arc::new(SubShared::new(
+                            &opts,
+                            resolved,
+                            state.codecs.clone(),
+                            state.gate.clone(),
+                            state.config.reliable_max_backlog,
+                            state.config.stream_decode_backlog,
+                        ));
+                        register(opts.normalized(matches!(shared.channel, Channel::Video(_))), ChannelStats::Sub(shared.clone()));
+                        // checked once registered, so a lease taken meanwhile either sees this subscription or is seen here
+                        if let Some(reason) = state.leases.subscribe_blocker(peer_id, &label.key) {
+                            return Some(reason);
                         }
+                        state.leases.changed();
+                        state.send_accepted(label.id).await;
+                        subscription::run(
+                            dc.clone(),
+                            label.clone(),
+                            session,
+                            state.catalog.clone(),
+                            shared.clone(),
+                            track,
+                            state.grant.acl.is_some().then(|| Arc::new(state.grant.clone())),
+                        )
+                        .await;
+                        // like a rejected channel, the client closes it itself
+                        if shared.leased_away.load(Ordering::Relaxed) {
+                            close_after_client(&dc).await;
+                        }
+                        None
                     }
-                    _ => publisher::run(dc.clone(), label.clone(), opts, session, shared, state.clock_offset_ms.clone(), blocker, state.config.put_timeout).await,
+                    Err(error) => Some(error),
                 }
-                None
             }
-            Err(error) => Some(error),
-        },
-        "heartbeat" => match HeartbeatOpts::parse(&label.opts) {
-            Ok(opts) => {
-                let _ = dc.set_priority(subscription::REAL_TIME_CHANNEL_PRIORITY).await;
-                run_heartbeat(dc.clone(), opts, state.clone()).await;
-                None
+            "pub" => {
+                match state.access().check(crate::auth::Action::Publish, &label.key).and_then(|()| PubOpts::parse(&label.opts)).and_then(
+                    |opts| {
+                        let encoding = microphone_encoding(&state, &label, &opts)?;
+                        Ok((opts, encoding))
+                    },
+                ) {
+                    Ok((opts, encoding)) => {
+                        let shared = Arc::new(PubShared::default());
+                        register(
+                            json!({"delivery": opts.delivery, "priority": opts.priority, "latencyLimit": opts.latency_limit, "encoding": opts.encoding, "sampleRate": opts.sample_rate}),
+                            ChannelStats::Pub(shared.clone()),
+                        );
+                        state.send_accepted(label.id).await;
+                        let (leases, key) = (state.leases.clone(), label.key.clone());
+                        let blocker = move || leases.blocker(peer_id, &key);
+                        match (encoding, label.mid.as_deref()) {
+                            (Some(encoding), Some(mid)) => {
+                                // the microphone's first packet may come after its channel opens; the channel may close first
+                                let track = tokio::select! {
+                                    track = state.take_remote_track(mid) => Some(track),
+                                    () = microphone::closed(&dc) => None,
+                                };
+                                if let Some(track) = track {
+                                    microphone::run(
+                                        dc.clone(),
+                                        label.clone(),
+                                        opts,
+                                        session,
+                                        shared,
+                                        microphone::Microphone {
+                                            track,
+                                            encoding,
+                                            sender_reports: state.sender_reports.clone(),
+                                            clock_offset_ms: state.clock_offset_ms.clone(),
+                                        },
+                                        blocker,
+                                    )
+                                    .await;
+                                }
+                            }
+                            _ => {
+                                publisher::run(
+                                    dc.clone(),
+                                    label.clone(),
+                                    opts,
+                                    session,
+                                    shared,
+                                    state.clock_offset_ms.clone(),
+                                    blocker,
+                                    state.config.put_timeout,
+                                )
+                                .await
+                            }
+                        }
+                        None
+                    }
+                    Err(error) => Some(error),
+                }
             }
-            Err(error) => Some(error),
-        },
-        other => Some(format!("unknown channel type {other:?}")),
-    } };
+            "heartbeat" => match HeartbeatOpts::parse(&label.opts) {
+                Ok(opts) => {
+                    let _ = dc.set_priority(subscription::REAL_TIME_CHANNEL_PRIORITY).await;
+                    run_heartbeat(dc.clone(), opts, state.clone()).await;
+                    None
+                }
+                Err(error) => Some(error),
+            },
+            other => Some(format!("unknown channel type {other:?}")),
+        }
+    };
     // a dropped peer's channels never report their close: without this each waited forever, holding the peer's state
     let rejected = tokio::select! {
         rejected = work => rejected,
@@ -1186,7 +1302,11 @@ async fn close_after_client(dc: &Arc<dyn DataChannel>) {
 }
 
 /// A microphone publisher's encoding (label `mid` + opts `encoding`); `None` for a data-channel publisher.
-fn microphone_encoding(state: &PeerState, label: &Label, opts: &PubOpts) -> Result<Option<Arc<dyn crate::encoding::MessageEncoding>>, String> {
+fn microphone_encoding(
+    state: &PeerState,
+    label: &Label,
+    opts: &PubOpts,
+) -> Result<Option<Arc<dyn crate::encoding::MessageEncoding>>, String> {
     match (&label.mid, &opts.encoding) {
         (None, None) => {
             if opts.sample_rate.is_some() {
@@ -1285,7 +1405,8 @@ fn bind_track(state: &PeerState, resolved: &Resolved, label: &Label) -> Result<O
     };
     let channel = resolved.channel.as_str();
     let mid = label.mid.as_deref().ok_or_else(|| format!("channel {channel}: the label needs the mid of a renegotiated transceiver"))?;
-    let track = state.tracks.lock().get(mid).cloned().ok_or_else(|| format!("no track for mid {mid:?} (renegotiate with the channel first)"))?;
+    let track =
+        state.tracks.lock().get(mid).cloned().ok_or_else(|| format!("no track for mid {mid:?} (renegotiate with the channel first)"))?;
     if track.mime != mime {
         return Err(format!("track {mid:?} carries {}, channel {channel} needs {mime}", track.mime));
     }
@@ -1297,9 +1418,15 @@ fn bind_track(state: &PeerState, resolved: &Resolved, label: &Label) -> Result<O
 /// share of the data-channel estimate is bandwidth they cannot use. Granting it anyway made the
 /// encoders outrun the pacer, and the excess queued there as latency (seconds, after a subscription
 /// started, while GCC was still climbing from its initial rate). Data streams get what is left.
-fn allocate_within_video_cap(budget: f64, video_cap: f64, demands: Vec<allocator::Demand>, is_video: &[bool]) -> Vec<allocator::Allocation> {
+fn allocate_within_video_cap(
+    budget: f64,
+    video_cap: f64,
+    demands: Vec<allocator::Demand>,
+    is_video: &[bool],
+) -> Vec<allocator::Allocation> {
     let joint = allocator::allocate(budget, &demands);
-    let video_total: f64 = joint.iter().zip(is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
+    let video_total: f64 =
+        joint.iter().zip(is_video).filter(|(_, video)| **video).map(|(allocation, _)| allocation.budget_bytes_per_sec).sum();
     if video_total <= video_cap * (1.0 + 1e-9) {
         return joint;
     }
@@ -1444,7 +1571,13 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             let limit = state.config.put_timeout + if slow { Duration::from_millis(api::MAX_GET_TIMEOUT_MS) } else { Duration::ZERO };
             let task = async move {
                 let id = request.id.clone();
-                let context = api::Context { session: &state.session, access: state.access(), api: &state.api, events: state.api_events.clone(), put_timeout: state.config.put_timeout };
+                let context = api::Context {
+                    session: &state.session,
+                    access: state.access(),
+                    api: &state.api,
+                    events: state.api_events.clone(),
+                    put_timeout: state.config.put_timeout,
+                };
                 let response = tokio::select! {
                     response = tokio::time::timeout(limit, api::handle(context, request)) => response.unwrap_or_else(|_| fail(&id, format!("timed out after {limit:?}"))),
                     // a peer that left takes its pending ops with it (each held its state)
@@ -1496,11 +1629,15 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 let clock = json!({"offsetMs": *state.clock_offset_ms.lock(), "rttMs": *state.rtt_ms.lock()});
                 let heartbeat = json!(state.heartbeat.lock().clone());
                 let bandwidth = json!(state.bandwidth.lock().clone());
-                ok(&request.id, json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "bandwidth": bandwidth, "memory": state.memory_counts()}))
+                ok(
+                    &request.id,
+                    json!({"channels": collect_stats(&state), "clock": clock, "heartbeat": heartbeat, "bandwidth": bandwidth, "memory": state.memory_counts()}),
+                )
             }
             "setDeadman" => set_deadman(&state, &request).await,
             "encodings" => {
-                let encodings: Vec<Value> = state.codecs.list().map(|(name, output)| json!({"name": name, "output": output.as_str()})).collect();
+                let encodings: Vec<Value> =
+                    state.codecs.list().map(|(name, output)| json!({"name": name, "output": output.as_str()})).collect();
                 // features: what a page may use beyond 0.5.31 (the subscribe option `metadata`)
                 ok(&request.id, json!({"encodings": encodings, "features": ["metadata"]}))
             }
@@ -1512,7 +1649,9 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
             }
             "updateSubscription" => update_subscription(&state, &request),
             "setLinkBandwidth" => match request.bytes_per_sec {
-                Some(known) if !(known.is_finite() && known > 0.0) => fail(&request.id, format!("bytesPerSec must be a positive number of bytes/s, got {known}")),
+                Some(known) if !(known.is_finite() && known > 0.0) => {
+                    fail(&request.id, format!("bytesPerSec must be a positive number of bytes/s, got {known}"))
+                }
                 // a page through a tunnel (ssh -L) is on 127.0.0.1 too, but its media comes over the network: no known speed then
                 Some(_) if let Some(remote) = remote_address(&state).await.filter(|remote| !on_this_machine(remote)) => {
                     fail(&request.id, format!("the page is at {remote}, not on this machine: the link's speed is estimated"))
@@ -1523,9 +1662,16 @@ async fn run_control(dc: Arc<dyn DataChannel>, state: Arc<PeerState>) {
                 }
             },
             "resumeLink" => match request.link_id {
-                Some(link_id) if link_id.is_empty() || link_id.len() > MAX_LINK_ID_LEN => fail(&request.id, format!("linkId must be 1-{MAX_LINK_ID_LEN} bytes")),
+                Some(link_id) if link_id.is_empty() || link_id.len() > MAX_LINK_ID_LEN => {
+                    fail(&request.id, format!("linkId must be 1-{MAX_LINK_ID_LEN} bytes"))
+                }
                 Some(link_id) => {
-                    let seed = state.link_seeds.lock().get(&link_id).filter(|(_, at)| at.elapsed() < state.config.link_memory).map(|(seed, _)| *seed);
+                    let seed = state
+                        .link_seeds
+                        .lock()
+                        .get(&link_id)
+                        .filter(|(_, at)| at.elapsed() < state.config.link_memory)
+                        .map(|(seed, _)| *seed);
                     let seeded = seed.filter(|seed| state.link.lock().seeded(*seed));
                     *state.link_id.lock() = Some(link_id);
                     ok(&request.id, json!({"seededBytesPerSec": seeded.map(|seed| seed.bandwidth_bytes_per_sec)}))
@@ -1647,13 +1793,25 @@ fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
     let slowest = state.leases.slowest_heartbeat.as_secs_f64();
     match timeout {
         Some(timeout) if timeout.as_secs_f64() > slowest => {
-            return fail(&request.id, format!("timeoutMs must be at most {} (the server's slowest lease heartbeat), got {}", slowest * 1000.0, timeout.as_secs_f64() * 1000.0));
+            return fail(
+                &request.id,
+                format!(
+                    "timeoutMs must be at most {} (the server's slowest lease heartbeat), got {}",
+                    slowest * 1000.0,
+                    timeout.as_secs_f64() * 1000.0
+                ),
+            );
         }
         Some(_) => {}
         None => {
             let deadline_secs = heartbeat.misses as f64 / heartbeat.hz;
             if deadline_secs > slowest {
-                return fail(&request.id, format!("a lease needs a heartbeat deadline (heartbeatMisses / heartbeatHz, or timeoutMs) of at most {slowest} s, got {deadline_secs} s"));
+                return fail(
+                    &request.id,
+                    format!(
+                        "a lease needs a heartbeat deadline (heartbeatMisses / heartbeatHz, or timeoutMs) of at most {slowest} s, got {deadline_secs} s"
+                    ),
+                );
             }
         }
     }
@@ -1692,7 +1850,10 @@ fn take_lease(state: &Arc<PeerState>, request: &ControlRequest) -> Value {
             info!("peer {}: leased {group:?} publish {publish:?} subscribe {subscribe:?}", state.peer_id);
             let expires_in_ms = expires_in.map(|after| after.as_millis() as u64);
             let timeout_ms = timeout.map(|timeout| timeout.as_secs_f64() * 1000.0);
-            ok(&request.id, json!({"group": group, "keys": publish, "publish": publish, "subscribe": subscribe, "expiresInMs": expires_in_ms, "timeoutMs": timeout_ms}))
+            ok(
+                &request.id,
+                json!({"group": group, "keys": publish, "publish": publish, "subscribe": subscribe, "expiresInMs": expires_in_ms, "timeoutMs": timeout_ms}),
+            )
         }
         Err(error) => fail(&request.id, error),
     }
@@ -1756,7 +1917,12 @@ async fn set_deadman(state: &PeerState, request: &ControlRequest) -> Value {
 ///
 /// The catalog answers at once; a non-zero `probe` also subscribes to `filter` that long (catching quiet,
 /// undeclared publishers) and remembers what it saw. Plain publishers without a token are seen only by their samples.
-async fn list_topics(session: &zenoh::Session, catalog: &Arc<crate::catalog::TopicCatalog>, filter: &str, probe: Duration) -> anyhow::Result<Vec<Value>> {
+async fn list_topics(
+    session: &zenoh::Session,
+    catalog: &Arc<crate::catalog::TopicCatalog>,
+    filter: &str,
+    probe: Duration,
+) -> anyhow::Result<Vec<Value>> {
     let filter_expr = zenoh::key_expr::KeyExpr::try_from(filter).map_err(|e| anyhow::anyhow!("{e}"))?;
     // probe 0 = no subscription, so publishers that only send while matched (matching listeners) aren't woken by a listing
     if !probe.is_zero() {
@@ -1791,7 +1957,12 @@ async fn list_topics(session: &zenoh::Session, catalog: &Arc<crate::catalog::Top
     Ok(crate::catalog::to_json(found))
 }
 
-async fn handle_list_topics(session: &zenoh::Session, catalog: &Arc<crate::catalog::TopicCatalog>, request: &ControlRequest, grant: &Grant) -> Value {
+async fn handle_list_topics(
+    session: &zenoh::Session,
+    catalog: &Arc<crate::catalog::TopicCatalog>,
+    request: &ControlRequest,
+    grant: &Grant,
+) -> Value {
     let filter = if request.key.is_empty() { "**" } else { &request.key };
     match list_topics(session, catalog, filter, Duration::from_millis(request.probe_ms.unwrap_or(0).min(MAX_LIST_PROBE_MS))).await {
         Ok(mut topics) => {
@@ -1829,17 +2000,27 @@ mod tests {
     }
 
     fn stream(bytes_per_message: f64, hz: f64) -> allocator::Demand {
-        allocator::Demand { priority: 1.0, max_hz: hz, quality_range: None, tradeoff: 0.5, price: Box::new(move |_| bytes_per_message), fixed_bytes_per_sec: None, shrinks_last: false }
+        allocator::Demand {
+            priority: 1.0,
+            max_hz: hz,
+            quality_range: None,
+            tradeoff: 0.5,
+            price: Box::new(move |_| bytes_per_message),
+            fixed_bytes_per_sec: None,
+            shrinks_last: false,
+        }
     }
 
     #[test]
     fn video_gets_no_more_than_its_cap_and_data_gets_the_rest() {
         // budget 1 MB/s; the video stream wants 500 KB/s but GCC allows 100 KB/s; data wants 500 KB/s
-        let allocations = allocate_within_video_cap(1_000_000.0, 100_000.0, vec![stream(50_000.0, 10.0), stream(50_000.0, 10.0)], &[true, false]);
+        let allocations =
+            allocate_within_video_cap(1_000_000.0, 100_000.0, vec![stream(50_000.0, 10.0), stream(50_000.0, 10.0)], &[true, false]);
         assert!(allocations[0].budget_bytes_per_sec <= 100_000.0 + 1e-6, "{:?}", allocations[0]);
         assert_eq!(allocations[1].budget_bytes_per_sec, 500_000.0, "{:?}", allocations[1]);
         // under the cap nothing changes
-        let allocations = allocate_within_video_cap(1_000_000.0, 600_000.0, vec![stream(50_000.0, 10.0), stream(50_000.0, 10.0)], &[true, false]);
+        let allocations =
+            allocate_within_video_cap(1_000_000.0, 600_000.0, vec![stream(50_000.0, 10.0), stream(50_000.0, 10.0)], &[true, false]);
         assert_eq!((allocations[0].budget_bytes_per_sec, allocations[1].budget_bytes_per_sec), (500_000.0, 500_000.0));
     }
 

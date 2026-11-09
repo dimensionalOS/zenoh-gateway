@@ -1,13 +1,16 @@
 //! The server's message encodings by name, its video encoders by format, and the caches that share decodes and
 //! encodes across frontends.
 
-use super::{Channel, Compress, DecodedFrame, EncodeOptions, EncodingOutput, EncodingSample, H264Encoder, MessageEncoding, VideoEncoder, VideoFormat, VideoPolicy};
+use super::{
+    Channel, Compress, DecodedFrame, EncodeOptions, EncodingOutput, EncodingSample, H264Encoder, MessageEncoding, VideoEncoder,
+    VideoFormat, VideoPolicy,
+};
 use anyhow::{Result, ensure};
+use parking_lot::{Condvar, Mutex};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use parking_lot::{Condvar, Mutex};
 
 /// Encoded results kept for sharing (they are small).
 const ENCODED_CAPACITY: usize = 64;
@@ -179,7 +182,11 @@ impl EncodingRegistry {
     }
 
     /// The server's video encoders (by the format each makes) and default policy.
-    pub fn with_video(self, video_encoders: impl IntoIterator<Item = (VideoFormat, VideoEncoderFactory)>, video_policy: VideoPolicy) -> Self {
+    pub fn with_video(
+        self,
+        video_encoders: impl IntoIterator<Item = (VideoFormat, VideoEncoderFactory)>,
+        video_policy: VideoPolicy,
+    ) -> Self {
         EncodingRegistry { video_encoders: video_encoders.into_iter().collect(), video_policy, ..self }
     }
 
@@ -199,7 +206,10 @@ impl EncodingRegistry {
 
     /// The encoding called `name`, or the error a subscription is rejected with.
     pub fn get(&self, name: &str) -> Result<Arc<dyn MessageEncoding>, String> {
-        self.codecs.get(name).cloned().ok_or_else(|| format!("unknown encoding {name:?} (known: {})", self.codecs.keys().cloned().collect::<Vec<_>>().join(", ")))
+        self.codecs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("unknown encoding {name:?} (known: {})", self.codecs.keys().cloned().collect::<Vec<_>>().join(", ")))
     }
 
     /// Every encoding's (name, output on its default channel), sorted by name.
@@ -220,7 +230,13 @@ impl EncodingRegistry {
         (self.decoded.len(), self.encoded.len())
     }
 
-    pub fn decode_shared(&self, codec: &dyn MessageEncoding, sample: &EncodingSample<'_>, hash: u64, channel: Channel) -> (Result<Arc<DecodedFrame>, String>, bool) {
+    pub fn decode_shared(
+        &self,
+        codec: &dyn MessageEncoding,
+        sample: &EncodingSample<'_>,
+        hash: u64,
+        channel: Channel,
+    ) -> (Result<Arc<DecodedFrame>, String>, bool) {
         self.decoded.get_or_compute((codec.name().to_owned(), channel, hash), self.encode_timeout, || {
             // a picture goes with its sample's header even when the decode left it out
             match codec.decode(sample, channel).map_err(|error| format!("{error:#}"))? {
@@ -235,8 +251,21 @@ impl EncodingRegistry {
 
     /// Blocking: a data encoding's bytes for `sample` with `options`, compressed as asked (or another frontend's).
     /// `true` = reused.
-    pub fn encode_shared(&self, codec: &dyn MessageEncoding, sample: &EncodingSample<'_>, hash: u64, options: &EncodeOptions, compress: Compress) -> (Result<Arc<Encoded>, String>, bool) {
-        let key = (codec.name().to_owned(), quality_bucket(options.quality), serde_json::Value::Object(options.options.clone()).to_string(), hash, compress);
+    pub fn encode_shared(
+        &self,
+        codec: &dyn MessageEncoding,
+        sample: &EncodingSample<'_>,
+        hash: u64,
+        options: &EncodeOptions,
+        compress: Compress,
+    ) -> (Result<Arc<Encoded>, String>, bool) {
+        let key = (
+            codec.name().to_owned(),
+            quality_bucket(options.quality),
+            serde_json::Value::Object(options.options.clone()).to_string(),
+            hash,
+            compress,
+        );
         self.encoded.get_or_compute(key, self.encode_timeout, || {
             let (frame, _) = self.decode_shared(codec, sample, hash, Channel::Data);
             let bytes = codec.encode(&*frame?, options).map_err(|error| format!("{error:#}"))?;
@@ -274,7 +303,8 @@ mod tests {
         }
         let error = registry.get("missing").err().unwrap();
         assert!(error.contains("unknown encoding") && error.contains("other") && error.contains("custom"), "{error}");
-        let duplicate = EncodingRegistry::new([Arc::new(Named("custom")) as Arc<dyn MessageEncoding>, Arc::new(Named("custom"))]).err().unwrap();
+        let duplicate =
+            EncodingRegistry::new([Arc::new(Named("custom")) as Arc<dyn MessageEncoding>, Arc::new(Named("custom"))]).err().unwrap();
         assert!(duplicate.to_string().contains("registered twice"), "{duplicate}");
         assert!(EncodingRegistry::new([Arc::new(Named("")) as Arc<dyn MessageEncoding>]).is_err());
     }
@@ -328,9 +358,13 @@ mod tests {
         assert_eq!((*fresh.unwrap(), shared), (11, false), "the hung entry is gone: computed afresh");
         release_tx.send(()).unwrap();
         assert_eq!(*hung.join().unwrap().0.unwrap(), 10);
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cache.get_or_compute(2, DEFAULT_ENCODE_TIMEOUT, || panic!("boom"))));
+        let panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cache.get_or_compute(2, DEFAULT_ENCODE_TIMEOUT, || panic!("boom"))));
         assert!(panicked.is_err());
-        assert!(cache.get_or_compute(2, DEFAULT_ENCODE_TIMEOUT, || Ok(0)).0.is_err(), "a panicked compute is settled as an error, not waited on");
+        assert!(
+            cache.get_or_compute(2, DEFAULT_ENCODE_TIMEOUT, || Ok(0)).0.is_err(),
+            "a panicked compute is settled as an error, not waited on"
+        );
     }
 
     #[test]
@@ -377,7 +411,10 @@ mod tests {
         let (plain, zstd) = (plain.unwrap(), zstd.unwrap());
         assert!(!reused && !plain.compressed && zstd.compressed && zstd.bytes.len() < plain.bytes.len() / 10);
         assert_eq!(zstd::bulk::decompress(&zstd.bytes, 3000).unwrap(), plain.bytes);
-        assert!(registry.encode_shared(&Repeat, &sample, hash, &EncodeOptions::quality(1.0), Compress::Zstd).1, "same compression is shared");
+        assert!(
+            registry.encode_shared(&Repeat, &sample, hash, &EncodeOptions::quality(1.0), Compress::Zstd).1,
+            "same compression is shared"
+        );
         let tiny = EncodingSample::new("a/b", b"", &encoding);
         let (tiny, _) = registry.encode_shared(&Repeat, &tiny, sample_hash(&tiny), &EncodeOptions::quality(1.0), Compress::Zstd);
         assert!(!tiny.unwrap().compressed, "a message zstd would grow is sent as is");

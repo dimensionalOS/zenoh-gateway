@@ -44,7 +44,12 @@ enum Leave {
 async fn wait_for(what: &str, limit: Duration, done: impl Fn() -> bool) {
     let started = Instant::now();
     while !done() {
-        assert!(started.elapsed() < limit, "{what}: still {} live peer states after {limit:?} (RSS {:.0} MB)", zenoh_gateway::live_peer_states(), rss_mb());
+        assert!(
+            started.elapsed() < limit,
+            "{what}: still {} live peer states after {limit:?} (RSS {:.0} MB)",
+            zenoh_gateway::live_peer_states(),
+            rss_mb()
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -79,9 +84,14 @@ async fn connections_that_come_and_go_leave_nothing_behind() {
     for batch in 0..batches {
         for round in 0..12 {
             let leave = [Leave::Close, Leave::Drop, Leave::Frozen][round % 3];
-            let client = Client::connect(&url, ClientOptions { heartbeat_hz: 10.0, heartbeat_misses: 3, ..Default::default() }).await.unwrap();
-            let mut camera = client.subscribe("camera/front", SubscribeOptions { encoding: Some("test-solid".into()), ..Default::default() }).await.unwrap();
-            let mut map = client.subscribe("map/local", SubscribeOptions { delivery: Some(Delivery::Reliable), ..Default::default() }).await.unwrap();
+            let client =
+                Client::connect(&url, ClientOptions { heartbeat_hz: 10.0, heartbeat_misses: 3, ..Default::default() }).await.unwrap();
+            let mut camera = client
+                .subscribe("camera/front", SubscribeOptions { encoding: Some("test-solid".into()), ..Default::default() })
+                .await
+                .unwrap();
+            let mut map =
+                client.subscribe("map/local", SubscribeOptions { delivery: Some(Delivery::Reliable), ..Default::default() }).await.unwrap();
             let publisher = client.publish("cmd/test", PublisherOptions::default()).await.unwrap();
             publisher.set_deadman(b"stop").await.unwrap();
             for subscription in [&mut camera, &mut map] {
@@ -109,7 +119,8 @@ async fn connections_that_come_and_go_leave_nothing_behind() {
     // offers that fail once their connection is built (here a malformed SDP) must not leave it running
     let http = reqwest::Client::new();
     for _ in 0..5 {
-        let response = http.post(format!("{url}/offer")).json(&serde_json::json!({"type": "offer", "sdp": "v=0\r\n"})).send().await.unwrap();
+        let response =
+            http.post(format!("{url}/offer")).json(&serde_json::json!({"type": "offer", "sdp": "v=0\r\n"})).send().await.unwrap();
         assert!(!response.status().is_success(), "a malformed offer is refused");
     }
     wait_for("after 5 failed offers", Duration::from_secs(10), || zenoh_gateway::live_peer_states() == 0).await;

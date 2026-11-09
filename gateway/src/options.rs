@@ -142,7 +142,9 @@ impl SubOpts {
             None => None,
             Some(value) => Some(value.as_f64().ok_or_else(|| format!("encodeOptions.quality must be a number, got {value}"))?),
         };
-        for (name, value) in [("minQuality", parsed.min_quality), ("encodeOptions.quality", quality), ("qualityToHzTradeoff", parsed.quality_to_hz_tradeoff)] {
+        for (name, value) in
+            [("minQuality", parsed.min_quality), ("encodeOptions.quality", quality), ("qualityToHzTradeoff", parsed.quality_to_hz_tradeoff)]
+        {
             check(name, value, |v| (0.0..=1.0).contains(&v), "within 0..1")?;
         }
         if parsed.min_quality.unwrap_or(0.0) > quality.unwrap_or(1.0) {
@@ -189,7 +191,10 @@ impl SubOpts {
                 || self.max_qp.is_some()
                 || self.playout_delay.is_some())
         {
-            return Err(format!("maxBitrate, minResolutionScale, minResolution, maxResolution, frameDropping, keyframeIntervalMs, sceneChangeKeyframes, targetQp, maxQp and playoutDelay are for video channels, not {}", channel.as_str()));
+            return Err(format!(
+                "maxBitrate, minResolutionScale, minResolution, maxResolution, frameDropping, keyframeIntervalMs, sceneChangeKeyframes, targetQp, maxQp and playoutDelay are for video channels, not {}",
+                channel.as_str()
+            ));
         }
         if let Channel::Video(format) = channel {
             registry.video_encoder(&*encoding, format)?;
@@ -391,9 +396,18 @@ mod tests {
         assert!(sub(r#"{"maxQuality":0.5}"#).is_err(), "maxQuality is encodeOptions.quality now");
         assert!(sub(r#"{"codec":"camera"}"#).is_err(), "codec is encoding now");
         assert!(sub(r#"{"qualityToHzTradeoff":2}"#).is_err());
-        let encodings = [Arc::new(Named("camera", EncodingOutput::Video)) as Arc<dyn MessageEncoding>, Arc::new(Named("table", EncodingOutput::Data)), Arc::new(Named("mic", EncodingOutput::Audio)), Arc::new(Flexible)];
+        let encodings = [
+            Arc::new(Named("camera", EncodingOutput::Video)) as Arc<dyn MessageEncoding>,
+            Arc::new(Named("table", EncodingOutput::Data)),
+            Arc::new(Named("mic", EncodingOutput::Audio)),
+            Arc::new(Flexible),
+        ];
         let registry = EncodingRegistry::new(encodings).unwrap();
-        let resolve = |opts: &str| sub(opts)?.resolve_encoding(&registry).map(|resolved| (resolved.encoding.map(|encoding| encoding.name().to_owned()), resolved.channel.as_str(), resolved.output));
+        let resolve = |opts: &str| {
+            sub(opts)?
+                .resolve_encoding(&registry)
+                .map(|resolved| (resolved.encoding.map(|encoding| encoding.name().to_owned()), resolved.channel.as_str(), resolved.output))
+        };
         let compress = |opts: &str| {
             let mut parsed = sub(opts)?;
             parsed.resolve_encoding(&registry)?;
@@ -406,17 +420,27 @@ mod tests {
         assert_eq!(resolve(r#"{"encoding":"camera"}"#).unwrap().1, "video-h264", "video goes on H.264 by default");
         assert_eq!(resolve(r#"{"encoding":"mic"}"#).unwrap().1, "audio-opus");
         assert!(resolve(r#"{"encoding":"camera","channel":"video-vp8"}"#).unwrap_err().contains("no video-vp8 encoder"));
-        assert!(resolve(r#"{"encoding":"camera","channel":"data"}"#).unwrap_err().contains("not on channel data"), "by default only its own channel");
+        assert!(
+            resolve(r#"{"encoding":"camera","channel":"data"}"#).unwrap_err().contains("not on channel data"),
+            "by default only its own channel"
+        );
         // H.265 is only ever passed through, so a server reaches it through the encoding's own encoder or not at all
         assert!(resolve(r#"{"encoding":"camera","channel":"video-h265"}"#).unwrap_err().contains("no video-h265 encoder"));
         assert!(resolve(r#"{"encoding":"camera","channel":"video-h266"}"#).unwrap_err().contains("unknown channel"));
         assert!(resolve(r#"{"encoding":"table","encodeOptions":{"format":"x"}}"#).unwrap_err().contains("takes no encodeOptions"));
         assert_eq!(resolve(r#"{"encoding":"table","encodeOptions":{"quality":0.5}}"#).unwrap().1, "data", "quality is always allowed");
-        assert_eq!(resolve(r#"{"encoding":"flexible","channel":"data","encodeOptions":{"format":"a"}}"#).unwrap(), (Some("flexible".into()), "data", EncodingOutput::Data));
+        assert_eq!(
+            resolve(r#"{"encoding":"flexible","channel":"data","encodeOptions":{"format":"a"}}"#).unwrap(),
+            (Some("flexible".into()), "data", EncodingOutput::Data)
+        );
         assert!(resolve(r#"{"encoding":"flexible","channel":"data","encodeOptions":{"format":"c"}}"#).is_err());
         assert!(resolve(r#"{"channel":"video-h264"}"#).unwrap_err().contains("needs an encoding"));
         assert!(resolve(r#"{"encodeOptions":{"quality":0.5}}"#).unwrap_err().contains("need an encoding"));
-        assert_eq!(sub(r#"{"encoding":"flexible","encodeOptions":{"quality":0.4,"format":"a"}}"#).unwrap().encoding_options(), serde_json::from_str::<serde_json::Map<String, Value>>(r#"{"format":"a"}"#).unwrap(), "the encoding doesn't see quality");
+        assert_eq!(
+            sub(r#"{"encoding":"flexible","encodeOptions":{"quality":0.4,"format":"a"}}"#).unwrap().encoding_options(),
+            serde_json::from_str::<serde_json::Map<String, Value>>(r#"{"format":"a"}"#).unwrap(),
+            "the encoding doesn't see quality"
+        );
         assert!(sub(r#"{"imageTransport":"jpeg"}"#).is_err(), "JPEG files are gone");
         assert_eq!(compress(r#"{}"#).unwrap(), "none");
         assert_eq!(compress(r#"{"compress":"zstd"}"#).unwrap(), "zstd", "raw topics compress too");
@@ -444,9 +468,13 @@ mod tests {
         assert_eq!((encoder.frame_dropping, encoder.keyframe_interval), (false, std::time::Duration::from_secs(2)));
         assert!(sub(r#"{"keyframeIntervalMs":0}"#).is_err());
         assert!(sub(r#"{"minResolution":[8,64]}"#).is_err());
-        let full = sub(r#"{"bandwidthPriority":2,"maxHz":20,"minQuality":0.3,"encodeOptions":{"quality":0.9},"qualityToHzTradeoff":0.7}"#).unwrap();
+        let full = sub(r#"{"bandwidthPriority":2,"maxHz":20,"minQuality":0.3,"encodeOptions":{"quality":0.9},"qualityToHzTradeoff":0.7}"#)
+            .unwrap();
         assert_eq!(full.quality_range(), (0.3, 0.9));
-        assert_eq!((full.normalized(false)["bandwidthPriority"].as_f64(), full.normalized(true)["qualityToHzTradeoff"].as_f64()), (Some(2.0), Some(0.7)));
+        assert_eq!(
+            (full.normalized(false)["bandwidthPriority"].as_f64(), full.normalized(true)["qualityToHzTradeoff"].as_f64()),
+            (Some(2.0), Some(0.7))
+        );
         assert_eq!(full.min_interval(), Some(Duration::from_millis(50)));
         // a page can ask for any positive number: none of them may panic a Duration
         assert_eq!(sub(r#"{"maxHz":1e-300}"#).unwrap().min_interval(), Some(Duration::from_secs(86_400)));

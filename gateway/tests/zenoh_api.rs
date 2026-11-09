@@ -4,7 +4,8 @@
 use std::time::Duration;
 use tokio::time::timeout;
 use zenoh_gateway::client::{
-    Client, ClientOptions, CongestionControl, ConsolidationMode, GetOptions, MatchingTarget, Message, PutOptions, QueryTarget, SubscribeOptions,
+    Client, ClientOptions, CongestionControl, ConsolidationMode, GetOptions, MatchingTarget, Message, PutOptions, QueryTarget,
+    SubscribeOptions,
 };
 use zenoh_gateway::{Grant, RunningServer, Server, zenoh};
 
@@ -109,8 +110,10 @@ async fn get_with_options_and_rich_replies() {
     assert_eq!(deleted.key.as_deref(), Some("api/get/two"));
 
     // a querier keeps its options; per-call parameters go on top
-    let querier =
-        client.querier("api/get/*", GetOptions { consolidation: Some(ConsolidationMode::None), timeout: Some(Duration::from_secs(2)), ..Default::default() });
+    let querier = client.querier(
+        "api/get/*",
+        GetOptions { consolidation: Some(ConsolidationMode::None), timeout: Some(Duration::from_secs(2)), ..Default::default() },
+    );
     let replies = querier.get_with(Some("b=2"), None, None).await.unwrap();
     assert_eq!(replies.len(), 3, "no consolidation: the echo, the error and the delete: {replies:?}");
     let echo = replies.iter().find(|reply| !reply.error && !reply.delete).unwrap();
@@ -235,8 +238,10 @@ async fn session_info_is_the_gateways() {
 async fn subscription_messages_carry_kind_encoding_and_attachment() {
     let (running, session, url) = start(None).await;
     let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
-    let mut subscription =
-        client.subscribe("api/meta/**", SubscribeOptions { delivery: Some(zenoh_gateway::client::Delivery::Reliable), ..Default::default() }).await.unwrap();
+    let mut subscription = client
+        .subscribe("api/meta/**", SubscribeOptions { delivery: Some(zenoh_gateway::client::Delivery::Reliable), ..Default::default() })
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     session.put("api/meta/a", "plain").await.unwrap();
     session.put("api/meta/a", "{\"x\":1}").encoding("application/json").attachment("att").await.unwrap();

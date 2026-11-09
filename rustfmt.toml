@@ -1,0 +1,7 @@
+# The style this codebase was already written in, so `cargo fmt --check` is a gate rather than an 11,000-line rewrite.
+# Measured rather than chosen: the code's own lines run to a 90th percentile of 113 columns and a 99th of 163, and
+# structs and calls are written on one line up to the full width. Default rustfmt (100 columns, "Default" heuristics)
+# reformats 11,067 lines of it; this reformats 2,399, which is the difference between describing the house style and
+# replacing it.
+max_width = 140
+use_small_heuristics = "Max"

@@ -148,7 +148,9 @@ impl Fields {
     pub fn scaled<T: Element>(self, name: &str, offset: &[f64], scale: &[f64], values: &[T]) -> Self {
         assert!(T::DTYPE.is_integer(), "fields: scaled field {name:?} must hold integers");
         assert_eq!(offset.len(), scale.len(), "fields: {name:?} needs one offset and one scale per component");
-        self.push(name, (T::DTYPE, offset.len() as u8, values.len()), SCALED, Some((offset, scale)), |out| values.iter().for_each(|value| value.put(out)))
+        self.push(name, (T::DTYPE, offset.len() as u8, values.len()), SCALED, Some((offset, scale)), |out| {
+            values.iter().for_each(|value| value.put(out))
+        })
     }
 
     /// UTF-8 text (the client gets a `string`).
@@ -161,9 +163,19 @@ impl Fields {
         self.bytes
     }
 
-    fn push(mut self, name: &str, (dtype, components, values): (Dtype, u8, usize), flags: u8, scaling: Option<(&[f64], &[f64])>, write: impl FnOnce(&mut Vec<u8>)) -> Self {
+    fn push(
+        mut self,
+        name: &str,
+        (dtype, components, values): (Dtype, u8, usize),
+        flags: u8,
+        scaling: Option<(&[f64], &[f64])>,
+        write: impl FnOnce(&mut Vec<u8>),
+    ) -> Self {
         assert!(name.len() <= 255 && self.bytes[1] < 255, "fields: at most 255 fields with names of at most 255 bytes ({name:?})");
-        assert!((1..=4).contains(&components) && values.is_multiple_of(components as usize), "fields: {name:?} has {values} values, not a whole number of {components}-component elements");
+        assert!(
+            (1..=4).contains(&components) && values.is_multiple_of(components as usize),
+            "fields: {name:?} has {values} values, not a whole number of {components}-component elements"
+        );
         let count = u32::try_from(values / components as usize).expect("fields: more than u32::MAX elements");
         let out = &mut self.bytes;
         out[1] += 1;
@@ -201,13 +213,17 @@ impl Field {
     /// Every value as f64, scaling applied.
     pub fn values(&self) -> Vec<f64> {
         let size = self.dtype.size();
-        self.data.chunks_exact(size).enumerate().map(|(index, bytes)| {
-            let value = self.dtype.read(bytes);
-            match &self.scaling {
-                Some((offset, scale)) => offset[index % offset.len()] + value * scale[index % scale.len()],
-                None => value,
-            }
-        }).collect()
+        self.data
+            .chunks_exact(size)
+            .enumerate()
+            .map(|(index, bytes)| {
+                let value = self.dtype.read(bytes);
+                match &self.scaling {
+                    Some((offset, scale)) => offset[index % offset.len()] + value * scale[index % scale.len()],
+                    None => value,
+                }
+            })
+            .collect()
     }
 
     /// A text field's string.
@@ -235,7 +251,8 @@ pub fn parse(bytes: &[u8]) -> Result<BTreeMap<String, Field>> {
         let Some(&dtype) = Dtype::ALL.get(dtype as usize) else { bail!("field {name:?}: unknown dtype {dtype}") };
         let count = u32::from_le_bytes([a, b, c, d]);
         let scaling = if flags & SCALED != 0 {
-            let numbers: Vec<f64> = take(16 * components as usize, 1)?.as_chunks::<8>().0.iter().map(|bytes| f64::from_le_bytes(*bytes)).collect();
+            let numbers: Vec<f64> =
+                take(16 * components as usize, 1)?.as_chunks::<8>().0.iter().map(|bytes| f64::from_le_bytes(*bytes)).collect();
             Some((numbers[..components as usize].to_vec(), numbers[components as usize..].to_vec()))
         } else {
             None

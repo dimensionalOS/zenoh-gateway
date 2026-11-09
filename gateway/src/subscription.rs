@@ -8,11 +8,11 @@ use crate::frame;
 use crate::options::{Delivery, Label, SubOpts};
 use crate::pacing::SendGate;
 use log::{debug, warn};
+use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
@@ -322,7 +322,14 @@ fn sample_timestamp_ms(sample: &Sample) -> f64 {
 }
 
 impl SubShared {
-    pub fn new(opts: &SubOpts, resolved: Resolved, codecs: Arc<EncodingRegistry>, gate: Arc<SendGate>, reliable_max_backlog: Duration, stream_decode_backlog: usize) -> Self {
+    pub fn new(
+        opts: &SubOpts,
+        resolved: Resolved,
+        codecs: Arc<EncodingRegistry>,
+        gate: Arc<SendGate>,
+        reliable_max_backlog: Duration,
+        stream_decode_backlog: usize,
+    ) -> Self {
         let Resolved { encoding: codec, channel, output } = resolved;
         static NEXT_STREAM: AtomicUsize = AtomicUsize::new(0);
         SubShared {
@@ -459,7 +466,8 @@ impl SubShared {
         }
         let quality = self.tuning().quality_range.0;
         let policy = self.tuning().video_policy;
-        let (floor, most) = (policy.frame_bytes(source, hz, quality) * 8.0 * hz, policy.frame_bytes(source, hz, self.tuning().quality_range.1) * 8.0 * hz);
+        let (floor, most) =
+            (policy.frame_bytes(source, hz, quality) * 8.0 * hz, policy.frame_bytes(source, hz, self.tuning().quality_range.1) * 8.0 * hz);
         (quality, start_bps.min(most).max(floor), hz)
     }
 
@@ -515,9 +523,7 @@ impl SubShared {
     /// pulling it back. Such a stream still must not be thinned; that is [`Self::never_thinned`].
     /// (Reliable ones shrink last, see `allocator`, their queue bounded by `reliable_max_backlog`.)
     pub fn reserved(&self) -> bool {
-        self.is_strict()
-            || self.channel == Channel::Audio
-            || matches!(self.channel, Channel::Video(format) if format.passthrough_only())
+        self.is_strict() || self.channel == Channel::Audio || matches!(self.channel, Channel::Video(format) if format.passthrough_only())
     }
 
     /// Never held to fewer frames than its source sends. Everything [`Self::reserved`] covers, and a stream decoded by
@@ -582,36 +588,46 @@ impl SubShared {
         let payload_bytes = state.payload_bytes;
         let price: crate::allocator::Price = match &self.codec {
             None => {
-                let message_bytes = if state.message_bytes > 0.0 { state.message_bytes + PACKET_OVERHEAD_BYTES as f64 } else { payload_bytes + FRAME_OVERHEAD_BYTES };
+                let message_bytes = if state.message_bytes > 0.0 {
+                    state.message_bytes + PACKET_OVERHEAD_BYTES as f64
+                } else {
+                    payload_bytes + FRAME_OVERHEAD_BYTES
+                };
                 Box::new(move |_| message_bytes)
             }
-            Some(_) if matches!(self.channel, Channel::Video(_)) => match state.video_source.or_else(|| guessed_video_source(payload_bytes)) {
-              // before its first frame and with no samples yet, the source's size is unknown: priced as the source sample
-              None => {
-                let sample_bytes = payload_bytes + FRAME_OVERHEAD_BYTES;
-                Box::new(move |_| sample_bytes)
-              }
-              Some(source) => {
-                let keys = state.keys.values().filter(|queue| queue.rate_hz > 0.0).count().max(1);
-                let (policy, frame_hz) = (self.tuning().video_policy, max_hz / keys as f64);
-                let model = move |quality: f64| policy.frame_bytes(source, frame_hz, quality);
-                // what its frames measured, with room to grow 1.5x per allocation: a simple or still picture encodes far
-                // below the model, and priced by the model alone it never showed the link more (a solid 320x240 camera
-                // at 10 Hz was held to 5 fps on localhost)
-                // (never below the full picture's floor: grants follow the price and the picture's size follows the grant, so a
-                // solid picture's tiny frames shrank it to half size)
-                let (measured, full_size) = (state.video_frame_bytes, policy.full_size_floor_bytes(source));
-                Box::new(move |quality| match measured {
-                    Some((at, bytes)) => model(quality).min((VIDEO_PRICE_HEADROOM * bytes * model(quality) / model(at).max(1e-9)).max(full_size)),
-                    None => model(quality),
-                })
-              }
-            },
+            Some(_) if matches!(self.channel, Channel::Video(_)) => {
+                match state.video_source.or_else(|| guessed_video_source(payload_bytes)) {
+                    // before its first frame and with no samples yet, the source's size is unknown: priced as the source sample
+                    None => {
+                        let sample_bytes = payload_bytes + FRAME_OVERHEAD_BYTES;
+                        Box::new(move |_| sample_bytes)
+                    }
+                    Some(source) => {
+                        let keys = state.keys.values().filter(|queue| queue.rate_hz > 0.0).count().max(1);
+                        let (policy, frame_hz) = (self.tuning().video_policy, max_hz / keys as f64);
+                        let model = move |quality: f64| policy.frame_bytes(source, frame_hz, quality);
+                        // what its frames measured, with room to grow 1.5x per allocation: a simple or still picture encodes far
+                        // below the model, and priced by the model alone it never showed the link more (a solid 320x240 camera
+                        // at 10 Hz was held to 5 fps on localhost)
+                        // (never below the full picture's floor: grants follow the price and the picture's size follows the grant, so a
+                        // solid picture's tiny frames shrank it to half size)
+                        let (measured, full_size) = (state.video_frame_bytes, policy.full_size_floor_bytes(source));
+                        Box::new(move |quality| match measured {
+                            Some((at, bytes)) => {
+                                model(quality).min((VIDEO_PRICE_HEADROOM * bytes * model(quality) / model(at).max(1e-9)).max(full_size))
+                            }
+                            None => model(quality),
+                        })
+                    }
+                }
+            }
             Some(codec) => {
                 // measured sizes per quality, scaled between qualities by the encoding's own estimate
                 let (codec, payload_len, options) = (codec.clone(), payload_bytes.round() as usize, self.encode_options.clone());
-                let model = move |quality: f64| codec.estimated_bytes(payload_len, &EncodeOptions { quality, options: options.clone() }).max(0.0);
-                let measured: Vec<(f64, f64)> = state.encoded_bytes.iter().map(|(&bucket, &bytes)| (bucket as f64 / 1000.0, bytes)).collect();
+                let model =
+                    move |quality: f64| codec.estimated_bytes(payload_len, &EncodeOptions { quality, options: options.clone() }).max(0.0);
+                let measured: Vec<(f64, f64)> =
+                    state.encoded_bytes.iter().map(|(&bucket, &bytes)| (bucket as f64 / 1000.0, bytes)).collect();
                 Box::new(move |quality| {
                     let nearest = measured.iter().min_by(|a, b| (a.0 - quality).abs().total_cmp(&(b.0 - quality).abs()));
                     match nearest {
@@ -685,9 +701,20 @@ impl SubShared {
     }
 
     /// A video frame's gateway stages (ms) and its track's pacer delay percentiles.
-    pub fn record_video_latency(&self, source_to_received: f64, received_to_encoded: f64, encoded_to_written: f64, pacer: Option<(f64, f64)>) {
+    pub fn record_video_latency(
+        &self,
+        source_to_received: f64,
+        received_to_encoded: f64,
+        encoded_to_written: f64,
+        pacer: Option<(f64, f64)>,
+    ) {
         let mut state = self.state.lock();
-        let latency = state.stats.video_latency.get_or_insert_with(|| VideoLatency { source_to_received_ms: source_to_received, received_to_encoded_ms: received_to_encoded, encoded_to_written_ms: encoded_to_written, ..Default::default() });
+        let latency = state.stats.video_latency.get_or_insert_with(|| VideoLatency {
+            source_to_received_ms: source_to_received,
+            received_to_encoded_ms: received_to_encoded,
+            encoded_to_written_ms: encoded_to_written,
+            ..Default::default()
+        });
         latency.source_to_received_ms = ewma(latency.source_to_received_ms, source_to_received);
         latency.received_to_encoded_ms = ewma(latency.received_to_encoded_ms, received_to_encoded);
         latency.encoded_to_written_ms = ewma(latency.encoded_to_written_ms, encoded_to_written);
@@ -702,7 +729,15 @@ impl SubShared {
     }
 
     /// A video frame went to the track.
-    pub fn record_video_frame(&self, bytes: usize, (width, height): (u32, u32), quality: f64, keyframe: bool, shared_encode: bool, keyframe_requests: u64) {
+    pub fn record_video_frame(
+        &self,
+        bytes: usize,
+        (width, height): (u32, u32),
+        quality: f64,
+        keyframe: bool,
+        shared_encode: bool,
+        keyframe_requests: u64,
+    ) {
         let mut state = self.state.lock();
         state.stats.keyframe_requests = keyframe_requests;
         state.stats.bytes_sent += bytes as u64;
@@ -745,7 +780,11 @@ impl SubShared {
                 priority: self.priority_override.unwrap_or(sample.priority() as u8),
                 payload: sample.payload().clone(),
             };
-            let key = self.key_prefix.as_ref().and_then(|prefix| sample.key_expr().as_str().strip_prefix(prefix.as_str())).unwrap_or(sample.key_expr().as_str());
+            let key = self
+                .key_prefix
+                .as_ref()
+                .and_then(|prefix| sample.key_expr().as_str().strip_prefix(prefix.as_str()))
+                .unwrap_or(sample.key_expr().as_str());
             let state = &mut *state;
             let queue = match state.keys.get_mut(key) {
                 Some(queue) => queue,
@@ -779,7 +818,11 @@ impl SubShared {
                         // what the consumer was doing for long enough to let `cap` samples pile up is worth knowing by
                         // name. It is rare by construction: once per keyframe interval at worst
                         state.stats.worst_consumer_gap_ms = state.stats.worst_consumer_gap_ms.max(away.unwrap_or_default());
-                        log::warn!("{key}: a sample was dropped with {} queued, {} since the send loop last took one — the decoder has to start over at the publisher's next keyframe", queue.items.len(), away.map_or("no sample yet".to_owned(), |away| format!("{away:.0} ms")));
+                        log::warn!(
+                            "{key}: a sample was dropped with {} queued, {} since the send loop last took one — the decoder has to start over at the publisher's next keyframe",
+                            queue.items.len(),
+                            away.map_or("no sample yet".to_owned(), |away| format!("{away:.0} ms"))
+                        );
                     }
                 }
             }
@@ -813,7 +856,9 @@ impl SubShared {
             }
         } else if self.delivery.reliable {
             for queue in state.keys.values_mut() {
-                while queue.items.len() > 1 && queue.items.front().is_some_and(|item| now.duration_since(item.arrived) > self.reliable_max_backlog) {
+                while queue.items.len() > 1
+                    && queue.items.front().is_some_and(|item| now.duration_since(item.arrived) > self.reliable_max_backlog)
+                {
                     state.stats.unqueue(&queue.items.pop_front().unwrap());
                     state.stats.dropped_queue += 1;
                 }
@@ -834,7 +879,9 @@ impl SubShared {
                 // a video key held to fewer frames than its source sends: once its spacing is up, the next frame to
                 // arrive goes rather than the one that waited out the spacing (up to a source interval old: at 2.7 of 5
                 // Hz that was 100 ms p50 of the picture's age), unless no frame comes within a source interval
-                (Spacing::Every(_), Some(due)) if matches!(self.channel, Channel::Video(_)) && queue.rate_hz > 0.0 && head.arrived < due => {
+                (Spacing::Every(_), Some(due))
+                    if matches!(self.channel, Channel::Video(_)) && queue.rate_hz > 0.0 && head.arrived < due =>
+                {
                     let fresh_by = due + crate::secs(1.0 / queue.rate_hz);
                     if now < fresh_by {
                         wake_at = Some(wake_at.map_or(fresh_by, |w| w.min(fresh_by)));
@@ -947,14 +994,23 @@ impl Drop for Unsubscribe {
 
 /// Runs a `sub` channel until it closes. Video and audio channels send frames to `track` instead of `dc`.
 /// `rules`: a grant with an ACL, whose put/delete egress rules decide which samples reach the browser.
-pub async fn run(dc: Arc<dyn DataChannel>, label: Label, session: zenoh::Session, catalog: Arc<crate::catalog::TopicCatalog>, shared: Arc<SubShared>, track: Option<crate::media::TrackClaim>, rules: Option<Arc<crate::Grant>>) {
+pub async fn run(
+    dc: Arc<dyn DataChannel>,
+    label: Label,
+    session: zenoh::Session,
+    catalog: Arc<crate::catalog::TopicCatalog>,
+    shared: Arc<SubShared>,
+    track: Option<crate::media::TrackClaim>,
+    rules: Option<Arc<crate::Grant>>,
+) {
     let feed = shared.clone();
     let subscriber = session
         .declare_subscriber(shared.zenoh_key(&label.key))
         .callback(move |sample| {
             catalog.note_sample(sample.key_expr().as_str());
             if let Some(rules) = &rules {
-                let message = if sample.kind() == SampleKind::Delete { crate::auth::AclMessage::Delete } else { crate::auth::AclMessage::Put };
+                let message =
+                    if sample.kind() == SampleKind::Delete { crate::auth::AclMessage::Delete } else { crate::auth::AclMessage::Put };
                 // dropped like zenoh's egress ACL drops it
                 if !rules.passes(message, sample.key_expr().as_str()) {
                     return;
@@ -1145,7 +1201,9 @@ async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>) {
         }
         // (a raw message is the whole sample, header and all)
         let headed = match &shared.codec {
-            Some(codec) if item.kind != SampleKind::Delete && shared.sends_header() => sample_header(&**codec, &key, &item).map(|header| frame::with_header(&header, body.bytes())),
+            Some(codec) if item.kind != SampleKind::Delete && shared.sends_header() => {
+                sample_header(&**codec, &key, &item).map(|header| frame::with_header(&header, body.bytes()))
+            }
             _ => None,
         };
         if headed.is_some() {
@@ -1190,7 +1248,15 @@ impl MessageSender {
         MessageSender { next_frame_id: 0, warned_send_error: false, urgent: false }
     }
 
-    pub async fn send(&mut self, dc: &Arc<dyn DataChannel>, shared: &SubShared, key: &str, item: &Pending, payload: &[u8], flags: u8) -> Sent {
+    pub async fn send(
+        &mut self,
+        dc: &Arc<dyn DataChannel>,
+        shared: &SubShared,
+        key: &str,
+        item: &Pending,
+        payload: &[u8],
+        flags: u8,
+    ) -> Sent {
         // strict: whole message at once, bulk held off meanwhile; bulk: small paced chunks
         let strict_turn = shared.is_strict().then(|| shared.gate.strict_turn());
         // (strict can come with the first sample's published priority, so it is raised here, once)
@@ -1209,7 +1275,8 @@ impl MessageSender {
             }
             let frame_id = self.next_frame_id;
             self.next_frame_id = self.next_frame_id.wrapping_add(1);
-            let header = frame::FrameHeader { key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index, chunk_count, flags };
+            let header =
+                frame::FrameHeader { key, timestamp_ms: item.timestamp_ms, seq: item.seq, frame_id, chunk_index, chunk_count, flags };
             let frame = frame::encode(&header, frame::chunk(payload, chunk_index, chunk_bytes));
             let frame_len = frame.len();
             if strict_turn.is_none() {
@@ -1236,7 +1303,11 @@ impl MessageSender {
             {
                 let mut state = shared.state.lock();
                 let wire_bytes = frame_len + PACKET_OVERHEAD_BYTES as usize;
-                let order = if strict_turn.is_some() { shared.gate.strict_frame_sent(shared.stream_id, wire_bytes, shared.packet_lifetime()) } else { shared.gate.frame_sent(shared.stream_id, wire_bytes, shared.packet_lifetime()) };
+                let order = if strict_turn.is_some() {
+                    shared.gate.strict_frame_sent(shared.stream_id, wire_bytes, shared.packet_lifetime())
+                } else {
+                    shared.gate.frame_sent(shared.stream_id, wire_bytes, shared.packet_lifetime())
+                };
                 state.unconsumed.push_back((frame_id, frame_len, order, Instant::now()));
                 state.stats.unconsumed_bytes += frame_len;
                 state.stats.frames_sent += 1;
@@ -1256,7 +1327,15 @@ impl MessageSender {
 }
 
 /// Sends one small frame (e.g. a video frame's metadata) without pacing; returns its size.
-pub async fn send_small_frame(dc: &Arc<dyn DataChannel>, key: &str, timestamp_ms: f64, seq: u32, frame_id: u32, flags: u8, payload: &[u8]) -> Result<usize, webrtc::error::Error> {
+pub async fn send_small_frame(
+    dc: &Arc<dyn DataChannel>,
+    key: &str,
+    timestamp_ms: f64,
+    seq: u32,
+    frame_id: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Result<usize, webrtc::error::Error> {
     let frame = frame::encode(&frame::FrameHeader { key, timestamp_ms, seq, frame_id, chunk_index: 0, chunk_count: 1, flags }, payload);
     let length = frame.len();
     dc.send(frame).await.map(|_| length)
@@ -1279,14 +1358,28 @@ mod tests {
 
     fn shared(opts: &str) -> SubShared {
         let registry = Arc::new(EncodingRegistry::new([]).unwrap());
-        SubShared::new(&SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(), Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data }, registry, Arc::default(), DEFAULT_RELIABLE_MAX_BACKLOG, DEFAULT_STREAM_DECODE_BACKLOG)
+        SubShared::new(
+            &SubOpts::parse(&serde_json::from_str(opts).unwrap()).unwrap(),
+            Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data },
+            registry,
+            Arc::default(),
+            DEFAULT_RELIABLE_MAX_BACKLOG,
+            DEFAULT_STREAM_DECODE_BACKLOG,
+        )
     }
 
     /// A video subscription of `channel`, which `shared` cannot make because it always resolves to the data channel.
     fn video_shared(channel: Channel) -> SubShared {
         let registry = Arc::new(EncodingRegistry::new([]).unwrap());
         let opts = SubOpts::parse(&serde_json::from_str("{}").unwrap()).unwrap();
-        SubShared::new(&opts, Resolved { encoding: None, channel, output: EncodingOutput::Video }, registry, Arc::default(), DEFAULT_RELIABLE_MAX_BACKLOG, DEFAULT_STREAM_DECODE_BACKLOG)
+        SubShared::new(
+            &opts,
+            Resolved { encoding: None, channel, output: EncodingOutput::Video },
+            registry,
+            Arc::default(),
+            DEFAULT_RELIABLE_MAX_BACKLOG,
+            DEFAULT_STREAM_DECODE_BACKLOG,
+        )
     }
 
     /// `reserved` and `never_thinned` must not be the same set, and the difference is the whole of a bug that pinned a
@@ -1462,7 +1555,14 @@ mod tests {
     fn reliable_max_backlog_sets_how_long_a_backlog_waits() {
         let registry = Arc::new(EncodingRegistry::new([]).unwrap());
         let opts = SubOpts::parse(&serde_json::json!({"delivery":"reliable"})).unwrap();
-        let shared = SubShared::new(&opts, Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data }, registry, Arc::default(), Duration::from_millis(500), DEFAULT_STREAM_DECODE_BACKLOG);
+        let shared = SubShared::new(
+            &opts,
+            Resolved { encoding: None, channel: Channel::Data, output: EncodingOutput::Data },
+            registry,
+            Arc::default(),
+            Duration::from_millis(500),
+            DEFAULT_STREAM_DECODE_BACKLOG,
+        );
         let t0 = Instant::now();
         for seq in 0..3 {
             insert(&shared, "tf", pending(seq, 5, t0 + Duration::from_millis(400 * seq as u64)), None);
@@ -1482,12 +1582,14 @@ mod tests {
         assert_eq!(zstd::bulk::decompress(body.bytes(), 6000).unwrap(), b"zenoh ".repeat(1000));
         assert_eq!(raw_body(Compress::None, &text).await.flags(), 0);
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-        let noise: Vec<u8> = (0..4096).map(|_| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed as u8
-        }).collect();
+        let noise: Vec<u8> = (0..4096)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
         let noisy = item(noise.clone());
         let body = raw_body(Compress::Zstd, &noisy).await;
         assert_eq!((body.flags(), body.bytes()), (0, &noise[..]), "incompressible bytes go as they are");
@@ -1498,20 +1600,30 @@ mod tests {
         // a 20 Hz camera, its frames 2 ms early or late, granted its measured 19.9 Hz: spacing from send times held it to
         // 12.6 Hz (a frame a hair early waited a whole source interval for a fresher one, which then also came early)
         let registry = Arc::new(EncodingRegistry::new([]).unwrap());
-        let resolved = Resolved { encoding: None, channel: Channel::Video(crate::encoding::video::VideoFormat::H264), output: EncodingOutput::Video };
-        let shared = SubShared::new(&SubOpts::parse(&serde_json::json!({"maxHz": 20})).unwrap(), resolved, registry, Arc::default(), DEFAULT_RELIABLE_MAX_BACKLOG, DEFAULT_STREAM_DECODE_BACKLOG);
+        let resolved =
+            Resolved { encoding: None, channel: Channel::Video(crate::encoding::video::VideoFormat::H264), output: EncodingOutput::Video };
+        let shared = SubShared::new(
+            &SubOpts::parse(&serde_json::json!({"maxHz": 20})).unwrap(),
+            resolved,
+            registry,
+            Arc::default(),
+            DEFAULT_RELIABLE_MAX_BACKLOG,
+            DEFAULT_STREAM_DECODE_BACKLOG,
+        );
         {
             let mut state = shared.state.lock();
             state.keys.entry("cam".into()).or_default().rate_hz = 19.9;
             state.allocation = Allocation { constrained: true, hz_fraction: 1.0, ..Default::default() };
         }
         let t0 = Instant::now();
-        let sent = (0..100u32).filter(|frame| {
-            let jitter = if frame % 2 == 0 { 2 } else { -2 };
-            let arrived = t0 + Duration::from_millis((50 * *frame as i64 + 10 + jitter) as u64);
-            insert(&shared, "cam", pending(*frame, 5, arrived), Some(1));
-            shared.pick(arrived + Duration::from_millis(1)).0.is_some()
-        }).count();
+        let sent = (0..100u32)
+            .filter(|frame| {
+                let jitter = if frame % 2 == 0 { 2 } else { -2 };
+                let arrived = t0 + Duration::from_millis((50 * *frame as i64 + 10 + jitter) as u64);
+                insert(&shared, "cam", pending(*frame, 5, arrived), Some(1));
+                shared.pick(arrived + Duration::from_millis(1)).0.is_some()
+            })
+            .count();
         assert!(sent >= 97, "{sent} of 100 frames went");
     }
 

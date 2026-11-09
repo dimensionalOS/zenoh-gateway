@@ -13,7 +13,7 @@
 //! are what it replaces, and it gets out sooner.
 
 use parking_lot::Mutex;
-use rtc::interceptor::{Attribute, Interceptor, Packet, Pacer, StreamInfo, TaggedPacket};
+use rtc::interceptor::{Attribute, Interceptor, Pacer, Packet, StreamInfo, TaggedPacket};
 use rtc::shared::marshal::MarshalSize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -42,7 +42,14 @@ pub struct PacerShared {
 
 impl Default for PacerShared {
     fn default() -> Self {
-        PacerShared { queue_limit: Mutex::new(crate::allocator::DEFAULT_LATENCY_TARGET), rate_bps: Mutex::new(None), backlog: Default::default(), keyframe_flags: Default::default(), keyframes: Default::default(), dropped_packets: Default::default() }
+        PacerShared {
+            queue_limit: Mutex::new(crate::allocator::DEFAULT_LATENCY_TARGET),
+            rate_bps: Mutex::new(None),
+            backlog: Default::default(),
+            keyframe_flags: Default::default(),
+            keyframes: Default::default(),
+            dropped_packets: Default::default(),
+        }
     }
 }
 
@@ -131,7 +138,8 @@ impl AgedPacer {
     }
 
     fn publish(&self, now: Instant) {
-        *self.shared.backlog.lock() = (self.queued_bits, self.bucket.target_bitrate(), self.queue.front().map(|queued| queued.since), Some(now));
+        *self.shared.backlog.lock() =
+            (self.queued_bits, self.bucket.target_bitrate(), self.queue.front().map(|queued| queued.since), Some(now));
     }
 
     fn remember_dropped(&mut self, key: (u32, u16)) {
@@ -199,7 +207,8 @@ impl AgedPacer {
     /// A keyframe entering the queue: the stream's packets queued before it are what it replaces (libwebrtc's pacer does
     /// the same), dropped without asking for another keyframe.
     fn flush_before_keyframe(&mut self, ssrc: u32) {
-        let (flushed, kept): (VecDeque<Queued>, VecDeque<Queued>) = std::mem::take(&mut self.queue).into_iter().partition(|queued| queued.frame.0 == ssrc);
+        let (flushed, kept): (VecDeque<Queued>, VecDeque<Queued>) =
+            std::mem::take(&mut self.queue).into_iter().partition(|queued| queued.frame.0 == ssrc);
         self.queue = kept;
         for queued in flushed {
             self.drop_packet(queued);
@@ -216,7 +225,9 @@ impl rtc::sansio::Protocol<TaggedPacket, TaggedPacket, ()> for AgedPacer {
 
     fn handle_read(&mut self, message: TaggedPacket) -> Result<(), Self::Error> {
         // the congestion controller's target rides the feedback packet it came from (rtc-interceptor's pacer does the same)
-        if let Some(Attribute::TargetBitrateChanged { bits_per_second }) = message.message.get(&Attribute::TargetBitrateChanged { bits_per_second: 0.0 }) {
+        if let Some(Attribute::TargetBitrateChanged { bits_per_second }) =
+            message.message.get(&Attribute::TargetBitrateChanged { bits_per_second: 0.0 })
+        {
             self.bucket.set_target_bitrate(*bits_per_second);
         }
         self.read_queue.push_back(message);

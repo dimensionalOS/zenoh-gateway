@@ -41,7 +41,15 @@ impl Opus {
     fn encode(&mut self, samples: &[i16]) -> Result<Vec<u8>> {
         let mut packet = vec![0u8; 1500];
         // SAFETY: `samples` holds one 20 ms frame of `channels` interleaved samples; `packet` is writable for its length
-        let length = unsafe { opus_encode(self.encoder, samples.as_ptr(), (samples.len() / self.channels as usize) as i32, packet.as_mut_ptr(), packet.len() as i32) };
+        let length = unsafe {
+            opus_encode(
+                self.encoder,
+                samples.as_ptr(),
+                (samples.len() / self.channels as usize) as i32,
+                packet.as_mut_ptr(),
+                packet.len() as i32,
+            )
+        };
         ensure!(length > 0, "opus_encode failed ({length})");
         packet.truncate(length as usize);
         Ok(packet)
@@ -95,7 +103,9 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             Some(header) => (crate::frame::HEADER, crate::frame::with_header(header, &[])),
             None => (0, Vec::new()),
         };
-        if subscription::send_small_frame(&dc, &key, item.timestamp_ms, item.seq, frame_id, flags, &message).await.is_err() && shared.is_closed() {
+        if subscription::send_small_frame(&dc, &key, item.timestamp_ms, item.seq, frame_id, flags, &message).await.is_err()
+            && shared.is_closed()
+        {
             break;
         }
         frame_id = frame_id.wrapping_add(1);
@@ -129,7 +139,8 @@ mod tests {
     fn encodes_twenty_millisecond_packets() {
         let mut opus = Opus::new(48000, 1).unwrap();
         assert_eq!(opus.packet_samples(), 960);
-        let tone: Vec<i16> = (0..960).map(|index| ((index as f64 * 400.0 / 48000.0 * std::f64::consts::TAU).sin() * 8000.0) as i16).collect();
+        let tone: Vec<i16> =
+            (0..960).map(|index| ((index as f64 * 400.0 / 48000.0 * std::f64::consts::TAU).sin() * 8000.0) as i16).collect();
         let packet = opus.encode(&tone).unwrap();
         assert!(!packet.is_empty() && packet.len() < 400, "{} bytes", packet.len());
         assert_eq!(Opus::new(16000, 2).unwrap().packet_samples(), 640);

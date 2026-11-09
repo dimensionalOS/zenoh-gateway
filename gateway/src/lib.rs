@@ -60,15 +60,18 @@ mod rtp_pacer;
 mod server;
 mod subscription;
 
-pub use encoding::{AudioPcm, Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, MessageHeader, EncodedVideo, H264Encoder, PixelFormat, StreamDecoder, VideoEncoder, VideoFormat, VideoImage, VideoPolicy, VideoTarget};
+pub use auth::{Acl, AclMessage, AclRule, Flow, Grant, OnRefused, Permission};
 /// The built-in AV1 encoder (feature `av1`), beside [`H264Encoder`], for an encoding that supplies its own.
 #[cfg(feature = "av1")]
 pub use encoding::Av1Encoder;
-pub use auth::{Acl, AclMessage, AclRule, Flow, Grant, OnRefused, Permission};
+pub use encoding::{
+    AudioPcm, Channel, Compress, DecodedFrame, EncodeOptions, EncodedVideo, EncodingOutput, EncodingSample, H264Encoder, MessageEncoding,
+    MessageHeader, PixelFormat, StreamDecoder, VideoEncoder, VideoFormat, VideoImage, VideoPolicy, VideoTarget,
+};
 pub use fields::Fields;
-pub use ice::{ICE_HOOK_TIMEOUT, IceRequest, IceServer, IceServersFn, IceSide, turn_credentials};
 #[cfg(feature = "cloudflare")]
 pub use ice::CloudflareTurn;
+pub use ice::{ICE_HOOK_TIMEOUT, IceRequest, IceServer, IceServersFn, IceSide, turn_credentials};
 #[doc(hidden)]
 pub use peer::live_peer_states;
 pub use server::{Authorize, DEFAULT_PORT, HEALTH_PATH, ICE_PATH, RunningServer, SIGNALLING_PREFIX, Server, ServerBuilder};
@@ -78,10 +81,16 @@ pub use zenoh;
 
 /// Spawns `task`; a panic in it is logged and runs `on_panic` (closing only what the task served) instead of
 /// leaving that part of the gateway dead. The returned handle finishes after both.
-pub(crate) fn spawn_isolated(what: String, task: impl Future<Output = ()> + Send + 'static, on_panic: impl Future<Output = ()> + Send + 'static) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn_isolated(
+    what: String,
+    task: impl Future<Output = ()> + Send + 'static,
+    on_panic: impl Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
     let handle = tokio::spawn(task);
     tokio::spawn(async move {
-        if let Err(error) = handle.await && error.is_panic() {
+        if let Err(error) = handle.await
+            && error.is_panic()
+        {
             log::error!("{what} panicked, closing it: {error}");
             on_panic.await;
         }

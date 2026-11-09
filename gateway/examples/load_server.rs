@@ -31,7 +31,14 @@ async fn main() -> Result<()> {
     let running = Server::builder().session(session.clone()).serve_dir(serve_dir).build().await?.bind("127.0.0.1:0").await?;
     let bytes = |name: &str, default: usize| std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default);
     let (cloud, map) = (bytes("CLOUD_BYTES", 200_000), bytes("MAP_BYTES", 400_000));
-    for (key, bytes, hz) in [("robot/cloud0", cloud, 10.0), ("robot/cloud1", cloud, 10.0), ("robot/cloud2", cloud, 10.0), ("robot/map", map, 1.0), ("robot/pose", 200, 20.0), ("robot/tf", 200, 100.0)] {
+    for (key, bytes, hz) in [
+        ("robot/cloud0", cloud, 10.0),
+        ("robot/cloud1", cloud, 10.0),
+        ("robot/cloud2", cloud, 10.0),
+        ("robot/map", map, 1.0),
+        ("robot/pose", 200, 20.0),
+        ("robot/tf", 200, 100.0),
+    ] {
         publish(&session, key, bytes, hz);
     }
     println!("listening on http://{}", running.local_addr());

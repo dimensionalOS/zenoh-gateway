@@ -3,13 +3,13 @@
 use crate::options::{DeliveryKind, Label, PubOpts};
 use crate::subscription::now_unix_ms;
 use log::{debug, warn};
+use parking_lot::Mutex;
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use parking_lot::Mutex;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use zenoh::pubsub::Publisher;
 use zenoh::qos::{CongestionControl, Priority};
@@ -71,7 +71,12 @@ struct Waiting {
 type Putting = std::pin::Pin<Box<dyn Future<Output = Option<zenoh::Result<()>>> + Send>>;
 
 /// Declares the zenoh publisher a `pub` channel puts through; closes the channel if zenoh refuses.
-pub(crate) async fn declare(dc: &Arc<dyn DataChannel>, label: &Label, opts: &PubOpts, session: &zenoh::Session) -> Option<Publisher<'static>> {
+pub(crate) async fn declare(
+    dc: &Arc<dyn DataChannel>,
+    label: &Label,
+    opts: &PubOpts,
+    session: &zenoh::Session,
+) -> Option<Publisher<'static>> {
     let priority = opts.zenoh_priority().unwrap_or_default();
     let congestion_control = if opts.delivery == DeliveryKind::Reliable { CongestionControl::Block } else { CongestionControl::Drop };
     let publisher = session
@@ -82,7 +87,10 @@ pub(crate) async fn declare(dc: &Arc<dyn DataChannel>, label: &Label, opts: &Pub
         .await;
     match publisher {
         Ok(publisher) => {
-            debug!("publisher {:?} priority={priority:?} congestion={congestion_control:?} latencyLimit={:?}", label.key, opts.latency_limit);
+            debug!(
+                "publisher {:?} priority={priority:?} congestion={congestion_control:?} latencyLimit={:?}",
+                label.key, opts.latency_limit
+            );
             Some(publisher)
         }
         Err(error) => {
@@ -172,7 +180,16 @@ pub(crate) async fn put(publisher: &Publisher<'static>, payload: Vec<u8>, shared
 /// unread channel stops the whole connection's reads): `latest` keeps only the newest message waiting, `reliable` every
 /// one, until its own deadline passes (counted in `dropped_stale`).
 #[allow(clippy::too_many_arguments)]
-pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session: zenoh::Session, shared: Arc<PubShared>, clock_offset_ms: Arc<Mutex<Option<f64>>>, blocker: impl Fn() -> Option<String>, put_timeout: Duration) {
+pub async fn run(
+    dc: Arc<dyn DataChannel>,
+    label: Label,
+    opts: PubOpts,
+    session: zenoh::Session,
+    shared: Arc<PubShared>,
+    clock_offset_ms: Arc<Mutex<Option<f64>>>,
+    blocker: impl Fn() -> Option<String>,
+    put_timeout: Duration,
+) {
     let reliable = opts.delivery == DeliveryKind::Reliable;
     let Some(publisher) = declare(&dc, &label, &opts, &session).await else { return };
     let publisher = Arc::new(publisher);
@@ -181,7 +198,9 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
     let mut putting: Option<Putting> = None;
     loop {
         // the next waiting message still worth putting goes as soon as nothing is in flight
-        while putting.is_none() && let Some(next) = waiting.pop_front() {
+        while putting.is_none()
+            && let Some(next) = waiting.pop_front()
+        {
             let now = Instant::now();
             if next.expires <= now {
                 shared.stats.lock().dropped_stale += 1;
@@ -236,7 +255,11 @@ pub async fn run(dc: Arc<dyn DataChannel>, label: Label, opts: PubOpts, session:
         count(&shared, &label.key, put.await);
     }
     for next in waiting {
-        count(&shared, &label.key, tokio::time::timeout(next.expires.saturating_duration_since(Instant::now()), publisher.put(next.payload)).await.ok());
+        count(
+            &shared,
+            &label.key,
+            tokio::time::timeout(next.expires.saturating_duration_since(Instant::now()), publisher.put(next.payload)).await.ok(),
+        );
     }
     debug!("publisher {:?} closed", label.key);
 }

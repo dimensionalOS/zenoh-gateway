@@ -11,8 +11,11 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 use tokio::time::timeout;
-use zenoh_gateway::client::{Client, ClientOptions, Delivery, Message, LeaseOptions, PublisherOptions, SubscribeOptions, VideoFrame};
-use zenoh_gateway::{Channel, EncodeOptions, MessageEncoding, EncodingOutput, EncodingSample, Compress, DecodedFrame, Fields, MessageHeader, RunningServer, Server, StreamDecoder, VideoImage, zenoh};
+use zenoh_gateway::client::{Client, ClientOptions, Delivery, LeaseOptions, Message, PublisherOptions, SubscribeOptions, VideoFrame};
+use zenoh_gateway::{
+    Channel, Compress, DecodedFrame, EncodeOptions, EncodingOutput, EncodingSample, Fields, MessageEncoding, MessageHeader, RunningServer,
+    Server, StreamDecoder, VideoImage, zenoh,
+};
 
 /// `[r, g, b, width u16, height u16]` → a solid picture.
 struct SolidColor;
@@ -29,7 +32,9 @@ impl MessageEncoding for SolidColor {
     fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
         let p = sample.payload;
         let (width, height) = (u16::from_le_bytes([p[3], p[4]]) as u32, u16::from_le_bytes([p[5], p[6]]) as u32);
-        Ok(DecodedFrame::Video(VideoImage::rgb8(width, height, p[..3].repeat((width * height) as usize))?.with_header(12.5, "solid_optical")))
+        Ok(DecodedFrame::Video(
+            VideoImage::rgb8(width, height, p[..3].repeat((width * height) as usize))?.with_header(12.5, "solid_optical"),
+        ))
     }
 }
 
@@ -85,7 +90,13 @@ fn keep_putting(session: &zenoh::Session, key: &str, payload: Vec<u8>) -> tokio:
     })
 }
 
-fn keep_putting_attached(session: &zenoh::Session, key: &str, payload: Vec<u8>, encoding: &'static str, attachment: Vec<u8>) -> tokio::task::JoinHandle<()> {
+fn keep_putting_attached(
+    session: &zenoh::Session,
+    key: &str,
+    payload: Vec<u8>,
+    encoding: &'static str,
+    attachment: Vec<u8>,
+) -> tokio::task::JoinHandle<()> {
     let (session, key) = (session.clone(), key.to_owned());
     tokio::spawn(async move {
         loop {
@@ -108,9 +119,13 @@ async fn next_video(subscription: &mut zenoh_gateway::client::Subscription) -> V
 async fn list_topics_and_get() {
     let (running, session, url) = start().await;
     let _token = session.liveliness().declare_token("listed/robot/camera").await.unwrap();
-    let _queryable = session.declare_queryable("answers/42").callback(|query| {
-        tokio::spawn(async move { query.reply("answers/42", "forty-two").await.unwrap() });
-    }).await.unwrap();
+    let _queryable = session
+        .declare_queryable("answers/42")
+        .callback(|query| {
+            tokio::spawn(async move { query.reply("answers/42", "forty-two").await.unwrap() });
+        })
+        .await
+        .unwrap();
     let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
     assert!(client.encodings().iter().any(|encoding| encoding.name == "test-solid" && encoding.output == "video"));
     let topics = client.list_topics("listed/**", Some(0)).await.unwrap();
@@ -135,7 +150,9 @@ async fn list_topics_from_the_catalog() {
     let mut subscription = client.subscribe("catalog/odom", SubscribeOptions::default()).await.unwrap();
     timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap();
     // no probe: answered from the catalog
-    let sources = |topics: &[zenoh_gateway::client::Topic], key: &str| topics.iter().find(|topic| topic.key == key).map(|topic| topic.sources.clone());
+    let sources = |topics: &[zenoh_gateway::client::Topic], key: &str| {
+        topics.iter().find(|topic| topic.key == key).map(|topic| topic.sources.clone())
+    };
     let topics = client.list_topics("catalog/**", Some(0)).await.unwrap();
     assert_eq!(sources(&topics, "catalog/arm"), Some(vec!["token".to_owned()]), "{topics:?}");
     assert_eq!(sources(&topics, "catalog/odom"), Some(vec!["sample".to_owned()]), "{topics:?}");
@@ -168,7 +185,8 @@ async fn raw_subscribe_is_byte_exact_with_zstd() {
     assert_eq!(message.key, "raw/big");
     assert!(message.bytes == payload, "byte-exact after reassembly and zstd ({} bytes)", message.bytes.len());
     let stats = client.stats().await.unwrap();
-    let sent: f64 = stats["channels"].as_array().unwrap().iter().map(|channel| channel["stats"]["bytesSent"].as_f64().unwrap_or_default()).sum();
+    let sent: f64 =
+        stats["channels"].as_array().unwrap().iter().map(|channel| channel["stats"]["bytesSent"].as_f64().unwrap_or_default()).sum();
     assert!(sent > 0.0 && sent < 100_000.0, "zstd on the wire: {sent} bytes sent");
     client.close().await;
     running.shutdown().await.unwrap();
@@ -180,13 +198,30 @@ async fn encoded_messages_carry_their_sample_s_header_when_asked() {
     let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
     let _putter = keep_putting(&session, "fields/x", vec![3, 1, 4]);
     let _attached = keep_putting_attached(&session, "fields/attached", vec![2, 7], "application/cdr", vec![5, 6]);
-    let mut attached = client.subscribe("fields/attached", SubscribeOptions { encoding: Some("test-fields".into()), metadata: Some(true), ..Default::default() }).await.unwrap();
+    let mut attached = client
+        .subscribe("fields/attached", SubscribeOptions { encoding: Some("test-fields".into()), metadata: Some(true), ..Default::default() })
+        .await
+        .unwrap();
     let Message::Data(message) = timeout(Duration::from_secs(10), attached.recv()).await.unwrap().unwrap() else { panic!("not data") };
-    assert_eq!((message.encoding.as_deref(), message.attachment.as_deref(), message.header.map(|header| header.frame_id)), (Some("application/cdr"), Some(&[5u8, 6][..]), Some("frame_2".into())), "the zenoh sample's encoding and attachment too");
+    assert_eq!(
+        (message.encoding.as_deref(), message.attachment.as_deref(), message.header.map(|header| header.frame_id)),
+        (Some("application/cdr"), Some(&[5u8, 6][..]), Some("frame_2".into())),
+        "the zenoh sample's encoding and attachment too"
+    );
     let exact = MessageHeader { sec: 1_761_350_400, nanosec: 987_654_321, frame_id: "frame_3".into(), seq: Some(42) };
-    for (metadata, compress, expected) in [(Some(true), None, Some(exact.clone())), (Some(true), Some(Compress::Zstd), Some(exact)), (Some(false), None, None), (None, None, None)] {
-        let mut subscription = client.subscribe("fields/x", SubscribeOptions { encoding: Some("test-fields".into()), metadata, compress, ..Default::default() }).await.unwrap();
-        let Message::Data(message) = timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap() else { panic!("not data") };
+    for (metadata, compress, expected) in [
+        (Some(true), None, Some(exact.clone())),
+        (Some(true), Some(Compress::Zstd), Some(exact)),
+        (Some(false), None, None),
+        (None, None, None),
+    ] {
+        let mut subscription = client
+            .subscribe("fields/x", SubscribeOptions { encoding: Some("test-fields".into()), metadata, compress, ..Default::default() })
+            .await
+            .unwrap();
+        let Message::Data(message) = timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap() else {
+            panic!("not data")
+        };
         assert_eq!(message.fields.expect("fields")["data"].values(), [3.0, 1.0, 4.0], "the message itself unchanged");
         // (None: a page that doesn't say may not be able to read it)
         assert_eq!(message.header, expected, "metadata {metadata:?}, compress {compress:?}");
@@ -199,7 +234,8 @@ async fn encoded_messages_carry_their_sample_s_header_when_asked() {
 async fn fields_subscribe_is_parsed() {
     let (running, session, url) = start().await;
     let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
-    let mut subscription = client.subscribe("fields/x", SubscribeOptions { encoding: Some("test-fields".into()), ..Default::default() }).await.unwrap();
+    let mut subscription =
+        client.subscribe("fields/x", SubscribeOptions { encoding: Some("test-fields".into()), ..Default::default() }).await.unwrap();
     let _putter = keep_putting(&session, "fields/x", vec![3, 1, 4]);
     let Message::Data(message) = timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap() else { panic!("not data") };
     let fields = message.fields.expect("fields");
@@ -274,7 +310,12 @@ async fn video_arrives_as_h264_access_units_and_answers_keyframe_requests() {
     assert!(stats["channels"][0]["stats"]["keyframeRequests"].as_u64().unwrap() >= 1, "{}", stats["channels"][0]["stats"]);
     // a second video subscription after closing the first reuses its track
     drop(camera);
-    let options = SubscribeOptions { encoding: Some("test-solid".into()), min_quality: Some(1.0), max_resolution: Some((160, 120)), ..Default::default() };
+    let options = SubscribeOptions {
+        encoding: Some("test-solid".into()),
+        min_quality: Some(1.0),
+        max_resolution: Some((160, 120)),
+        ..Default::default()
+    };
     let mut again = client.subscribe("camera/front", options).await.unwrap();
     let first = next_video(&mut again).await;
     assert!(first.keyframe);
@@ -292,7 +333,10 @@ async fn a_running_video_subscription_changes_its_options_in_place() {
     let _putter = keep_putting(&session, "camera/front", solid([200, 40, 90], 320, 240));
     assert_eq!(decode_all(&[next_video(&mut camera).await]).0, (320, 240));
     let now = camera.update(json!({"maxResolution": [160, 120], "playoutDelay": [0, 100], "maxHz": 20})).await.unwrap();
-    assert_eq!((now["maxResolution"].clone(), now["playoutDelay"].clone(), now["maxHz"].clone()), (json!([160, 120]), json!([0.0, 100.0]), json!(20.0)));
+    assert_eq!(
+        (now["maxResolution"].clone(), now["playoutDelay"].clone(), now["maxHz"].clone()),
+        (json!([160, 120]), json!([0.0, 100.0]), json!(20.0))
+    );
     // the new size starts at a keyframe on the same subscription
     let resized = loop {
         let frame = next_video(&mut camera).await;
@@ -389,11 +433,15 @@ async fn a_decode_slower_than_the_frame_interval_does_not_set_the_rate() {
         next_video(&mut camera).await;
         frames += 1;
     }
-    let decode_secs = (SLOW_DECODE_MICROS.load(SeqCst) - micros_before) as f64 / 1e6 / (SLOW_DECODES.load(SeqCst) - decodes_before).max(1) as f64;
+    let decode_secs =
+        (SLOW_DECODE_MICROS.load(SeqCst) - micros_before) as f64 / 1e6 / (SLOW_DECODES.load(SeqCst) - decodes_before).max(1) as f64;
     // one decode at a time could not pass 1 / decode_secs fps
     let serial = 3.0 / decode_secs;
     let most = SLOW_MOST_IN_FLIGHT.load(SeqCst);
-    assert!(most >= 2 && frames as f64 > 1.8 * serial, "{frames} frames in 3 s from a 25 Hz source, {decode_secs:.3} s a decode, at most {most} at once (one at a time: {serial:.0})");
+    assert!(
+        most >= 2 && frames as f64 > 1.8 * serial,
+        "{frames} frames in 3 s from a 25 Hz source, {decode_secs:.3} s a decode, at most {most} at once (one at a time: {serial:.0})"
+    );
     client.close().await;
     running.shutdown().await.unwrap();
 }
@@ -410,7 +458,10 @@ async fn quick_switches_keep_video_flowing() {
         drop(camera);
         camera = match client.subscribe("camera/front", options()).await {
             Ok(camera) => camera,
-            Err(error) => panic!("round {round}: {error:#}; gateway: {}", client.stats().await.map(|stats| stats["channels"].to_string()).unwrap_or_default()),
+            Err(error) => panic!(
+                "round {round}: {error:#}; gateway: {}",
+                client.stats().await.map(|stats| stats["channels"].to_string()).unwrap_or_default()
+            ),
         };
         let mut frames = vec![];
         let start = std::time::Instant::now();
@@ -432,7 +483,10 @@ async fn publish_arrives_in_zenoh() {
     let (running, session, url) = start().await;
     let subscriber = session.declare_subscriber("cmd/vel").await.unwrap();
     let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
-    let publisher = client.publish("cmd/vel", PublisherOptions { delivery: Some(Delivery::Reliable), latency_limit: Some(500.0), ..Default::default() }).await.unwrap();
+    let publisher = client
+        .publish("cmd/vel", PublisherOptions { delivery: Some(Delivery::Reliable), latency_limit: Some(500.0), ..Default::default() })
+        .await
+        .unwrap();
     publisher.put(b"forward").await.unwrap();
     let sample = timeout(Duration::from_secs(5), subscriber.recv_async()).await.unwrap().unwrap();
     assert_eq!(sample.payload().to_bytes().as_ref(), b"forward");
@@ -599,8 +653,11 @@ async fn key_prefix_subscriptions_and_lease_hooks() {
     let server = Server::builder().session(session.clone()).encoding(Prefixed).build().await.unwrap();
     let running = server.clone().bind("127.0.0.1:0").await.unwrap();
     let mut changes = server.changes();
-    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions { heartbeat_hz: 5.0, ..Default::default() }).await.unwrap();
-    let mut prefixed = client.subscribe("cam/*", SubscribeOptions { encoding: Some("test-prefixed".into()), ..Default::default() }).await.unwrap();
+    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions { heartbeat_hz: 5.0, ..Default::default() })
+        .await
+        .unwrap();
+    let mut prefixed =
+        client.subscribe("cam/*", SubscribeOptions { encoding: Some("test-prefixed".into()), ..Default::default() }).await.unwrap();
     let mut raw = client.subscribe("cam/*", SubscribeOptions::default()).await.unwrap();
     assert!(changes.has_changed().unwrap(), "opening subscriptions bumps changes");
     let mut subscriptions = server.subscriptions();
@@ -638,7 +695,9 @@ async fn lease_lost_right_behind_its_grant() {
     let session = zenoh::open(isolated_config()).await.unwrap();
     let server = Server::builder().session(session.clone()).build().await.unwrap();
     let running = server.clone().bind("127.0.0.1:0").await.unwrap();
-    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions { heartbeat_hz: 5.0, ..Default::default() }).await.unwrap();
+    let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions { heartbeat_hz: 5.0, ..Default::default() })
+        .await
+        .unwrap();
     // ends every lease the moment it's granted, so the leaseLost event lands right behind the lease reply
     let expirer = {
         let (server, mut changes) = (server.clone(), server.changes());
@@ -712,18 +771,30 @@ async fn cloudflare_turn_carries_a_relay_only_connection() {
     let api_token = std::env::var("CF_TURN_API_TOKEN").expect("CF_TURN_API_TOKEN");
     let turn = zenoh_gateway::CloudflareTurn::new(key_id, api_token).ttl(Duration::from_secs(600));
     let generated = turn.generate().await.unwrap();
-    assert!(generated.iter().any(|server| server.urls.iter().any(|url| url.starts_with("turn")) && !server.credential.is_empty()), "{generated:?}");
-    assert!(generated.iter().all(|server| server.urls.iter().all(|url| !url.split('?').next().unwrap().ends_with(":53"))), "port 53 dropped");
+    assert!(
+        generated.iter().any(|server| server.urls.iter().any(|url| url.starts_with("turn")) && !server.credential.is_empty()),
+        "{generated:?}"
+    );
+    assert!(
+        generated.iter().all(|server| server.urls.iter().all(|url| !url.split('?').next().unwrap().ends_with(":53"))),
+        "port 53 dropped"
+    );
     let session = zenoh::open(isolated_config()).await.unwrap();
     let server = Server::builder().session(session.clone()).cloudflare_turn(turn).build().await.unwrap();
     let running = server.bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", running.local_addr());
     // relay only: every packet goes through Cloudflare's TURN server, with the credentials the server handed out
-    let client = timeout(Duration::from_secs(30), Client::connect(&url, ClientOptions { relay_only: true, ..Default::default() })).await.unwrap().unwrap();
-    let mut subscription = client.subscribe("turn/data", SubscribeOptions { delivery: Some(Delivery::Reliable), ..Default::default() }).await.unwrap();
+    let client = timeout(Duration::from_secs(30), Client::connect(&url, ClientOptions { relay_only: true, ..Default::default() }))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut subscription =
+        client.subscribe("turn/data", SubscribeOptions { delivery: Some(Delivery::Reliable), ..Default::default() }).await.unwrap();
     let _putter = keep_putting(&session, "turn/data", b"through cloudflare".to_vec());
     for _ in 0..5 {
-        let Message::Data(message) = timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap() else { panic!("not data") };
+        let Message::Data(message) = timeout(Duration::from_secs(10), subscription.recv()).await.unwrap().unwrap() else {
+            panic!("not data")
+        };
         assert_eq!(message.bytes, b"through cloudflare");
     }
     client.close().await;
@@ -749,7 +820,11 @@ async fn a_relay_policy_in_the_ice_reply_makes_the_connection_relay_only() {
     client.close().await;
     let relay = host(Some("relay")).await;
     let refused = timeout(Duration::from_secs(20), Client::connect(&relay, ClientOptions::default())).await;
-    let error = match refused { Ok(Ok(_)) => panic!("relay-only with no TURN server must not connect"), Ok(Err(error)) => format!("{error:#}"), Err(_) => "timed out".to_owned() };
+    let error = match refused {
+        Ok(Ok(_)) => panic!("relay-only with no TURN server must not connect"),
+        Ok(Err(error)) => format!("{error:#}"),
+        Err(_) => "timed out".to_owned(),
+    };
     assert!(error.contains("Relay-only"), "refused for the relay policy: {error}");
 }
 
@@ -757,7 +832,12 @@ async fn a_relay_policy_in_the_ice_reply_makes_the_connection_relay_only() {
 async fn video_av1_channel_arrives_as_av1_and_vp8_without_an_encoder_is_refused() {
     let (running, session, url) = start().await;
     let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
-    let av1 = SubscribeOptions { encoding: Some("test-solid".into()), channel: Some("video-av1".into()), min_quality: Some(1.0), ..Default::default() };
+    let av1 = SubscribeOptions {
+        encoding: Some("test-solid".into()),
+        channel: Some("video-av1".into()),
+        min_quality: Some(1.0),
+        ..Default::default()
+    };
     let mut camera = client.subscribe("camera/front", av1).await.unwrap();
     let _putter = keep_putting(&session, "camera/front", solid([200, 40, 90], 320, 240));
     let frame = next_video(&mut camera).await;
@@ -786,7 +866,11 @@ impl MessageEncoding for Echo {
         if channel != Channel::Data || options.keys().any(|key| key != "prefix" && key != "fields") {
             return Err("test-echo: data, with prefix and fields".into());
         }
-        Ok(if options.get("fields").and_then(|value| value.as_bool()) == Some(true) { EncodingOutput::Fields } else { EncodingOutput::Data })
+        Ok(if options.get("fields").and_then(|value| value.as_bool()) == Some(true) {
+            EncodingOutput::Fields
+        } else {
+            EncodingOutput::Data
+        })
     }
 
     fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
@@ -794,7 +878,12 @@ impl MessageEncoding for Echo {
     }
 
     fn encode(&self, frame: &DecodedFrame, options: &EncodeOptions) -> Result<Vec<u8>> {
-        let text = format!("{}{} q={:.2}", options.str("prefix").unwrap_or(""), String::from_utf8_lossy(frame.downcast::<Vec<u8>>()?), options.quality);
+        let text = format!(
+            "{}{} q={:.2}",
+            options.str("prefix").unwrap_or(""),
+            String::from_utf8_lossy(frame.downcast::<Vec<u8>>()?),
+            options.quality
+        );
         Ok(if options.options.contains_key("fields") { Fields::new().text("text", &text).build() } else { text.into_bytes() })
     }
 }
@@ -806,7 +895,11 @@ async fn encode_options_reach_the_encoding_and_quality_caps_it() {
     let running = server.bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", running.local_addr());
     let client = Client::connect(&url, ClientOptions::default()).await.unwrap();
-    let options = |json: serde_json::Value| SubscribeOptions { encoding: Some("test-echo".into()), encode_options: Some(serde_json::from_value(json).unwrap()), ..Default::default() };
+    let options = |json: serde_json::Value| SubscribeOptions {
+        encoding: Some("test-echo".into()),
+        encode_options: Some(serde_json::from_value(json).unwrap()),
+        ..Default::default()
+    };
     let mut bytes = client.subscribe("echo/a", options(serde_json::json!({"prefix": ">", "quality": 0.25}))).await.unwrap();
     let mut fields = client.subscribe("echo/a", options(serde_json::json!({"fields": true}))).await.unwrap();
     let _putter = keep_putting(&session, "echo/a", b"hi".to_vec());
@@ -826,7 +919,12 @@ async fn a_takeover_lease_moves_the_cameras_to_the_newest_viewer() {
     let _camera = keep_putting(&session, "robot/cam/front", b"frame".to_vec());
     let _tf = keep_putting(&session, "robot/tf", b"tf".to_vec());
     let options = ClientOptions { heartbeat_hz: 10.0, heartbeat_misses: 20, ..Default::default() };
-    let seat = || LeaseOptions { publish: vec!["robot/cmd_vel".into()], subscribe: vec!["robot/cam/**".into()], allow_takeover: true, ..Default::default() };
+    let seat = || LeaseOptions {
+        publish: vec!["robot/cmd_vel".into()],
+        subscribe: vec!["robot/cam/**".into()],
+        allow_takeover: true,
+        ..Default::default()
+    };
     let old_viewer = Client::connect(&url, options.clone()).await.unwrap();
     let old_lease = old_viewer.lease_with(seat()).await.unwrap();
     assert!(old_lease.group.starts_with('#'), "unnamed: {}", old_lease.group);
@@ -853,7 +951,10 @@ async fn a_takeover_lease_moves_the_cameras_to_the_newest_viewer() {
     drop(hard);
     // a lease's own timeoutMs outlasts the connection's 2 s heartbeat deadline, which still trips deadmen and leases without one
     let stalling = Client::connect(&url, ClientOptions { heartbeat_hz: 10.0, heartbeat_misses: 20, ..Default::default() }).await.unwrap();
-    let patient = stalling.lease_with(LeaseOptions { publish: vec!["robot/patient".into()], timeout_ms: Some(5000.0), ..Default::default() }).await.unwrap();
+    let patient = stalling
+        .lease_with(LeaseOptions { publish: vec!["robot/patient".into()], timeout_ms: Some(5000.0), ..Default::default() })
+        .await
+        .unwrap();
     assert_eq!(patient.timeout_ms, Some(5000.0), "the gateway says it applies the timeout");
     let tight = stalling.lease_with(LeaseOptions { publish: vec!["robot/tight".into()], ..Default::default() }).await.unwrap();
     stalling.pause_heartbeat(true);
@@ -864,12 +965,22 @@ async fn a_takeover_lease_moves_the_cameras_to_the_newest_viewer() {
     assert!(patient.lost().is_none(), "beats resumed before 5 s: still held");
     stalling.pause_heartbeat(true);
     assert_eq!(timeout(Duration::from_secs(8), patient.wait_lost()).await.unwrap(), "heartbeat");
-    let refused = stalling.lease_with(LeaseOptions { publish: vec!["robot/x".into()], timeout_ms: Some(61_000.0), ..Default::default() }).await.err().expect("over 60 s").to_string();
+    let refused = stalling
+        .lease_with(LeaseOptions { publish: vec!["robot/x".into()], timeout_ms: Some(61_000.0), ..Default::default() })
+        .await
+        .err()
+        .expect("over 60 s")
+        .to_string();
     assert!(refused.contains("timeoutMs must be at most 60000"), "{refused}");
     stalling.close().await;
     // a heartbeat slower than the server's slowest_lease_heartbeat_allowed (default 60 s) gets no lease
     let sleepy = Client::connect(&url, ClientOptions { heartbeat_hz: 0.01, heartbeat_misses: 3, ..Default::default() }).await.unwrap();
-    let refused = sleepy.lease_with(LeaseOptions { publish: vec!["robot/arm".into()], ..Default::default() }).await.err().expect("too slow").to_string();
+    let refused = sleepy
+        .lease_with(LeaseOptions { publish: vec!["robot/arm".into()], ..Default::default() })
+        .await
+        .err()
+        .expect("too slow")
+        .to_string();
     assert!(refused.contains("at most 60 s, got 300 s"), "{refused}");
     sleepy.close().await;
     for client in [old_viewer, new_viewer, bystander] {
@@ -882,7 +993,8 @@ async fn a_takeover_lease_moves_the_cameras_to_the_newest_viewer() {
 async fn tls_serves_https_with_the_given_certificate() {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let session = zenoh::open(isolated_config()).await.unwrap();
-    let server = Server::builder().session(session).tls_pem(certified.cert.pem(), certified.signing_key.serialize_pem()).build().await.unwrap();
+    let server =
+        Server::builder().session(session).tls_pem(certified.cert.pem(), certified.signing_key.serialize_pem()).build().await.unwrap();
     let running = server.bind("127.0.0.1:0").await.unwrap();
     let port = running.local_addr().port();
     let https = reqwest::Client::builder()
@@ -890,7 +1002,8 @@ async fn tls_serves_https_with_the_given_certificate() {
         .resolve("localhost", running.local_addr())
         .build()
         .unwrap();
-    let health: serde_json::Value = https.get(format!("https://localhost:{port}{}", zenoh_gateway::HEALTH_PATH)).send().await.unwrap().json().await.unwrap();
+    let health: serde_json::Value =
+        https.get(format!("https://localhost:{port}{}", zenoh_gateway::HEALTH_PATH)).send().await.unwrap().json().await.unwrap();
     assert_eq!(health["service"], "zenoh-gateway");
     // the signaling route answers over HTTPS too (a malformed offer is refused, not dropped)
     let offer = https.post(format!("https://localhost:{port}/offer")).json(&serde_json::json!({})).send().await.unwrap();
@@ -949,7 +1062,8 @@ impl StreamDecoder for HoldOne {
         let published_ms = f64::from_le_bytes(sample.payload[1..9].try_into().unwrap());
         // the picture is painted with its sample's number and stamped with when that sample was published, so what
         // arrives can be matched to the sample it came from without trusting the gateway to say
-        let picture = VideoImage::rgb8(160, 120, [number * HELD_SHADE, 40, 90].repeat(160 * 120))?.with_header(published_ms / 1000.0, &format!("sample_{number}"));
+        let picture = VideoImage::rgb8(160, 120, [number * HELD_SHADE, 40, 90].repeat(160 * 120))?
+            .with_header(published_ms / 1000.0, &format!("sample_{number}"));
         let out = self.held.replace((frame_id, DecodedFrame::Video(picture)));
         self.last_frame_id = out.as_ref().map(|(id, _)| *id);
         Ok(out.map(|(_, frame)| frame))
@@ -1013,8 +1127,14 @@ async fn a_held_picture_is_sent_with_its_own_sample_s_timing() {
         let number = (red / HELD_SHADE as f64).round() as u8;
         assert!((red - (number * HELD_SHADE) as f64).abs() < 8.0, "a sample's number has to be readable back off the picture: red {red}");
         let Some(info) = infos.iter().find(|info| info.rtp_timestamp == Some(frame.rtp_timestamp)) else { continue };
-        let (Some(stamp), Some(received_ms)) = (info.stamp, info.received_ms) else { panic!("the picture's stamp and the sample's arrival") };
-        assert_eq!(info.frame_id.as_deref(), Some(format!("sample_{number}").as_str()), "the frame's metadata describes the picture that arrived");
+        let (Some(stamp), Some(received_ms)) = (info.stamp, info.received_ms) else {
+            panic!("the picture's stamp and the sample's arrival")
+        };
+        assert_eq!(
+            info.frame_id.as_deref(),
+            Some(format!("sample_{number}").as_str()),
+            "the frame's metadata describes the picture that arrived"
+        );
         // the gateway got this picture's sample a moment before it was published; the sample it pushed in to get the
         // picture out was published a whole interval later
         gaps.push((received_ms - stamp * 1000.0, number, info.seq));
@@ -1022,7 +1142,13 @@ async fn a_held_picture_is_sent_with_its_own_sample_s_timing() {
     }
     assert!(checked >= 4, "only {checked} of {} frames could be matched to their metadata", frames.len());
     let worst = gaps.iter().copied().fold((0.0f64, 0, 0), |worst, gap| if gap.0 > worst.0 { gap } else { worst });
-    assert!(worst.0 < INTERVAL.as_secs_f64() * 1000.0 * 0.5, "sample {} (seq {}) was published {:.0} ms before the gateway says it arrived, which is the next sample's arrival: {gaps:?}", worst.1, worst.2, worst.0);
+    assert!(
+        worst.0 < INTERVAL.as_secs_f64() * 1000.0 * 0.5,
+        "sample {} (seq {}) was published {:.0} ms before the gateway says it arrived, which is the next sample's arrival: {gaps:?}",
+        worst.1,
+        worst.2,
+        worst.0
+    );
     // and each picture's own sample is a later one than the last picture's: the stream is in order, one picture a sample
     let numbers: Vec<u8> = gaps.iter().map(|gap| gap.1).collect();
     assert!(numbers.windows(2).all(|pair| pair[1] == (pair[0] + 1) % 12), "one picture per sample, in order: {numbers:?}");
@@ -1059,8 +1185,12 @@ async fn two_cameras_under_one_subscription_each_keep_their_own_timing() {
     let enough = |gaps: &BTreeMap<String, Vec<f64>>| gaps.len() == 2 && gaps.values().all(|measured| measured.len() >= 4);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !enough(&gaps) && std::time::Instant::now() < deadline {
-        if let Message::VideoInfo(info) = timeout(Duration::from_secs(5), cameras.recv()).await.expect("a message").expect("subscription open") {
-            let (Some(stamp), Some(received_ms)) = (info.stamp, info.received_ms) else { panic!("the picture's stamp and the sample's arrival") };
+        if let Message::VideoInfo(info) =
+            timeout(Duration::from_secs(5), cameras.recv()).await.expect("a message").expect("subscription open")
+        {
+            let (Some(stamp), Some(received_ms)) = (info.stamp, info.received_ms) else {
+                panic!("the picture's stamp and the sample's arrival")
+            };
             gaps.entry(info.key.clone()).or_default().push(received_ms - stamp * 1000.0);
         }
     }
@@ -1077,7 +1207,8 @@ async fn two_cameras_under_one_subscription_each_keep_their_own_timing() {
         assert!(worst < 45.0, "{key}: a picture was sent with a stamp {worst:.0} ms before the arrival the gateway reported: {measured:?}");
     }
     let stats = client.stats().await.unwrap();
-    let errors: u64 = stats["channels"].as_array().unwrap().iter().map(|channel| channel["stats"]["encodingErrors"].as_u64().unwrap_or_default()).sum();
+    let errors: u64 =
+        stats["channels"].as_array().unwrap().iter().map(|channel| channel["stats"]["encodingErrors"].as_u64().unwrap_or_default()).sum();
     assert_eq!(errors, 0, "a picture whose sample had been dropped would be counted here: {}", stats["channels"][0]["stats"]);
     running.shutdown().await.unwrap();
 }
@@ -1130,7 +1261,8 @@ async fn a_dropped_sample_says_how_long_its_consumer_was_away() {
     let session = zenoh::open(isolated_config()).await.unwrap();
     let running = Server::builder().session(session.clone()).encoding(SlowStream).build().await.unwrap().bind("127.0.0.1:0").await.unwrap();
     let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions::default()).await.unwrap();
-    let options = SubscribeOptions { encoding: Some("test-slow-stream".into()), min_quality: Some(1.0), max_hz: Some(30.0), ..Default::default() };
+    let options =
+        SubscribeOptions { encoding: Some("test-slow-stream".into()), min_quality: Some(1.0), max_hz: Some(30.0), ..Default::default() };
     let mut camera = client.subscribe("camera/front", options).await.unwrap();
     let before = SLOW_STREAM_RESYNCS.load(SeqCst);
     let putter = tokio::spawn({
@@ -1245,10 +1377,14 @@ impl zenoh_gateway::VideoEncoder for SlowEncoder {
 async fn a_loop_that_cannot_keep_up_skips_encodes_rather_than_dropping_samples() {
     logged();
     let session = zenoh::open(isolated_config()).await.unwrap();
-    let server = Server::builder().session(session.clone()).encoding(FastStream).video_encoder(|| Box::new(SlowEncoder(zenoh_gateway::H264Encoder::default())));
+    let server = Server::builder()
+        .session(session.clone())
+        .encoding(FastStream)
+        .video_encoder(|| Box::new(SlowEncoder(zenoh_gateway::H264Encoder::default())));
     let running = server.build().await.unwrap().bind("127.0.0.1:0").await.unwrap();
     let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions::default()).await.unwrap();
-    let options = SubscribeOptions { encoding: Some("test-fast-stream".into()), min_quality: Some(1.0), max_hz: Some(30.0), ..Default::default() };
+    let options =
+        SubscribeOptions { encoding: Some("test-fast-stream".into()), min_quality: Some(1.0), max_hz: Some(30.0), ..Default::default() };
     let mut camera = client.subscribe("camera/front", options).await.unwrap();
     let before = FAST_STREAM_RESYNCS.load(SeqCst);
     let putter = tokio::spawn({
@@ -1279,7 +1415,11 @@ async fn a_loop_that_cannot_keep_up_skips_encodes_rather_than_dropping_samples()
     let (dropped, resyncs, skips) = (of("droppedQueue"), of("streamResyncs"), of("catchUpSkips"));
     assert!(skips > 0.0, "a 50 ms encode against a 30 Hz publisher has to catch up: {}", stats["channels"][0]["stats"]);
     assert_eq!(dropped, 0.0, "catching up is what keeps samples from being dropped: {}", stats["channels"][0]["stats"]);
-    assert_eq!((resyncs, FAST_STREAM_RESYNCS.load(SeqCst) - before), (0.0, 0), "and a sample that is never dropped is a decoder that never starts over");
+    assert_eq!(
+        (resyncs, FAST_STREAM_RESYNCS.load(SeqCst) - before),
+        (0.0, 0),
+        "and a sample that is never dropped is a decoder that never starts over"
+    );
     // and the viewer is still being sent frames, at what the encode sustains rather than nothing
     assert!(frames > 20, "only {frames} frames in 4 s: skipping encodes must not starve the viewer");
     running.shutdown().await.unwrap();
@@ -1333,9 +1473,15 @@ impl StreamDecoder for FallibleOne {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_decode_does_not_cost_the_stream_its_decoder() {
     let session = zenoh::open(isolated_config()).await.unwrap();
-    let running = Server::builder().session(session.clone()).encoding(FallibleStream).build().await.unwrap().bind("127.0.0.1:0").await.unwrap();
+    let running =
+        Server::builder().session(session.clone()).encoding(FallibleStream).build().await.unwrap().bind("127.0.0.1:0").await.unwrap();
     let client = Client::connect(&format!("http://{}", running.local_addr()), ClientOptions::default()).await.unwrap();
-    let options = SubscribeOptions { encoding: Some("test-fallible-stream".into()), min_quality: Some(1.0), max_hz: Some(30.0), ..Default::default() };
+    let options = SubscribeOptions {
+        encoding: Some("test-fallible-stream".into()),
+        min_quality: Some(1.0),
+        max_hz: Some(30.0),
+        ..Default::default()
+    };
     let mut camera = client.subscribe("camera/front", options).await.unwrap();
     let putter = tokio::spawn({
         let session = session.clone();

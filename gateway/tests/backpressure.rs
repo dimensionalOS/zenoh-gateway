@@ -105,11 +105,16 @@ async fn start_shaped_link(server_url: String, down: Direction, up: Direction) -
     let route = axum::routing::post(move |axum::Json(mut offer): axum::Json<Value>| {
         let (server_url, queued) = (server_url.clone(), queued.clone());
         async move {
-            let without_candidates: Vec<&str> = offer["sdp"].as_str().unwrap().split("\r\n").filter(|line| !line.starts_with("a=candidate")).collect();
+            let without_candidates: Vec<&str> =
+                offer["sdp"].as_str().unwrap().split("\r\n").filter(|line| !line.starts_with("a=candidate")).collect();
             offer["sdp"] = without_candidates.join("\r\n").into();
-            let mut answer: Value = reqwest::Client::new().post(format!("{server_url}/offer")).json(&offer).send().await.unwrap().json().await.unwrap();
+            let mut answer: Value =
+                reqwest::Client::new().post(format!("{server_url}/offer")).json(&offer).send().await.unwrap().json().await.unwrap();
             let sdp = answer["sdp"].as_str().unwrap().to_owned();
-            let loopback = sdp.split("\r\n").find(|line| line.starts_with("a=candidate") && line.contains(" 127.0.0.1 ")).expect("a loopback candidate");
+            let loopback = sdp
+                .split("\r\n")
+                .find(|line| line.starts_with("a=candidate") && line.contains(" 127.0.0.1 "))
+                .expect("a loopback candidate");
             let target_port: u16 = loopback.split(' ').nth(5).unwrap().parse().unwrap();
             let (port, down_queued) = start_shaper(SocketAddr::from(([127, 0, 0, 1], target_port)), down, up).await;
             *queued.lock().unwrap() = Some(down_queued);
@@ -193,7 +198,10 @@ async fn run(seconds: u64, consume_bytes_per_sec: Option<f64>) -> Vec<Window> {
     let down = Direction { bytes_per_sec: 1_000_000.0, queue_limit_bytes: 2_000_000, delay: Duration::from_millis(30) };
     let up = Direction { bytes_per_sec: 10_000_000.0, queue_limit_bytes: 2_000_000, delay: Duration::from_millis(30) };
     let (url, _queued) = start_shaped_link(server_url, down, up).await;
-    let client = Client::connect(&url, ClientOptions { ice_servers: Some(vec![]), heartbeat_hz: 5.0, heartbeat_misses: 50, ..Default::default() }).await.expect("connect through the shaper");
+    let client =
+        Client::connect(&url, ClientOptions { ice_servers: Some(vec![]), heartbeat_hz: 5.0, heartbeat_misses: 50, ..Default::default() })
+            .await
+            .expect("connect through the shaper");
 
     let started = Instant::now();
     let window_secs = 5.0;
@@ -236,7 +244,9 @@ async fn run(seconds: u64, consume_bytes_per_sec: Option<f64>) -> Vec<Window> {
             loop {
                 ticker.tick().await;
                 let rtt = client.rtt_ms();
-                if rtt != last && let Some(rtt) = rtt {
+                if rtt != last
+                    && let Some(rtt) = rtt
+                {
                     heartbeats.lock().unwrap()[window_of(Instant::now()).min(windows)].push(rtt);
                 }
                 last = rtt;
@@ -251,7 +261,8 @@ async fn run(seconds: u64, consume_bytes_per_sec: Option<f64>) -> Vec<Window> {
     let stats = client.stats().await.unwrap_or_default();
     eprintln!("bandwidth: {}", stats["bandwidth"]);
     client.close().await;
-    let (heartbeats, bulk_ages, small_ages, bulk_bytes) = (heartbeats.lock().unwrap(), bulk_ages.lock().unwrap(), small_ages.lock().unwrap(), bulk_bytes.lock().unwrap());
+    let (heartbeats, bulk_ages, small_ages, bulk_bytes) =
+        (heartbeats.lock().unwrap(), bulk_ages.lock().unwrap(), small_ages.lock().unwrap(), bulk_bytes.lock().unwrap());
     (0..windows)
         .map(|window| Window {
             heartbeat_p50: percentile(&heartbeats[window], 0.5),

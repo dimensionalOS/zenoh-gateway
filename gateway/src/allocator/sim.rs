@@ -156,9 +156,7 @@ impl Link {
 
     /// What the link is carrying `elapsed` into the run.
     fn carrying(&self, elapsed: Duration) -> f64 {
-        self.varying
-            .as_ref()
-            .map_or(self.capacity_bytes_per_sec, |carrying| carrying(elapsed))
+        self.varying.as_ref().map_or(self.capacity_bytes_per_sec, |carrying| carrying(elapsed))
     }
 
     /// A path whose **own delay** moves, independently of any queue — which is the trigger this model could not
@@ -177,9 +175,7 @@ impl Link {
 
     /// The path's own delay `elapsed` into the run.
     fn path_delay_ms(&self, elapsed: Duration) -> f64 {
-        self.wobbling
-            .as_ref()
-            .map_or(self.propagation_ms, |wobbling| wobbling(elapsed))
+        self.wobbling.as_ref().map_or(self.propagation_ms, |wobbling| wobbling(elapsed))
     }
 
     /// The round trip through the queue as it stands: the path itself plus how long what is waiting takes to drain at
@@ -194,22 +190,13 @@ impl Link {
     }
 
     fn filtered(&self, now: Instant) -> (Option<f64>, Option<f64>, Option<f64>) {
-        let least = self
-            .rtts
-            .iter()
-            .map(|(_, rtt)| *rtt)
-            .fold(f64::INFINITY, f64::min);
+        let least = self.rtts.iter().map(|(_, rtt)| *rtt).fold(f64::INFINITY, f64::min);
         let median = |mut taken: Vec<f64>| {
             taken.sort_by(f64::total_cmp);
             taken.get(taken.len() / 2).copied()
         };
-        let typical = median(
-            self.rtts
-                .iter()
-                .filter(|(at, _)| now.duration_since(*at) <= TYPICAL_RTT_WINDOW)
-                .map(|(_, rtt)| *rtt)
-                .collect(),
-        );
+        let typical =
+            median(self.rtts.iter().filter(|(at, _)| now.duration_since(*at) <= TYPICAL_RTT_WINDOW).map(|(_, rtt)| *rtt).collect());
         let quiet = median(self.quiet_rtts.iter().map(|(_, rtt)| *rtt).collect());
         (least.is_finite().then_some(least), typical, quiet)
     }
@@ -224,9 +211,7 @@ impl Link {
         demand_bytes_per_sec: f64,
         latency_target: Option<Duration>,
     ) -> Round {
-        let elapsed = self
-            .start
-            .map_or(Duration::ZERO, |start| now.saturating_duration_since(start));
+        let elapsed = self.start.map_or(Duration::ZERO, |start| now.saturating_duration_since(start));
         let carrying = self.carrying(elapsed);
         let path_ms = self.path_delay_ms(elapsed);
         let (budget, _) = model.pacing(latency_target);
@@ -253,27 +238,17 @@ impl Link {
         // the small stream goes out regardless: it is never what the window holds back
         let trickle = self.trickle_bytes_per_sec * secs;
         let offered = offered + trickle;
-        let dropped = (self.queue_bytes + offered - self.queue_limit_bytes)
-            .max(0.0)
-            .min(offered);
+        let dropped = (self.queue_bytes + offered - self.queue_limit_bytes).max(0.0).min(offered);
         self.queue_bytes += offered - dropped;
         let drained = self.queue_bytes.min(carrying * secs);
         self.queue_bytes -= drained;
 
         let in_flight = self.in_flight_bytes(carrying, path_ms);
         let rtt = self.rtt_ms(carrying, path_ms);
-        while self
-            .rtts
-            .front()
-            .is_some_and(|(at, _)| now.duration_since(*at) > RTT_WINDOW)
-        {
+        while self.rtts.front().is_some_and(|(at, _)| now.duration_since(*at) > RTT_WINDOW) {
             self.rtts.pop_front();
         }
-        while self
-            .quiet_rtts
-            .front()
-            .is_some_and(|(at, _)| now.duration_since(*at) > RTT_WINDOW)
-        {
+        while self.quiet_rtts.front().is_some_and(|(at, _)| now.duration_since(*at) > RTT_WINDOW) {
             self.quiet_rtts.pop_front();
         }
         self.rtts.push_back((now, rtt));
@@ -325,9 +300,9 @@ impl Link {
             carrying_bytes_per_sec: carrying,
             window_waited,
             link_limited,
-            latency_first: model.path_floor_ms().is_some_and(|floor| {
-                latency_target.is_some_and(|target| floor < target.as_secs_f64() * 1000.0)
-            }),
+            latency_first: model
+                .path_floor_ms()
+                .is_some_and(|floor| latency_target.is_some_and(|target| floor < target.as_secs_f64() * 1000.0)),
         }
     }
 
@@ -438,8 +413,7 @@ pub fn steady(value: f64) -> Schedule {
 
 impl Profile {
     fn link(&self) -> Link {
-        let mut link = Link::new(self.nominal_bytes_per_sec, self.propagation_ms)
-            .with_trickle(self.trickle_bytes_per_sec);
+        let mut link = Link::new(self.nominal_bytes_per_sec, self.propagation_ms).with_trickle(self.trickle_bytes_per_sec);
         if let Some(carrying) = self.carrying.clone() {
             link = link.with_capacity(move |elapsed| carrying(elapsed));
         }
@@ -450,66 +424,31 @@ impl Profile {
     }
 
     /// Runs the profile for `rounds` rounds of `secs` and scores it.
-    pub fn score(
-        &self,
-        rounds: u32,
-        secs: f64,
-        latency_target: Option<Duration>,
-    ) -> (Outcome, LinkModel) {
+    pub fn score(&self, rounds: u32, secs: f64, latency_target: Option<Duration>) -> (Outcome, LinkModel) {
         let mut link = self.link();
         let mut model = LinkModel::default();
-        let carried: Vec<f64> = (0..rounds)
-            .map(|round| link.carrying(Duration::from_secs_f64(secs * round as f64)))
-            .collect();
-        let played = link.run(
-            &mut model,
-            Instant::now(),
-            rounds,
-            secs,
-            self.demand_bytes_per_sec,
-            latency_target,
-        );
+        let carried: Vec<f64> = (0..rounds).map(|round| link.carrying(Duration::from_secs_f64(secs * round as f64))).collect();
+        let played = link.run(&mut model, Instant::now(), rounds, secs, self.demand_bytes_per_sec, latency_target);
 
         // what was wanted *and* there to be had: a page asking 2.5 MB/s of a 3.5 MB/s link can only ever get 71% of
         // the link, so scoring against the link alone would mark a perfect run a failure
-        let could = carried
-            .iter()
-            .map(|carrying| carrying.min(self.demand_bytes_per_sec + self.trickle_bytes_per_sec))
-            .sum::<f64>()
-            * secs;
-        let did = played
-            .iter()
-            .map(|round| round.delivered_bytes_per_sec)
-            .sum::<f64>()
-            * secs;
-        let target_ms =
-            latency_target.map_or(f64::INFINITY, |target| target.as_secs_f64() * 1000.0);
+        let could = carried.iter().map(|carrying| carrying.min(self.demand_bytes_per_sec + self.trickle_bytes_per_sec)).sum::<f64>() * secs;
+        let did = played.iter().map(|round| round.delivered_bytes_per_sec).sum::<f64>() * secs;
+        let target_ms = latency_target.map_or(f64::INFINITY, |target| target.as_secs_f64() * 1000.0);
         // the path's own delay over the run, as the profile defines it — never as the model perceives it
-        let truly = |elapsed: Duration| {
-            self.path_delay_ms
-                .as_ref()
-                .map_or(self.propagation_ms, |delay| delay(elapsed))
-        };
-        let true_path_floor_ms = (0..rounds)
-            .map(|round| truly(Duration::from_secs_f64(secs * round as f64)))
-            .fold(f64::INFINITY, f64::min);
+        let truly = |elapsed: Duration| self.path_delay_ms.as_ref().map_or(self.propagation_ms, |delay| delay(elapsed));
+        let true_path_floor_ms = (0..rounds).map(|round| truly(Duration::from_secs_f64(secs * round as f64))).fold(f64::INFINITY, f64::min);
         let path_was_slow = true_path_floor_ms >= target_ms;
         (
             Outcome {
-                delivered_fraction: if could > 0.0 {
-                    (did / could).min(1.0)
-                } else {
-                    0.0
-                },
+                delivered_fraction: if could > 0.0 { (did / could).min(1.0) } else { 0.0 },
                 peak_queue_ms: played
                     .iter()
                     .zip(&carried)
                     .map(|(round, carrying)| round.queue_bytes / carrying * 1000.0)
                     .fold(0.0, f64::max),
                 peak_window_bytes: peak(&played, |round| round.window_bytes as f64),
-                peak_allowed_window_bytes: peak(&played, |round| {
-                    round.estimate_bytes_per_sec * round.gain.max(1.0) * target_ms / 1000.0
-                }),
+                peak_allowed_window_bytes: peak(&played, |round| round.estimate_bytes_per_sec * round.gain.max(1.0) * target_ms / 1000.0),
                 // the floor being under the target is what makes leaving the mode a latch rather than a slow path
                 rounds_latched: played.iter().filter(|round| !round.latency_first).count(),
                 rounds: played.len(),
@@ -537,13 +476,7 @@ pub fn profiles() -> Vec<Profile> {
             // the robot's tunnel over Wi-Fi: the max filter holds the good phase while the bad one is being carried
             name: "a varying link, 3.5 MB/s then 1.2",
             nominal_bytes_per_sec: 3_500_000.0,
-            carrying: Some(schedule(|elapsed| {
-                if elapsed.as_secs_f64() % 10.0 < 3.0 {
-                    3_500_000.0
-                } else {
-                    1_200_000.0
-                }
-            })),
+            carrying: Some(schedule(|elapsed| if elapsed.as_secs_f64() % 10.0 < 3.0 { 3_500_000.0 } else { 1_200_000.0 })),
             path_delay_ms: None,
             propagation_ms: 12.0,
             trickle_bytes_per_sec: 7_000.0,
@@ -554,13 +487,7 @@ pub fn profiles() -> Vec<Profile> {
             name: "a one-second path spike on a quiet link",
             nominal_bytes_per_sec: 2_500_000.0,
             carrying: Some(steady(2_500_000.0)),
-            path_delay_ms: Some(schedule(|elapsed| {
-                if (20.0..21.0).contains(&elapsed.as_secs_f64()) {
-                    494.0
-                } else {
-                    12.0
-                }
-            })),
+            path_delay_ms: Some(schedule(|elapsed| if (20.0..21.0).contains(&elapsed.as_secs_f64()) { 494.0 } else { 12.0 })),
             propagation_ms: 12.0,
             trickle_bytes_per_sec: 7_000.0,
             demand_bytes_per_sec: 2_000_000.0,
@@ -569,20 +496,8 @@ pub fn profiles() -> Vec<Profile> {
             // ... and the same spike while the link is also varying, which is the robot's actual combination
             name: "a path spike while the link varies",
             nominal_bytes_per_sec: 3_500_000.0,
-            carrying: Some(schedule(|elapsed| {
-                if elapsed.as_secs_f64() % 10.0 < 3.0 {
-                    3_500_000.0
-                } else {
-                    1_200_000.0
-                }
-            })),
-            path_delay_ms: Some(schedule(|elapsed| {
-                if (20.0..21.0).contains(&elapsed.as_secs_f64()) {
-                    494.0
-                } else {
-                    12.0
-                }
-            })),
+            carrying: Some(schedule(|elapsed| if elapsed.as_secs_f64() % 10.0 < 3.0 { 3_500_000.0 } else { 1_200_000.0 })),
+            path_delay_ms: Some(schedule(|elapsed| if (20.0..21.0).contains(&elapsed.as_secs_f64()) { 494.0 } else { 12.0 })),
             propagation_ms: 12.0,
             trickle_bytes_per_sec: 7_000.0,
             demand_bytes_per_sec: 2_500_000.0,
@@ -601,13 +516,7 @@ pub fn profiles() -> Vec<Profile> {
             // the link drops to almost nothing and comes back: does delivery return?
             name: "a link that drops out for 5 s and returns",
             nominal_bytes_per_sec: 2_500_000.0,
-            carrying: Some(schedule(|elapsed| {
-                if (20.0..25.0).contains(&elapsed.as_secs_f64()) {
-                    20_000.0
-                } else {
-                    2_500_000.0
-                }
-            })),
+            carrying: Some(schedule(|elapsed| if (20.0..25.0).contains(&elapsed.as_secs_f64()) { 20_000.0 } else { 2_500_000.0 })),
             path_delay_ms: None,
             propagation_ms: 12.0,
             trickle_bytes_per_sec: 7_000.0,

@@ -9,10 +9,15 @@ use crate::encoding::{Channel, DecodedFrame, EncodingSample, MessageEncoding, Me
 use crate::subscription::{self, SubShared};
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use rtc::interceptor::{Attribute, BandwidthEstimator, EstimatorStats, Gcc, Interceptor, Packet, PacketReport, Registry, Slot, StreamInfo, TaggedPacket};
+use parking_lot::Mutex;
+use rtc::interceptor::{
+    Attribute, BandwidthEstimator, EstimatorStats, Gcc, Interceptor, Packet, PacketReport, Registry, Slot, StreamInfo, TaggedPacket,
+};
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
-use rtc::peer_connection::configuration::interceptor_registry::{CongestionFeedback, configure_congestion_control, register_default_interceptors};
+use rtc::peer_connection::configuration::interceptor_registry::{
+    CongestionFeedback, configure_congestion_control, register_default_interceptors,
+};
 use rtc::peer_connection::configuration::media_engine::MediaEngine;
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
@@ -20,12 +25,13 @@ use rtc::rtcp::sender_report::SenderReport;
 use rtc::rtp::extension::HeaderExtension;
 use rtc::rtp::extension::playout_delay_extension::PlayoutDelayExtension;
 use rtc::rtp_transceiver::rtp_sender::RTCRtpHeaderExtensionCapability;
-use rtc::rtp_transceiver::rtp_sender::{RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind};
+use rtc::rtp_transceiver::rtp_sender::{
+    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
+};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::future::Future;
 use std::sync::Arc;
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use webrtc::data_channel::DataChannel;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
@@ -36,7 +42,8 @@ use webrtc::rtp_transceiver::RtpSender;
 /// Every format a track can have, with the payload type the gateway offers it at.
 /// (`video/H265` at 126, the payload type the webrtc fork's own default codecs use for it; the browser's answer decides
 /// the payload type actually sent, see `negotiated_payload_type`.)
-const FORMATS: [(&str, u8); 6] = [("video/H264", 102), ("video/VP8", 96), ("video/VP9", 98), ("video/AV1", 45), ("video/H265", 126), (OPUS, 111)];
+const FORMATS: [(&str, u8); 6] =
+    [("video/H264", 102), ("video/VP8", 96), ("video/VP9", 98), ("video/AV1", 45), ("video/H265", 126), (OPUS, 111)];
 const OPUS: &str = "audio/opus";
 /// Google Congestion Control bounds, bits/s. It starts where the link estimator starts
 /// (`ServerBuilder::initial_bandwidth_bytes_per_sec`, 512 kbit/s by default), since video is allocated no more than that estimate. The ceiling is only a sanity bound (at 50 Mbit/s it
@@ -87,7 +94,13 @@ pub fn format_of_payload_type(payload_type: u8) -> Option<&'static str> {
 
 fn rtp_codec(mime: &str) -> RTCRtpCodec {
     if mime == OPUS {
-        return RTCRtpCodec { mime_type: mime.to_owned(), clock_rate: 48_000, channels: 2, sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(), rtcp_feedback: vec![] };
+        return RTCRtpCodec {
+            mime_type: mime.to_owned(),
+            clock_rate: 48_000,
+            channels: 2,
+            sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
+            rtcp_feedback: vec![],
+        };
     }
     let feedback = |typ: &str, parameter: &str| RTCPFeedback { typ: typ.to_owned(), parameter: parameter.to_owned() };
     let sdp_fmtp_line = match mime {
@@ -100,7 +113,13 @@ fn rtp_codec(mime: &str) -> RTCRtpCodec {
         "video/H265" => "",
         _ => "",
     };
-    RTCRtpCodec { mime_type: mime.to_owned(), clock_rate: 90_000, channels: 0, sdp_fmtp_line: sdp_fmtp_line.to_owned(), rtcp_feedback: vec![feedback("ccm", "fir"), feedback("nack", ""), feedback("nack", "pli")] }
+    RTCRtpCodec {
+        mime_type: mime.to_owned(),
+        clock_rate: 90_000,
+        channels: 0,
+        sdp_fmtp_line: sdp_fmtp_line.to_owned(),
+        rtcp_feedback: vec![feedback("ccm", "fir"), feedback("nack", ""), feedback("nack", "pli")],
+    }
 }
 
 /// The track format a media channel carries (None: the data channel).
@@ -408,7 +427,11 @@ impl BandwidthEstimator for ReportingEstimator {
         let epoch = *self.epoch.get_or_insert_with(|| reports.first().map_or(now, |report| report.departure));
         let one_way: Vec<f64> = reports
             .iter()
-            .filter_map(|report| report.arrival.map(|arrival| arrival.as_secs_f64() * 1000.0 - report.departure.saturating_duration_since(epoch).as_secs_f64() * 1000.0))
+            .filter_map(|report| {
+                report.arrival.map(|arrival| {
+                    arrival.as_secs_f64() * 1000.0 - report.departure.saturating_duration_since(epoch).as_secs_f64() * 1000.0
+                })
+            })
             .collect();
         if let Some(least) = one_way.iter().copied().reduce(f64::min) {
             self.one_way_floor.push_back((now, least));
@@ -424,7 +447,11 @@ impl BandwidthEstimator for ReportingEstimator {
             for report in reports {
                 if let Some(arrival) = report.arrival.filter(|_| report.arrived) {
                     let arrival_ms = arrival.as_secs_f64() * 1000.0;
-                    self.arrivals.push_back((arrival_ms, report.size, arrival_ms - report.departure.saturating_duration_since(epoch).as_secs_f64() * 1000.0));
+                    self.arrivals.push_back((
+                        arrival_ms,
+                        report.size,
+                        arrival_ms - report.departure.saturating_duration_since(epoch).as_secs_f64() * 1000.0,
+                    ));
                 }
             }
             let span_ms = crate::pacing::SAMPLE_SPAN.as_secs_f64() * 1000.0;
@@ -444,9 +471,16 @@ impl BandwidthEstimator for ReportingEstimator {
                 // 125 KB/s link at 57)
                 // and lost nothing: a full drop-tail queue also carried resends and RTCP the arrivals don't count (a
                 // 1 s queue on a 125 KB/s link read 62-86 KB/s of video, and the estimate halved)
-                let busy = self.lost_at <= newest - span_ms && self.arrivals.iter().zip(self.arrivals.iter().skip(1)).all(|((previous, _, _), (at, _, one_way))| at - (one_way - floor) <= *previous);
-                let least_queue_ms = if busy { within().map(|(_, _, one_way)| one_way - floor).fold(f64::INFINITY, f64::min).max(0.0) } else { 0.0 };
-                *self.rate.delivery.lock() = Some(Delivery { bytes_per_sec: bytes as f64 / (span_ms / 1000.0), least_queue_ms, at: std::time::Instant::now() });
+                let busy = self.lost_at <= newest - span_ms
+                    && self
+                        .arrivals
+                        .iter()
+                        .zip(self.arrivals.iter().skip(1))
+                        .all(|((previous, _, _), (at, _, one_way))| at - (one_way - floor) <= *previous);
+                let least_queue_ms =
+                    if busy { within().map(|(_, _, one_way)| one_way - floor).fold(f64::INFINITY, f64::min).max(0.0) } else { 0.0 };
+                *self.rate.delivery.lock() =
+                    Some(Delivery { bytes_per_sec: bytes as f64 / (span_ms / 1000.0), least_queue_ms, at: std::time::Instant::now() });
             }
         }
         self.inner.on_reports(now, reports);
@@ -586,15 +620,43 @@ pub fn media_setup(initial_bandwidth: f64) -> Result<(MediaEngine, Registry, Arc
         let kind = if mime == OPUS { RtpCodecKind::Audio } else { RtpCodecKind::Video };
         media_engine.register_codec(RTCRtpCodecParameters { rtp_codec: rtp_codec(mime), payload_type }, kind)?;
     }
-    media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: PLAYOUT_DELAY_URI.to_owned() }, RtpCodecKind::Video, None)?;
-    media_engine.register_header_extension(RTCRtpHeaderExtensionCapability { uri: ABS_CAPTURE_TIME_URI.to_owned() }, RtpCodecKind::Video, None)?;
+    media_engine.register_header_extension(
+        RTCRtpHeaderExtensionCapability { uri: PLAYOUT_DELAY_URI.to_owned() },
+        RtpCodecKind::Video,
+        None,
+    )?;
+    media_engine.register_header_extension(
+        RTCRtpHeaderExtensionCapability { uri: ABS_CAPTURE_TIME_URI.to_owned() },
+        RtpCodecKind::Video,
+        None,
+    )?;
     let gcc_initial_bps = initial_bandwidth * 8.0;
-    let rate = Arc::new(VideoRate { gcc_bps: AtomicU64::new(gcc_initial_bps.to_bits()), cap_bps: AtomicU64::new(gcc_initial_bps.to_bits()), link_bps: AtomicU64::new(0), size_ratio: AtomicU64::new(1f64.to_bits()), starting_up: AtomicBool::new(true), received_bytes: AtomicU64::new(0), braked_at: Default::default(), queue_delay_ms: AtomicU64::new(0), delivery: Default::default(), pacer: Default::default(), rtp: Default::default() });
-    let estimator = ReportingEstimator { inner: Gcc::new(gcc_initial_bps, GCC_MIN_BPS, GCC_MAX_BPS), rate: rate.clone(), epoch: None, one_way_floor: VecDeque::new(), arrivals: VecDeque::new(), lost_at: f64::NEG_INFINITY };
+    let rate = Arc::new(VideoRate {
+        gcc_bps: AtomicU64::new(gcc_initial_bps.to_bits()),
+        cap_bps: AtomicU64::new(gcc_initial_bps.to_bits()),
+        link_bps: AtomicU64::new(0),
+        size_ratio: AtomicU64::new(1f64.to_bits()),
+        starting_up: AtomicBool::new(true),
+        received_bytes: AtomicU64::new(0),
+        braked_at: Default::default(),
+        queue_delay_ms: AtomicU64::new(0),
+        delivery: Default::default(),
+        pacer: Default::default(),
+        rtp: Default::default(),
+    });
+    let estimator = ReportingEstimator {
+        inner: Gcc::new(gcc_initial_bps, GCC_MIN_BPS, GCC_MAX_BPS),
+        rate: rate.clone(),
+        epoch: None,
+        one_way_floor: VecDeque::new(),
+        arrivals: VecDeque::new(),
+        lost_at: f64::NEG_INFINITY,
+    };
     let registry = configure_congestion_control(Registry::new(), estimator, CongestionFeedback::Twcc, &mut media_engine)?;
     let reports = Arc::new(SenderReports::default());
     let reader = SenderReportReader { reports: reports.clone(), read: VecDeque::new(), write: VecDeque::new() };
-    let registry = register_default_interceptors(registry, &mut media_engine)?.with(Slot::Custom(14_000), KeyframeRequests::default())
+    let registry = register_default_interceptors(registry, &mut media_engine)?
+        .with(Slot::Custom(14_000), KeyframeRequests::default())
         .with(Slot::Custom(14_001), reader)
         .with(Slot::Custom(15_000), RtpTap { side: TapSide::Enqueue, rate: rate.clone(), read: VecDeque::new(), write: VecDeque::new() })
         .with(Slot::Custom(2_500), RtpTap { side: TapSide::Depart, rate: rate.clone(), read: VecDeque::new(), write: VecDeque::new() })
@@ -653,11 +715,7 @@ const LOW_LATENCY_MAX_UNITS: u16 = 50;
 /// [100, 400] ms) a low-latency [0, x] goes out as [10 ms, max(x, 10 ms)], the nearest delay that keeps real render times.
 fn sent_playout_delay((min, max): (u16, u16), left_low_latency: bool) -> (u16, u16) {
     let low_latency = min == 0 && max <= LOW_LATENCY_MAX_UNITS;
-    if low_latency && left_low_latency {
-        (1, max.max(1))
-    } else {
-        (min, max)
-    }
+    if low_latency && left_low_latency { (1, max.max(1)) } else { (min, max) }
 }
 
 static NEXT_CLAIM: AtomicU64 = AtomicU64::new(1);
@@ -676,7 +734,14 @@ impl MediaTrack {
     /// `playout_delay`: (min, max) in 10 ms units, video only (audio has its own jitter buffer and no playout-delay extension).
     /// `capture_unix_ms`: the source sample's time, sent in the abs-capture-time extension (video only).
     /// `keyframe`: the RTP pacer lets its packets wait longer (`rtp_pacer::MAX_KEYFRAME_AGE`).
-    pub async fn write(&self, data: Vec<u8>, duration: Duration, playout_delay: (u16, u16), capture_unix_ms: Option<f64>, keyframe: bool) -> Result<Written> {
+    pub async fn write(
+        &self,
+        data: Vec<u8>,
+        duration: Duration,
+        playout_delay: (u16, u16),
+        capture_unix_ms: Option<f64>,
+        keyframe: bool,
+    ) -> Result<Written> {
         if keyframe {
             let first = self.rate.rtp.lock().get(&self.ssrc).and_then(|stream| stream.first_timestamp);
             self.rate.pacer.mark_keyframe(self.ssrc, first.map(|first| first.wrapping_add(*self.media_ticks.lock())));
@@ -688,7 +753,11 @@ impl MediaTrack {
             self.left_low_latency.store(true, Ordering::Relaxed);
         }
         let (min_delay, max_delay) = sent_playout_delay(playout_delay, self.left_low_latency.load(Ordering::Relaxed));
-        let writer = if self.mime == OPUS { writer } else { writer.with_extension(HeaderExtension::PlayoutDelay(PlayoutDelayExtension { min_delay, max_delay })) };
+        let writer = if self.mime == OPUS {
+            writer
+        } else {
+            writer.with_extension(HeaderExtension::PlayoutDelay(PlayoutDelayExtension { min_delay, max_delay }))
+        };
         let stamp_due = {
             let mut stamped_at = self.capture_stamped_at.lock();
             let due = stamped_at.is_none_or(|at| at.elapsed() >= CAPTURE_TIME_INTERVAL);
@@ -698,7 +767,10 @@ impl MediaTrack {
             due
         };
         let writer = match capture_unix_ms {
-            Some(capture_unix_ms) if self.mime != OPUS && stamp_due => writer.with_extension(HeaderExtension::Custom { uri: ABS_CAPTURE_TIME_URI.into(), extension: Box::new(AbsCaptureTime { capture_unix_ms }) }),
+            Some(capture_unix_ms) if self.mime != OPUS && stamp_due => writer.with_extension(HeaderExtension::Custom {
+                uri: ABS_CAPTURE_TIME_URI.into(),
+                extension: Box::new(AbsCaptureTime { capture_unix_ms }),
+            }),
             _ => writer,
         };
         writer.write_sample(&sample).await?;
@@ -709,7 +781,8 @@ impl MediaTrack {
             *ticks = ticks.wrapping_add((duration.as_secs_f64() * VIDEO_CLOCK_RATE) as u32);
             at
         };
-        let rtp_timestamp = self.rate.rtp.lock().get(&self.ssrc).and_then(|stream| stream.first_timestamp).map(|first| first.wrapping_add(at));
+        let rtp_timestamp =
+            self.rate.rtp.lock().get(&self.ssrc).and_then(|stream| stream.first_timestamp).map(|first| first.wrapping_add(at));
         Ok(Written { media_time_ms: at as f64 * 1000.0 / VIDEO_CLOCK_RATE, rtp_timestamp })
     }
 
@@ -746,16 +819,31 @@ impl Drop for TrackClaim {
 }
 
 /// Watches the track's RTCP for keyframe requests until the track is dropped.
-fn spawn_rtcp_reader(track: Arc<TrackLocalStaticSample>, dropped: Arc<tokio::sync::Notify>, keyframe_requested: Arc<AtomicBool>, keyframe_requests: Arc<AtomicU64>) {
-    tokio::spawn(read_rtcp(move || {
-        let track = track.clone();
-        async move { track.poll().await }
-    }, dropped, keyframe_requested, keyframe_requests));
+fn spawn_rtcp_reader(
+    track: Arc<TrackLocalStaticSample>,
+    dropped: Arc<tokio::sync::Notify>,
+    keyframe_requested: Arc<AtomicBool>,
+    keyframe_requests: Arc<AtomicU64>,
+) {
+    tokio::spawn(read_rtcp(
+        move || {
+            let track = track.clone();
+            async move { track.poll().await }
+        },
+        dropped,
+        keyframe_requested,
+        keyframe_requests,
+    ));
 }
 
 /// [`spawn_rtcp_reader`]'s loop over `poll`; it ends when `dropped` is notified, whatever `poll` is doing, so the track
 /// (held by `poll`) goes with its `MediaTrack`.
-async fn read_rtcp<F: Future<Output = Option<TrackLocalEvent>>>(mut poll: impl FnMut() -> F, dropped: Arc<tokio::sync::Notify>, keyframe_requested: Arc<AtomicBool>, keyframe_requests: Arc<AtomicU64>) {
+async fn read_rtcp<F: Future<Output = Option<TrackLocalEvent>>>(
+    mut poll: impl FnMut() -> F,
+    dropped: Arc<tokio::sync::Notify>,
+    keyframe_requested: Arc<AtomicBool>,
+    keyframe_requests: Arc<AtomicU64>,
+) {
     loop {
         let event = tokio::select! {
             event = poll() => event,
@@ -809,7 +897,12 @@ pub async fn stop_tracks(connection: &Arc<dyn PeerConnection>, dropped: &[Arc<Me
 
 /// Applies a browser offer (renegotiation over `control`). With `add` (a track format), first adds
 /// a track, which pairs with the offer's new recvonly m-line of its kind, and returns it with its mid.
-pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSessionDescription, add: Option<&'static str>, rate: &Arc<VideoRate>) -> Result<(RTCSessionDescription, Option<Arc<MediaTrack>>)> {
+pub async fn renegotiate(
+    connection: &Arc<dyn PeerConnection>,
+    offer: RTCSessionDescription,
+    add: Option<&'static str>,
+    rate: &Arc<VideoRate>,
+) -> Result<(RTCSessionDescription, Option<Arc<MediaTrack>>)> {
     let added = if let Some(mime) = add {
         let ssrc = rand_ssrc();
         let kind = if mime == OPUS { RtpCodecKind::Audio } else { RtpCodecKind::Video };
@@ -820,7 +913,11 @@ pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSession
                 format!("zenoh-gateway-track-{ssrc}"),
                 "zenoh-gateway".to_owned(),
                 kind,
-                vec![RTCRtpEncodingParameters { rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() }, codec: rtp_codec(mime), ..Default::default() }],
+                vec![RTCRtpEncodingParameters {
+                    rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() },
+                    codec: rtp_codec(mime),
+                    ..Default::default()
+                }],
             ),
         )?);
         let sender = connection.add_track(track.clone() as Arc<dyn TrackLocal>).await?;
@@ -845,7 +942,21 @@ pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSession
     let payload_type = negotiated_payload_type(&sender, mime).await.with_context(|| format!("the browser did not accept {mime}"))?;
     let keyframe_requested = Arc::new(AtomicBool::new(true));
     let dropped = Arc::new(tokio::sync::Notify::new());
-    let video = Arc::new(MediaTrack { mid, mime, track: track.clone(), ssrc, payload_type, keyframe_requested, keyframe_requests: Arc::default(), owner: AtomicU64::new(0), left_low_latency: AtomicBool::new(false), dropped: dropped.clone(), rate: rate.clone(), media_ticks: Default::default(), capture_stamped_at: Default::default() });
+    let video = Arc::new(MediaTrack {
+        mid,
+        mime,
+        track: track.clone(),
+        ssrc,
+        payload_type,
+        keyframe_requested,
+        keyframe_requests: Arc::default(),
+        owner: AtomicU64::new(0),
+        left_low_latency: AtomicBool::new(false),
+        dropped: dropped.clone(),
+        rate: rate.clone(),
+        media_ticks: Default::default(),
+        capture_stamped_at: Default::default(),
+    });
     if mime != OPUS {
         rate.pacer.register_track(ssrc, video.keyframe_requested.clone());
     }
@@ -855,13 +966,20 @@ pub async fn renegotiate(connection: &Arc<dyn PeerConnection>, offer: RTCSession
 
 async fn negotiated_payload_type(sender: &Arc<dyn RtpSender>, mime: &str) -> Result<u8> {
     let codecs = sender.get_parameters().await?.rtp_parameters.codecs;
-    codecs.iter().find(|codec| codec.rtp_codec.mime_type.eq_ignore_ascii_case(mime)).map(|codec| codec.payload_type).context("not negotiated")
+    codecs
+        .iter()
+        .find(|codec| codec.rtp_codec.mime_type.eq_ignore_ascii_case(mime))
+        .map(|codec| codec.payload_type)
+        .context("not negotiated")
 }
 
 fn rand_ssrc() -> u32 {
     use std::hash::{BuildHasher, Hasher};
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    hasher.write_u128(Instant::now().elapsed().as_nanos() ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+    hasher.write_u128(
+        Instant::now().elapsed().as_nanos()
+            ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
+    );
     (hasher.finish() as u32).max(1)
 }
 
@@ -873,7 +991,14 @@ fn rand_ssrc() -> u32 {
 /// exactly) | `f64 receivedMs | f64 encodedMs`: when the gateway got the sample and finished encoding it (unix ms).
 /// The frame header's timestamp is the sample's own (its zenoh timestamp, else `receivedMs`). With flags bit2, the
 /// picture's message header follows ([`frame::encode_header`](crate::frame::encode_header)).
-pub(crate) fn metadata(frame: &EncodedVideo, source: (u32, u32), quality: f64, written: &Written, times: FrameTimes, header: Option<(&MessageHeader, &crate::frame::SampleMeta)>) -> Vec<u8> {
+pub(crate) fn metadata(
+    frame: &EncodedVideo,
+    source: (u32, u32),
+    quality: f64,
+    written: &Written,
+    times: FrameTimes,
+    header: Option<(&MessageHeader, &crate::frame::SampleMeta)>,
+) -> Vec<u8> {
     let mut out = vec![0u8; METADATA_LEN];
     out[28..36].copy_from_slice(&written.media_time_ms.to_le_bytes());
     out[36..44].copy_from_slice(&times.written_ms.to_le_bytes());
@@ -934,12 +1059,19 @@ pub enum DecodeTask {
 /// picture is; or why there is none.
 ///
 /// Given up after `timeout` (`ServerBuilder::encode_timeout`): a hung decoder keeps only its own thread.
-pub async fn finish_decode(task: DecodeTask, timeout: Duration) -> std::result::Result<(Option<Arc<DecodedFrame>>, bool, f64, u64, Option<MessageHeader>, Option<u64>), String> {
+pub async fn finish_decode(
+    task: DecodeTask,
+    timeout: Duration,
+) -> std::result::Result<(Option<Arc<DecodedFrame>>, bool, f64, u64, Option<MessageHeader>, Option<u64>), String> {
     let finished = match task {
-        DecodeTask::Pool(task) => tokio::time::timeout(timeout, task).await.map(|joined| joined.map_err(|error| format!("decoder task failed: {error}"))),
+        DecodeTask::Pool(task) => {
+            tokio::time::timeout(timeout, task).await.map(|joined| joined.map_err(|error| format!("decoder task failed: {error}")))
+        }
         // the thread is the stream's own and outlives this: a sender dropped without answering is a decoder that
         // panicked, which ends the stream rather than the subscription
-        DecodeTask::Stream(answer) => tokio::time::timeout(timeout, answer).await.map(|received| received.map_err(|_| "the stream's decoder thread stopped".to_owned())),
+        DecodeTask::Stream(answer) => tokio::time::timeout(timeout, answer)
+            .await
+            .map(|received| received.map_err(|_| "the stream's decoder thread stopped".to_owned())),
     };
     match finished {
         Ok(Ok((Ok((decoded, reused, header, picture_id)), ms, hash))) => Ok((decoded, reused, ms, hash, header, picture_id)),
@@ -996,7 +1128,9 @@ impl StreamWorker {
                 }
                 let outcome = match decoder.decode(&sample, job.frame_id) {
                     // which sample the picture is, asked here where the decoder lives (`None`: the one just fed)
-                    Ok(frame) => Ok((frame.map(Arc::new), false, codec.header(&sample), Some(decoder.last_frame_id().unwrap_or(job.frame_id)))),
+                    Ok(frame) => {
+                        Ok((frame.map(Arc::new), false, codec.header(&sample), Some(decoder.last_frame_id().unwrap_or(job.frame_id))))
+                    }
                     Err(error) => Err(format!("{error:#}")),
                 };
                 // (a receiver dropped is a frame given up on: the loop moved past it)
@@ -1017,9 +1151,16 @@ impl StreamWorker {
 /// this sample through this encoding ([`decode_shared`](registry::EncodingRegistry::decode_shared)).
 ///
 /// A stateful encoding's stream does not come through here: it has its own thread ([`start_stream_decode`]).
-pub fn start_decode(shared: &SubShared, codec: &Arc<dyn MessageEncoding>, key: String, item: subscription::Pending, frame_id: u64) -> Decoding {
+pub fn start_decode(
+    shared: &SubShared,
+    codec: &Arc<dyn MessageEncoding>,
+    key: String,
+    item: subscription::Pending,
+    frame_id: u64,
+) -> Decoding {
     let payload = item.payload.to_bytes().into_owned();
-    let (hash_key, encoding, codecs, codec, channel) = (key.clone(), item.encoding.clone(), shared.codecs.clone(), codec.clone(), shared.channel);
+    let (hash_key, encoding, codecs, codec, channel) =
+        (key.clone(), item.encoding.clone(), shared.codecs.clone(), codec.clone(), shared.channel);
     let task = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         let sample = EncodingSample::new(&hash_key, &payload, &encoding);
@@ -1123,13 +1264,21 @@ type SizeInUse = ((u32, u32), (u32, u32), Instant);
 /// `starting_up`: the link model is still looking for the link's bandwidth, so the picture grows at once (held back
 /// `SIZE_UP_SETTLE`, video sent a third of its budget, the link model saw no growth and ended its startup at 93 KB/s on
 /// a 1 MB/s link).
-fn steady_size(current: Option<SizeInUse>, source: (u32, u32), wanted: (u32, u32), now: Instant, starting_up: bool, qp_shrunk: bool) -> ((u32, u32), bool) {
+fn steady_size(
+    current: Option<SizeInUse>,
+    source: (u32, u32),
+    wanted: (u32, u32),
+    now: Instant,
+    starting_up: bool,
+    qp_shrunk: bool,
+) -> ((u32, u32), bool) {
     let Some((_, size, changed_at)) = current.filter(|(current_source, _, _)| *current_source == source) else {
         return (wanted, true);
     };
     let ratio = wanted.0 as f64 / size.0.max(1) as f64;
     let since = now.duration_since(changed_at);
-    let change = (ratio < 1.0 / SIZE_BAND && since >= SIZE_DOWN_SETTLE) || (ratio > SIZE_BAND && (starting_up || since >= SIZE_UP_SETTLE))
+    let change = (ratio < 1.0 / SIZE_BAND && since >= SIZE_DOWN_SETTLE)
+        || (ratio > SIZE_BAND && (starting_up || since >= SIZE_UP_SETTLE))
         || (!qp_shrunk && wanted.0 >= source.0 & !1 && size.0 < source.0 & !1);
     if change { (wanted, true) } else { (size, false) }
 }
@@ -1174,7 +1323,9 @@ impl CpuGovernor {
     /// last step; all of it per pixel without one at another scale.
     fn cost_model(&self, scale: f64, encode_ms: f64) -> (f64, f64) {
         let proportional = (0.0, encode_ms / (scale * scale).max(1e-9));
-        let Some((before_scale, before_ms)) = self.before.filter(|(before_scale, _)| (before_scale - scale).abs() > 1e-9) else { return proportional };
+        let Some((before_scale, before_ms)) = self.before.filter(|(before_scale, _)| (before_scale - scale).abs() > 1e-9) else {
+            return proportional;
+        };
         let per_area = ((before_ms - encode_ms) / (before_scale * before_scale - scale * scale)).max(0.0);
         let fixed = encode_ms - per_area * scale * scale;
         if fixed < 0.0 { proportional } else { (fixed, per_area) }
@@ -1319,7 +1470,9 @@ impl QpScaler {
         let qp = self.frames.iter().map(|(_, qp, ..)| qp).sum::<f64>() / count;
         let then = self.frames.iter().map(|(_, _, _, size_bitrate, _)| size_bitrate).sum::<f64>() / count;
         let given = self.frames.iter().map(|(.., bitrate)| bitrate).sum::<f64>() / count;
-        let window = self.since.map_or(SIZE_DOWN_SETTLE, |since| self.frames.back().map_or(SIZE_DOWN_SETTLE, |(last, ..)| last.duration_since(since)).min(SIZE_DOWN_SETTLE));
+        let window = self.since.map_or(SIZE_DOWN_SETTLE, |since| {
+            self.frames.back().map_or(SIZE_DOWN_SETTLE, |(last, ..)| last.duration_since(since)).min(SIZE_DOWN_SETTLE)
+        });
         let spent = self.frames.iter().map(|(_, _, bits, ..)| bits).sum::<f64>() / window.as_secs_f64().max(f64::EPSILON);
         let qp_factor = 2f64.powf((target_qp - qp) / 6.0);
         let qp_factor = if spent < given { qp_factor.max(1.0) } else { qp_factor };
@@ -1359,21 +1512,59 @@ impl EncodeSession {
 impl VideoSessions {
     /// The session `member` encodes in at `grant`: `current` while it still fits (unless it is alone there and an older
     /// session of the same stream and policy fits too), else the oldest such session that fits, else a new one.
-    fn place(&self, current: Option<Arc<EncodeSession>>, member: u64, (codec, format, key): (&str, VideoFormat, &str), policy: VideoPolicy, grant: (f64, f64, f64, bool)) -> Arc<EncodeSession> {
+    fn place(
+        &self,
+        current: Option<Arc<EncodeSession>>,
+        member: u64,
+        (codec, format, key): (&str, VideoFormat, &str),
+        policy: VideoPolicy,
+        grant: (f64, f64, f64, bool),
+    ) -> Arc<EncodeSession> {
         let mut sessions = self.sessions.lock();
-        let same_stream = |session: &&Arc<EncodeSession>| session.codec == codec && session.format == format && session.key == key && session.policy == policy;
-        let oldest_fit = sessions.iter().filter(same_stream).filter(|session| session.fits(member, grant.0)).min_by_key(|session| session.id).cloned();
+        let same_stream = |session: &&Arc<EncodeSession>| {
+            session.codec == codec && session.format == format && session.key == key && session.policy == policy
+        };
+        let oldest_fit =
+            sessions.iter().filter(same_stream).filter(|session| session.fits(member, grant.0)).min_by_key(|session| session.id).cloned();
         let session = match (current, oldest_fit) {
             // the policy changes when the subscription is updated (updateSubscription)
-            (Some(current), oldest) if current.policy == policy && current.fits(member, grant.0) && (current.grants.lock().len() > 1 || oldest.as_ref().is_none_or(|oldest| oldest.id >= current.id)) => current,
+            (Some(current), oldest)
+                if current.policy == policy
+                    && current.fits(member, grant.0)
+                    && (current.grants.lock().len() > 1 || oldest.as_ref().is_none_or(|oldest| oldest.id >= current.id)) =>
+            {
+                current
+            }
             (current, oldest) => {
                 if let Some(current) = current {
                     Self::leave_locked(&mut sessions, &current, member);
                 }
                 oldest.filter(|oldest| sessions.iter().any(|session| Arc::ptr_eq(session, oldest))).unwrap_or_else(|| {
-                    let state = SessionState { encoder: None, governor: CpuGovernor::new(), log: VecDeque::new(), next_seq: 0, last_input: None, keyframe_wanted: true, source: (640, 480), scale: 1.0, size: None, qp: QpScaler::default(), qp_shrunk: false, pending: VecDeque::new(), next_frame_id: 0 };
+                    let state = SessionState {
+                        encoder: None,
+                        governor: CpuGovernor::new(),
+                        log: VecDeque::new(),
+                        next_seq: 0,
+                        last_input: None,
+                        keyframe_wanted: true,
+                        source: (640, 480),
+                        scale: 1.0,
+                        size: None,
+                        qp: QpScaler::default(),
+                        qp_shrunk: false,
+                        pending: VecDeque::new(),
+                        next_frame_id: 0,
+                    };
                     let id = self.next_session.fetch_add(1, Ordering::Relaxed);
-                    let session = Arc::new(EncodeSession { id, codec: codec.to_owned(), format, key: key.to_owned(), policy, grants: Mutex::default(), state: tokio::sync::Mutex::new(state) });
+                    let session = Arc::new(EncodeSession {
+                        id,
+                        codec: codec.to_owned(),
+                        format,
+                        key: key.to_owned(),
+                        policy,
+                        grants: Mutex::default(),
+                        state: tokio::sync::Mutex::new(state),
+                    });
                     sessions.push(session.clone());
                     session
                 })
@@ -1494,7 +1685,8 @@ impl Profile {
     /// elsewhere 20.9`. "Elsewhere" is the point of the line — it is the part no stat accounts for.
     fn line(&self, key: &str, over: Duration) -> String {
         let each = |stage: Duration| stage.as_secs_f64() * 1000.0 / self.iterations.max(1) as f64;
-        let (pick, decode, encode, write, send) = (each(self.pick), each(self.decode), each(self.encode), each(self.write), each(self.send));
+        let (pick, decode, encode, write, send) =
+            (each(self.pick), each(self.decode), each(self.encode), each(self.write), each(self.send));
         let interval = over.as_secs_f64() * 1000.0 / self.iterations.max(1) as f64;
         let rate = self.iterations as f64 / over.as_secs_f64().max(f64::MIN_POSITIVE);
         format!(
@@ -1542,17 +1734,27 @@ struct Step {
 
 /// One member's turn with one sample: encode it if it is newer than anything the session encoded (otherwise another
 /// member already did), then take every frame of the session this member hasn't sent, from a keyframe on.
-async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, codecs: Arc<EncodingRegistry>, codec: Arc<dyn MessageEncoding>) -> Step {
+async fn step(
+    session: Arc<EncodeSession>,
+    member: &mut Member,
+    input: Input,
+    codecs: Arc<EncodingRegistry>,
+    codec: Arc<dyn MessageEncoding>,
+) -> Step {
     let mut state = session.state.lock().await;
     let mut out = Step::default();
     // a new member starts at the newest frame if that is a keyframe, else at the next one
-    let next_seq = *member.next_seq.get_or_insert_with(|| state.log.back().filter(|logged| logged.frame.keyframe).map_or(state.next_seq, |logged| logged.seq));
+    let next_seq = *member
+        .next_seq
+        .get_or_insert_with(|| state.log.back().filter(|logged| logged.frame.keyframe).map_or(state.next_seq, |logged| logged.seq));
     let can_sync = member.synced || state.log.iter().any(|logged| logged.seq >= next_seq && logged.frame.keyframe);
     if !can_sync || input.keyframe_requested {
         state.keyframe_wanted = true;
     }
     // without zenoh timestamps each frontend stamps a sample on arrival, so the same sample differs by a little
-    let newer = state.last_input.is_none_or(|(timestamp_ms, hash)| if hash == input.hash { input.timestamp_ms > timestamp_ms + SAME_SAMPLE_MS } else { input.timestamp_ms >= timestamp_ms });
+    let newer = state.last_input.is_none_or(|(timestamp_ms, hash)| {
+        if hash == input.hash { input.timestamp_ms > timestamp_ms + SAME_SAMPLE_MS } else { input.timestamp_ms >= timestamp_ms }
+    });
     if newer {
         state.last_input = Some((input.timestamp_ms, input.hash));
         let (is_picture, header) = if let DecodedFrame::Video(image) = &*input.decoded {
@@ -1570,12 +1772,14 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
         // (only while bandwidth is short: granted its whole demand, the policy's bits per pixel already set the quality at
         // full size, and a coarse quantizer shrank a 20 Mbit/s link's picture to 1184x666)
         let most = session.policy.frame_bytes(state.source, hz.max(0.1), 1.0) * 8.0 * hz.max(0.1);
-        let by_qp = (bitrate < most).then(|| state.qp.scale(state.source, size_bitrate, session.policy.target_qp, session.policy.max_qp)).flatten();
+        let by_qp =
+            (bitrate < most).then(|| state.qp.scale(state.source, size_bitrate, session.policy.target_qp, session.policy.max_qp)).flatten();
         let qp_scale = by_qp.map(|(scale, _)| scale);
         let (scale, source) = (state.scale, state.source);
         let floor = session.policy.floor_scale(source);
         out.scale_cap = state.governor.scale_cap(scale, floor, hz, Instant::now());
-        let mut target = target(&session.policy, source, input.quality, bitrate, size_bitrate, qp_scale, hz, out.scale_cap, state.keyframe_wanted);
+        let mut target =
+            target(&session.policy, source, input.quality, bitrate, size_bitrate, qp_scale, hz, out.scale_cap, state.keyframe_wanted);
         let now = Instant::now();
         let (size, changed) = steady_size(state.size, source, (target.width, target.height), now, starting_up, state.qp_shrunk);
         if changed {
@@ -1587,7 +1791,14 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
         (target.width, target.height) = size;
         target.frame_id = state.next_frame_id;
         state.next_frame_id += 1;
-        let pending = Pending { frame_id: target.frame_id, source: state.source, timestamp_ms: input.timestamp_ms, received_ms: input.received_ms, header: header.clone(), sample: input.sample.clone() };
+        let pending = Pending {
+            frame_id: target.frame_id,
+            source: state.source,
+            timestamp_ms: input.timestamp_ms,
+            received_ms: input.received_ms,
+            header: header.clone(),
+            sample: input.sample.clone(),
+        };
         state.pending.push_back(pending);
         if state.pending.len() > PENDING_MAX {
             state.pending.pop_front();
@@ -1599,7 +1810,9 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
             let mut encoder = existing.map_or_else(|| codecs.video_encoder(&*codec, format), Ok)?;
             let started = Instant::now();
             // this frame's output (or an earlier one's)
-            let mut result = encoder.encode(&decoded, &target).map(|frame| frame.map(|frame| (frame, encoder.last_qp(), encoder.last_frame_id())).into_iter().collect::<Vec<_>>());
+            let mut result = encoder
+                .encode(&decoded, &target)
+                .map(|frame| frame.map(|frame| (frame, encoder.last_qp(), encoder.last_frame_id())).into_iter().collect::<Vec<_>>());
             // (the wait below is not encoding work: the CPU governor only sees this)
             let encode_ms = started.elapsed().as_secs_f64() * 1000.0;
             // then every frame still inside a pipelined encoder, as it comes out, until the next input is due: taken only
@@ -1631,34 +1844,60 @@ async fn step(session: Arc<EncodeSession>, member: &mut Member, input: Input, co
                 }
                 out.encode_ms = state.governor.encode_ms;
                 match result {
-                    Ok(frames) => for (frame, qp, frame_id) in frames {
-                        // (a keyframe's quantizer says nothing about what a frame of this picture needs)
-                        if !frame.keyframe
-                            && let Some(qp) = qp
-                        {
-                            state.qp.observe(Instant::now(), (frame.width, frame.height), qp, frame.data.len() as f64 * 8.0, size_bitrate, bitrate);
+                    Ok(frames) => {
+                        for (frame, qp, frame_id) in frames {
+                            // (a keyframe's quantizer says nothing about what a frame of this picture needs)
+                            if !frame.keyframe
+                                && let Some(qp) = qp
+                            {
+                                state.qp.observe(
+                                    Instant::now(),
+                                    (frame.width, frame.height),
+                                    qp,
+                                    frame.data.len() as f64 * 8.0,
+                                    size_bitrate,
+                                    bitrate,
+                                );
+                            }
+                            if !is_picture {
+                                state.source = (frame.width, frame.height);
+                            }
+                            state.scale = frame.width as f64 / state.source.0.max(1) as f64;
+                            state.keyframe_wanted &= !frame.keyframe;
+                            let seq = state.next_seq;
+                            state.next_seq += 1;
+                            // the input this output is from (a pipelined encoder's trails), and every older one is done
+                            let from = frame_id.unwrap_or(target.frame_id);
+                            let mut came_with = None;
+                            while state.pending.front().is_some_and(|pending| pending.frame_id <= from) {
+                                came_with = state.pending.pop_front().filter(|pending| pending.frame_id == from);
+                            }
+                            let Pending { source, timestamp_ms, received_ms, header, sample, .. } = came_with.unwrap_or_else(|| Pending {
+                                frame_id: from,
+                                source: state.source,
+                                timestamp_ms: input.timestamp_ms,
+                                received_ms: input.received_ms,
+                                header: header.clone(),
+                                sample: input.sample.clone(),
+                            });
+                            let source = if is_picture { source } else { state.source };
+                            let logged = SessionFrame {
+                                seq,
+                                source,
+                                frame,
+                                timestamp_ms,
+                                received_ms,
+                                encoded_ms: crate::subscription::now_unix_ms(),
+                                encoded_by: member.id,
+                                header,
+                                sample,
+                            };
+                            state.log.push_back(Arc::new(logged));
+                            if state.log.len() > SESSION_LOG {
+                                state.log.pop_front();
+                            }
                         }
-                        if !is_picture {
-                            state.source = (frame.width, frame.height);
-                        }
-                        state.scale = frame.width as f64 / state.source.0.max(1) as f64;
-                        state.keyframe_wanted &= !frame.keyframe;
-                        let seq = state.next_seq;
-                        state.next_seq += 1;
-                        // the input this output is from (a pipelined encoder's trails), and every older one is done
-                        let from = frame_id.unwrap_or(target.frame_id);
-                        let mut came_with = None;
-                        while state.pending.front().is_some_and(|pending| pending.frame_id <= from) {
-                            came_with = state.pending.pop_front().filter(|pending| pending.frame_id == from);
-                        }
-                        let Pending { source, timestamp_ms, received_ms, header, sample, .. } = came_with.unwrap_or_else(|| Pending { frame_id: from, source: state.source, timestamp_ms: input.timestamp_ms, received_ms: input.received_ms, header: header.clone(), sample: input.sample.clone() });
-                        let source = if is_picture { source } else { state.source };
-                        let logged = SessionFrame { seq, source, frame, timestamp_ms, received_ms, encoded_ms: crate::subscription::now_unix_ms(), encoded_by: member.id, header, sample };
-                        state.log.push_back(Arc::new(logged));
-                        if state.log.len() > SESSION_LOG {
-                            state.log.pop_front();
-                        }
-                    },
+                    }
                     Err(error) => out.error = Some(error),
                 }
             }
@@ -1696,7 +1935,13 @@ fn decode_ahead(decode_ms: Option<f64>, encode_ms: Option<f64>) -> usize {
 }
 
 /// Awaits `work` while starting decodes of samples as they may go (paced by `pick`), up to `limit` waiting in `ahead`.
-async fn picking_while<T>(work: impl Future<Output = T>, ahead: &mut VecDeque<Decoding>, limit: usize, shared: &SubShared, codec: &Arc<dyn MessageEncoding>) -> T {
+async fn picking_while<T>(
+    work: impl Future<Output = T>,
+    ahead: &mut VecDeque<Decoding>,
+    limit: usize,
+    shared: &SubShared,
+    codec: &Arc<dyn MessageEncoding>,
+) -> T {
     tokio::pin!(work);
     loop {
         if ahead.len() >= limit {
@@ -1726,7 +1971,13 @@ async fn picking_while<T>(work: impl Future<Output = T>, ahead: &mut VecDeque<De
 pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: TrackClaim) {
     let Some(codec) = shared.codec.clone() else { return };
     let sessions = &shared.codecs.video_sessions;
-    let mut member = Member { id: sessions.next_member.fetch_add(1, Ordering::Relaxed), session: None, next_seq: None, synced: false, registry: Some(shared.codecs.clone()) };
+    let mut member = Member {
+        id: sessions.next_member.fetch_add(1, Ordering::Relaxed),
+        session: None,
+        next_seq: None,
+        synced: false,
+        registry: Some(shared.codecs.clone()),
+    };
     let mut next_frame_id: u32 = 0;
     let mut last_write: Option<Instant> = None;
     let mut warned_write = false;
@@ -1817,7 +2068,8 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         // a 33 ms interval the loop is idle for the rest anyway, and the overlap it would buy is the encode, under a
         // millisecond. Measure before building it
         let depth = if stream_decoded { 0 } else { decode_ahead(decode_ms, encode_ms) };
-        let finished = picking_while(finish_decode(task, shared.codecs.encode_timeout), &mut ahead, depth.saturating_sub(1), &shared, &codec).await;
+        let finished =
+            picking_while(finish_decode(task, shared.codecs.encode_timeout), &mut ahead, depth.saturating_sub(1), &shared, &codec).await;
         profile.decode += stage.elapsed();
         if profile.iterations >= PROFILE_FRAMES || profile_since.elapsed() >= PROFILE_INTERVAL {
             profile.report(&key, profile_since.elapsed());
@@ -1828,7 +2080,16 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                 if !reused {
                     decode_ms = Some(ewma(decode_ms, ms));
                 }
-                let this = Fed { frame_id, key, timestamp_ms: item.timestamp_ms, received_ms: item.received_ms, seq: item.seq, hash, header, sample: subscription::sample_meta(&item) };
+                let this = Fed {
+                    frame_id,
+                    key,
+                    timestamp_ms: item.timestamp_ms,
+                    received_ms: item.received_ms,
+                    seq: item.seq,
+                    hash,
+                    header,
+                    sample: subscription::sample_meta(&item),
+                };
                 match picture_id {
                     // a stream decode: the picture is the sample its decoder named, which may not be the one just fed
                     Some(picture_id) => {
@@ -1847,7 +2108,9 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                             // a picture for a sample this loop no longer has: a decoder that gave one frame id twice,
                             // or held pictures back past `FED_MAX`. Nothing can say when it was taken, and a picture
                             // sent with another sample's stamp is worse than one not sent
-                            shared.record_encoding_error(&format!("stream decoder gave frame {picture_id}, which is not one of this key's samples waiting for a picture"));
+                            shared.record_encoding_error(&format!(
+                                "stream decoder gave frame {picture_id}, which is not one of this key's samples waiting for a picture"
+                            ));
                             continue;
                         }
                         (decoded, waiting.pop_front().expect("the front was just looked at"))
@@ -1896,12 +2159,27 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
         frame_interval = crate::secs(1.0 / hz.max(0.1));
         let previous = member.session.take();
         let Channel::Video(format) = shared.channel else { return };
-        let session = sessions.place(previous.clone(), member.id, (codec.name(), format, &key), shared.tuning().video_policy, (bitrate, hz, bitrate * track.rate.size_ratio(), track.rate.starting_up()));
+        let session = sessions.place(
+            previous.clone(),
+            member.id,
+            (codec.name(), format, &key),
+            shared.tuning().video_policy,
+            (bitrate, hz, bitrate * track.rate.size_ratio(), track.rate.starting_up()),
+        );
         if previous.is_none_or(|previous| !Arc::ptr_eq(&previous, &session)) {
             (member.next_seq, member.synced) = (None, false);
         }
         member.session = Some(session.clone());
-        let input = Input { decoded, header: decoded_header, timestamp_ms, received_ms, hash, quality, keyframe_requested: track.keyframe_requested.swap(false, Ordering::AcqRel), sample: sample_meta };
+        let input = Input {
+            decoded,
+            header: decoded_header,
+            timestamp_ms,
+            received_ms,
+            hash,
+            quality,
+            keyframe_requested: track.keyframe_requested.swap(false, Ordering::AcqRel),
+            sample: sample_meta,
+        };
         let stepping = step(session, &mut member, input, shared.codecs.clone(), codec.clone());
         let stage = Instant::now();
         let outcome = picking_while(stepping, &mut ahead, depth, &shared, &codec).await;
@@ -1919,9 +2197,15 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             if !profile_reported && format == VideoFormat::H264 {
                 if let Some(profile) = h264_profile(&frame.data) {
                     let (profile_idc, constraints, level) = profile;
-                    let (name, level) = (format!("profile_idc {profile_idc}, constraints {constraints:#04x}"), format!("level {}.{}", level / 10, level % 10));
+                    let (name, level) = (
+                        format!("profile_idc {profile_idc}, constraints {constraints:#04x}"),
+                        format!("level {}.{}", level / 10, level % 10),
+                    );
                     if takes_constrained_baseline(profile) {
-                        log::info!("video track {}: H.264 {name}, {level} — a receiver offered constrained baseline can take it", track.mid);
+                        log::info!(
+                            "video track {}: H.264 {name}, {level} — a receiver offered constrained baseline can take it",
+                            track.mid
+                        );
                     } else {
                         log::warn!(
                             "video track {}: H.264 {name}, {level} — the gateway offered constrained baseline (profile-level-id=42e01f) and this is not it, so a browser may refuse or fail to decode it. An encoder on its defaults is the usual reason",
@@ -1933,13 +2217,15 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
             }
             shared.note_video_source(logged.source.0, logged.source.1);
             let now = Instant::now();
-            let duration = last_write.map_or(crate::secs(1.0 / hz.max(0.1)), |previous| now.duration_since(previous).max(Duration::from_millis(1)));
+            let duration =
+                last_write.map_or(crate::secs(1.0 / hz.max(0.1)), |previous| now.duration_since(previous).max(Duration::from_millis(1)));
             last_write = Some(now);
             if !track.is_current() {
                 break;
             }
             let stage = Instant::now();
-            let writing = track.write(frame.data.clone(), duration, shared.tuning().playout_delay, Some(logged.timestamp_ms), frame.keyframe).await;
+            let writing =
+                track.write(frame.data.clone(), duration, shared.tuning().playout_delay, Some(logged.timestamp_ms), frame.keyframe).await;
             profile.write += stage.elapsed();
             let written = match writing {
                 Ok(written) => written,
@@ -1952,11 +2238,34 @@ pub async fn send_loop(dc: Arc<dyn DataChannel>, shared: Arc<SubShared>, track: 
                     continue;
                 }
             };
-            let times = FrameTimes { received_ms: logged.received_ms, encoded_ms: logged.encoded_ms, written_ms: crate::subscription::now_unix_ms() };
-            shared.record_video_latency(times.received_ms - logged.timestamp_ms, times.encoded_ms - times.received_ms, times.written_ms - times.encoded_ms, track.pacer_delay_percentiles());
-            let meta = metadata(frame, logged.source, quality, &written, times, logged.header.as_ref().filter(|_| shared.sends_header()).map(|header| (header, &logged.sample)));
+            let times = FrameTimes {
+                received_ms: logged.received_ms,
+                encoded_ms: logged.encoded_ms,
+                written_ms: crate::subscription::now_unix_ms(),
+            };
+            shared.record_video_latency(
+                times.received_ms - logged.timestamp_ms,
+                times.encoded_ms - times.received_ms,
+                times.written_ms - times.encoded_ms,
+                track.pacer_delay_percentiles(),
+            );
+            let meta = metadata(
+                frame,
+                logged.source,
+                quality,
+                &written,
+                times,
+                logged.header.as_ref().filter(|_| shared.sends_header()).map(|header| (header, &logged.sample)),
+            );
             let shared_encode = logged.encoded_by != member.id;
-            shared.record_video_frame(frame.data.len(), (frame.width, frame.height), quality, frame.keyframe, shared_encode, track.keyframe_requests.load(Ordering::Relaxed));
+            shared.record_video_frame(
+                frame.data.len(),
+                (frame.width, frame.height),
+                quality,
+                frame.keyframe,
+                shared_encode,
+                track.keyframe_requests.load(Ordering::Relaxed),
+            );
             let stage = Instant::now();
             let sent = subscription::send_small_frame(&dc, &key, logged.timestamp_ms, seq, next_frame_id, 0, &meta).await;
             profile.send += stage.elapsed();
@@ -1983,9 +2292,13 @@ mod tests {
         let picture = VideoImage::i420(320, 240, vec![128; 320 * 240 * 3 / 2]).unwrap();
         let frame = DecodedFrame::Video(picture);
         let mut encoder = crate::encoding::H264Encoder::default();
-        let encoded = (0..4).find_map(|_| encoder.encode(&frame, &VideoTarget::new(320, 240, 1_000_000, 30.0)).unwrap()).expect("an access unit");
+        let encoded =
+            (0..4).find_map(|_| encoder.encode(&frame, &VideoTarget::new(320, 240, 1_000_000, 30.0)).unwrap()).expect("an access unit");
         let profile = super::h264_profile(&encoded.data).expect("its parameter set");
-        assert!(super::takes_constrained_baseline(profile), "openh264 emits {profile:?}, which a receiver offered constrained baseline cannot be assumed to take");
+        assert!(
+            super::takes_constrained_baseline(profile),
+            "openh264 emits {profile:?}, which a receiver offered constrained baseline cannot be assumed to take"
+        );
         // and specifically: baseline, since that is what it is configured for
         // measured: (66, 0xc0, level) — baseline with constraint_set0 and constraint_set1 both set, which is
         // precisely constrained baseline, so what is offered and what is emitted agree
@@ -2026,7 +2339,10 @@ mod tests {
             send: Duration::from_millis(20),
         };
         let line = profile.line("camera/front", Duration::from_millis(4_520));
-        assert_eq!(line, "camera/front: 22.1 iterations/s, 45.2 ms each: pick 0.2, decode 22.4, encode 0.4, write 1.1, send 0.2, elsewhere 20.9");
+        assert_eq!(
+            line,
+            "camera/front: 22.1 iterations/s, 45.2 ms each: pick 0.2, decode 22.4, encode 0.4, write 1.1, send 0.2, elsewhere 20.9"
+        );
         // an empty window says so rather than dividing by it
         let line = super::Profile::default().line("camera/front", Duration::ZERO);
         assert!(line.starts_with("camera/front: ") && !line.contains("NaN"), "{line}");
@@ -2137,17 +2453,53 @@ mod tests {
         let at = |size: (u32, u32), after: std::time::Duration| Some((source, size, t0 - after));
         assert_eq!(steady_size(None, source, (1360, 1088), t0, false, false), ((1360, 1088), true), "the first frame takes its size");
         let settled = SIZE_UP_SETTLE * 2;
-        assert_eq!(steady_size(at((1360, 1088), settled), source, (1312, 1050), t0, false, false).0, (1360, 1088), "a few percent smaller: kept");
-        assert_eq!(steady_size(at((1360, 1088), settled), source, (1440, 1152), t0, false, false).0, (1360, 1088), "a few percent bigger: kept");
-        assert_eq!(steady_size(at((1360, 1088), settled), source, (960, 768), t0, false, false), ((960, 768), true), "much smaller: shrinks");
-        assert_eq!(steady_size(at((1360, 1088), SIZE_DOWN_SETTLE / 2), source, (960, 768), t0, false, false).0, (1360, 1088), "not twice a second");
-        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE * 2), source, (1360, 1088), t0, false, false).0, (960, 768), "grows only after it settled");
-        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE * 2), source, (1360, 1088), t0, true, false).0, (1360, 1088), "or at once while the link model starts up");
+        assert_eq!(
+            steady_size(at((1360, 1088), settled), source, (1312, 1050), t0, false, false).0,
+            (1360, 1088),
+            "a few percent smaller: kept"
+        );
+        assert_eq!(
+            steady_size(at((1360, 1088), settled), source, (1440, 1152), t0, false, false).0,
+            (1360, 1088),
+            "a few percent bigger: kept"
+        );
+        assert_eq!(
+            steady_size(at((1360, 1088), settled), source, (960, 768), t0, false, false),
+            ((960, 768), true),
+            "much smaller: shrinks"
+        );
+        assert_eq!(
+            steady_size(at((1360, 1088), SIZE_DOWN_SETTLE / 2), source, (960, 768), t0, false, false).0,
+            (1360, 1088),
+            "not twice a second"
+        );
+        assert_eq!(
+            steady_size(at((960, 768), SIZE_DOWN_SETTLE * 2), source, (1360, 1088), t0, false, false).0,
+            (960, 768),
+            "grows only after it settled"
+        );
+        assert_eq!(
+            steady_size(at((960, 768), SIZE_DOWN_SETTLE * 2), source, (1360, 1088), t0, true, false).0,
+            (1360, 1088),
+            "or at once while the link model starts up"
+        );
         assert_eq!(steady_size(at((960, 768), settled), source, (1360, 1088), t0, false, false).0, (1360, 1088));
         assert_eq!(steady_size(at((1792, 1434), settled), source, (1920, 1536), t0, false, false).0, (1920, 1536), "back to full size");
-        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE / 2), source, (1920, 1536), t0, false, false).0, (1920, 1536), "full size at once");
-        assert_eq!(steady_size(at((960, 768), SIZE_DOWN_SETTLE / 2), source, (1920, 1536), t0, false, true).0, (960, 768), "not after the quantizer shrank it");
-        assert_eq!(steady_size(Some(((640, 480), (320, 240), t0)), source, (1920, 1536), t0, false, false), ((1920, 1536), true), "a new source: at once");
+        assert_eq!(
+            steady_size(at((960, 768), SIZE_DOWN_SETTLE / 2), source, (1920, 1536), t0, false, false).0,
+            (1920, 1536),
+            "full size at once"
+        );
+        assert_eq!(
+            steady_size(at((960, 768), SIZE_DOWN_SETTLE / 2), source, (1920, 1536), t0, false, true).0,
+            (960, 768),
+            "not after the quantizer shrank it"
+        );
+        assert_eq!(
+            steady_size(Some(((640, 480), (320, 240), t0)), source, (1920, 1536), t0, false, false),
+            ((1920, 1536), true),
+            "a new source: at once"
+        );
     }
 
     #[test]
@@ -2174,7 +2526,10 @@ mod tests {
         assert!((governor.scale_cap(1.0, 0.25, 30.0, start) - 0.9).abs() < 1e-9, "one step down");
         // (at 0.9 it costs 0.81 of that: all of it scales with pixels)
         governor.observe_encode(40.5);
-        assert!((governor.scale_cap(0.9, 0.25, 30.0, start + Duration::from_millis(100)) - 0.9).abs() < 1e-9, "settles before the next step");
+        assert!(
+            (governor.scale_cap(0.9, 0.25, 30.0, start + Duration::from_millis(100)) - 0.9).abs() < 1e-9,
+            "settles before the next step"
+        );
         assert!((governor.scale_cap(0.9, 0.25, 30.0, start + CPU_SETTLE) - 0.8).abs() < 1e-9);
         // steps down from the scale in use: the bitrate policy had already shrunk the picture to 0.5
         let mut shrunk = CpuGovernor::new();
@@ -2213,7 +2568,8 @@ mod tests {
         }
         assert!((scale - 0.7).abs() < 1e-9, "stops at the first size that fits (25 ms), not at the floor: {scale}");
         // left at the floor (as an older gateway left it), it climbs back
-        let mut stuck = CpuGovernor { cap: 0.1, encode_ms: None, changed_at: Some(start), before: Some((0.2, cost(0.2))), ..CpuGovernor::new() };
+        let mut stuck =
+            CpuGovernor { cap: 0.1, encode_ms: None, changed_at: Some(start), before: Some((0.2, cost(0.2))), ..CpuGovernor::new() };
         let (mut scale, mut at) = (0.1, start);
         for _ in 0..20 {
             at += CPU_UP_SETTLE;
@@ -2289,14 +2645,30 @@ mod tests {
         let codecs = Arc::new(EncodingRegistry::new([codec.clone()]).unwrap());
         let sessions = &codecs.video_sessions;
         let picture = Arc::new(DecodedFrame::Video(VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap()));
-        let mut viewers: Vec<Member> = (0..3).map(|id| Member { id, session: None, next_seq: None, synced: false, registry: None }).collect();
+        let mut viewers: Vec<Member> =
+            (0..3).map(|id| Member { id, session: None, next_seq: None, synced: false, registry: None }).collect();
         let grants = [(4e6, 30.0, 4e6, false), (4.4e6, 30.0, 4.4e6, false), (1e6, 30.0, 1e6, false)];
         let mut sent = vec![Vec::new(); 3];
         for sample in 0..10u64 {
             for (index, viewer) in viewers.iter_mut().enumerate() {
-                let session = sessions.place(viewer.session.take(), viewer.id, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), grants[index]);
+                let session = sessions.place(
+                    viewer.session.take(),
+                    viewer.id,
+                    ("camera", VideoFormat::H264, "cam0"),
+                    VideoPolicy::default(),
+                    grants[index],
+                );
                 viewer.session = Some(session.clone());
-                let input = Input { decoded: picture.clone(), header: None, timestamp_ms: sample as f64 * 33.0, received_ms: sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false, sample: None };
+                let input = Input {
+                    decoded: picture.clone(),
+                    header: None,
+                    timestamp_ms: sample as f64 * 33.0,
+                    received_ms: sample as f64 * 33.0,
+                    hash: sample,
+                    quality: 1.0,
+                    keyframe_requested: false,
+                    sample: None,
+                };
                 let step = step(session, viewer, input, codecs.clone(), codec.clone()).await;
                 sent[index].extend(step.frames.iter().map(|frame| (frame.seq, frame.frame.keyframe, frame.encoded_by)));
             }
@@ -2305,7 +2677,8 @@ mod tests {
         // a viewer that started alone (its first grant was a guess) joins the older session once its grant fits there
         let late = sessions.place(None, 9, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (16e6, 30.0, 16e6, false));
         assert_eq!(sessions.count(), 3);
-        let merged = sessions.place(Some(late), 9, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (4.2e6, 30.0, 4.2e6, false));
+        let merged =
+            sessions.place(Some(late), 9, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (4.2e6, 30.0, 4.2e6, false));
         assert!(Arc::ptr_eq(&merged, viewers[0].session.as_ref().unwrap()) && sessions.count() == 2);
         sessions.leave(&merged, 9);
         assert_eq!(encodes.load(Ordering::Relaxed), 20, "10 samples, encoded once per session");
@@ -2313,7 +2686,13 @@ mod tests {
         assert!(sent[0][0].1 && sent[2][0].1, "each viewer starts at a keyframe");
         assert_eq!(sent[1].iter().filter(|frame| frame.2 == 0).count(), 10, "viewer 1 sent the frames viewer 0 encoded");
         // a viewer whose grant moves away leaves for a session of its own, from a keyframe
-        let session = sessions.place(viewers[1].session.take(), 1, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (12e6, 30.0, 12e6, false));
+        let session = sessions.place(
+            viewers[1].session.take(),
+            1,
+            ("camera", VideoFormat::H264, "cam0"),
+            VideoPolicy::default(),
+            (12e6, 30.0, 12e6, false),
+        );
         assert!(!Arc::ptr_eq(&session, viewers[0].session.as_ref().unwrap()));
         assert_eq!(sessions.count(), 3);
         for viewer in viewers.iter().filter(|viewer| viewer.session.is_some()) {
@@ -2331,14 +2710,34 @@ mod tests {
         let mut sent = Vec::new();
         for (sample, frame_id) in [(0u64, "cam_optical"), (1, "cam_optical"), (2, "cam2_optical")] {
             let picture = VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap().with_header(100.0 + sample as f64 * 0.5, frame_id);
-            let session = codecs.video_sessions.place(viewer.session.take(), 0, ("camera", VideoFormat::H264, "cam0"), VideoPolicy::default(), (4e6, 30.0, 4e6, false));
+            let session = codecs.video_sessions.place(
+                viewer.session.take(),
+                0,
+                ("camera", VideoFormat::H264, "cam0"),
+                VideoPolicy::default(),
+                (4e6, 30.0, 4e6, false),
+            );
             viewer.session = Some(session.clone());
-            let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), header: None, timestamp_ms: sample as f64 * 33.0, received_ms: sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false, sample: Some(("image/raw".into(), Some(vec![9]))) };
+            let input = Input {
+                decoded: Arc::new(DecodedFrame::Video(picture)),
+                header: None,
+                timestamp_ms: sample as f64 * 33.0,
+                received_ms: sample as f64 * 33.0,
+                hash: sample,
+                quality: 1.0,
+                keyframe_requested: false,
+                sample: Some(("image/raw".into(), Some(vec![9]))),
+            };
             sent.extend(step(session, &mut viewer, input, codecs.clone(), codec.clone()).await.frames);
         }
         codecs.video_sessions.leave(viewer.session.as_ref().unwrap(), 0);
-        let headers: Vec<_> = sent.iter().map(|frame| frame.header.as_ref().map(|header| (header.stamp(), header.frame_id.clone())).unwrap()).collect();
-        assert_eq!(headers, vec![(100.0, "cam_optical".into()), (100.5, "cam_optical".into()), (101.0, "cam2_optical".into())], "each frame its own picture's");
+        let headers: Vec<_> =
+            sent.iter().map(|frame| frame.header.as_ref().map(|header| (header.stamp(), header.frame_id.clone())).unwrap()).collect();
+        assert_eq!(
+            headers,
+            vec![(100.0, "cam_optical".into()), (100.5, "cam_optical".into()), (101.0, "cam2_optical".into())],
+            "each frame its own picture's"
+        );
         let times = || super::FrameTimes { received_ms: 1.0, encoded_ms: 2.0, written_ms: 3.0 };
         let written = super::Written { media_time_ms: 0.0, rtp_timestamp: Some(90) };
         let mut bare = super::metadata(&sent[2].frame, (64, 48), 1.0, &written, times(), None);
@@ -2349,7 +2748,11 @@ mod tests {
         assert_eq!(&with[..super::METADATA_LEN], &bare[..], "the first 64 bytes unchanged but the flag");
         assert_eq!(f64::from_le_bytes(with[64..72].try_into().unwrap()), 101.0);
         assert_eq!((u16::from_le_bytes([with[72], with[73]]), &with[74..86]), (12, &b"cam2_optical"[..]), "0.5.31's layout first");
-        assert_eq!(crate::frame::decode_header(&with[64..]), Some((sent[2].header.clone().unwrap(), Some(("image/raw".into(), Some(vec![9]))))), "then the exact stamp, seq and the sample's encoding and attachment");
+        assert_eq!(
+            crate::frame::decode_header(&with[64..]),
+            Some((sent[2].header.clone().unwrap(), Some(("image/raw".into(), Some(vec![9]))))),
+            "then the exact stamp, seq and the sample's encoding and attachment"
+        );
     }
 
     /// Holds two frames, as a hardware pipeline does: each encode returns the frame given two calls before.
@@ -2363,7 +2766,12 @@ mod tests {
         fn encode(&mut self, _: &DecodedFrame, target: &VideoTarget) -> anyhow::Result<Option<EncodedVideo>> {
             self.0.push_back(target.frame_id);
             self.1 = if self.0.len() > 2 { self.0.pop_front() } else { None };
-            Ok(self.1.map(|frame_id| EncodedVideo { data: vec![0; 10], width: target.width, height: target.height, keyframe: frame_id == 0 }))
+            Ok(self.1.map(|frame_id| EncodedVideo {
+                data: vec![0; 10],
+                width: target.width,
+                height: target.height,
+                keyframe: frame_id == 0,
+            }))
         }
 
         fn last_frame_id(&self) -> Option<u64> {
@@ -2399,14 +2807,34 @@ mod tests {
         let mut sent = Vec::new();
         for sample in 0..6u64 {
             let picture = VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap().with_header(100.0 + sample as f64, "cam");
-            let session = codecs.video_sessions.place(viewer.session.take(), 0, ("lagging", VideoFormat::H264, "cam0"), VideoPolicy::default(), (4e6, 30.0, 4e6, false));
+            let session = codecs.video_sessions.place(
+                viewer.session.take(),
+                0,
+                ("lagging", VideoFormat::H264, "cam0"),
+                VideoPolicy::default(),
+                (4e6, 30.0, 4e6, false),
+            );
             viewer.session = Some(session.clone());
-            let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), header: None, timestamp_ms: sample as f64 * 33.0, received_ms: 1000.0 + sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false, sample: None };
+            let input = Input {
+                decoded: Arc::new(DecodedFrame::Video(picture)),
+                header: None,
+                timestamp_ms: sample as f64 * 33.0,
+                received_ms: 1000.0 + sample as f64 * 33.0,
+                hash: sample,
+                quality: 1.0,
+                keyframe_requested: false,
+                sample: None,
+            };
             sent.extend(step(session, &mut viewer, input, codecs.clone(), codec.clone()).await.frames);
         }
         codecs.video_sessions.leave(viewer.session.as_ref().unwrap(), 0);
-        let stamps: Vec<_> = sent.iter().map(|frame| (frame.header.as_ref().unwrap().stamp(), frame.timestamp_ms, frame.received_ms)).collect();
-        assert_eq!(stamps, vec![(100.0, 0.0, 1000.0), (101.0, 33.0, 1033.0), (102.0, 66.0, 1066.0), (103.0, 99.0, 1099.0)], "each output with the input it came from, two behind");
+        let stamps: Vec<_> =
+            sent.iter().map(|frame| (frame.header.as_ref().unwrap().stamp(), frame.timestamp_ms, frame.received_ms)).collect();
+        assert_eq!(
+            stamps,
+            vec![(100.0, 0.0, 1000.0), (101.0, 33.0, 1033.0), (102.0, 66.0, 1066.0), (103.0, 99.0, 1099.0)],
+            "each output with the input it came from, two behind"
+        );
     }
 
     /// Holds frames until it has three, then lets them all out at once (as a pipeline that fell behind catches up).
@@ -2461,10 +2889,32 @@ mod tests {
         let mut sent = Vec::new();
         for sample in 0..3u64 {
             let picture = VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap().with_header(100.0 + sample as f64, "cam");
-            let session = codecs.video_sessions.place(viewer.session.take(), 0, ("bursty", VideoFormat::H264, "cam0"), VideoPolicy::default(), (4e6, 30.0, 4e6, false));
+            let session = codecs.video_sessions.place(
+                viewer.session.take(),
+                0,
+                ("bursty", VideoFormat::H264, "cam0"),
+                VideoPolicy::default(),
+                (4e6, 30.0, 4e6, false),
+            );
             viewer.session = Some(session.clone());
-            let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), header: None, timestamp_ms: sample as f64 * 33.0, received_ms: sample as f64 * 33.0, hash: sample, quality: 1.0, keyframe_requested: false, sample: None };
-            sent.push(step(session, &mut viewer, input, codecs.clone(), codec.clone()).await.frames.iter().map(|frame| frame.header.as_ref().unwrap().stamp()).collect::<Vec<_>>());
+            let input = Input {
+                decoded: Arc::new(DecodedFrame::Video(picture)),
+                header: None,
+                timestamp_ms: sample as f64 * 33.0,
+                received_ms: sample as f64 * 33.0,
+                hash: sample,
+                quality: 1.0,
+                keyframe_requested: false,
+                sample: None,
+            };
+            sent.push(
+                step(session, &mut viewer, input, codecs.clone(), codec.clone())
+                    .await
+                    .frames
+                    .iter()
+                    .map(|frame| frame.header.as_ref().unwrap().stamp())
+                    .collect::<Vec<_>>(),
+            );
         }
         codecs.video_sessions.leave(viewer.session.as_ref().unwrap(), 0);
         assert_eq!(sent, vec![vec![], vec![], vec![100.0, 101.0, 102.0]], "all three at once, each with its own stamp, not one a call");
@@ -2525,9 +2975,19 @@ mod tests {
         let codecs = Arc::new(EncodingRegistry::new([codec.clone()]).unwrap());
         let mut viewer = Member { id: 0, session: None, next_seq: None, synced: false, registry: None };
         let picture = VideoImage::rgb8(64, 48, vec![0; 64 * 48 * 3]).unwrap().with_header(100.0, "cam");
-        let session = codecs.video_sessions.place(None, 0, (name, VideoFormat::H264, "cam0"), VideoPolicy::default(), (4e6, fps, 4e6, false));
+        let session =
+            codecs.video_sessions.place(None, 0, (name, VideoFormat::H264, "cam0"), VideoPolicy::default(), (4e6, fps, 4e6, false));
         viewer.session = Some(session.clone());
-        let input = Input { decoded: Arc::new(DecodedFrame::Video(picture)), header: None, timestamp_ms: 0.0, received_ms: 0.0, hash: 0, quality: 1.0, keyframe_requested: false, sample: None };
+        let input = Input {
+            decoded: Arc::new(DecodedFrame::Video(picture)),
+            header: None,
+            timestamp_ms: 0.0,
+            received_ms: 0.0,
+            hash: 0,
+            quality: 1.0,
+            keyframe_requested: false,
+            sample: None,
+        };
         let started = Instant::now();
         let out = step(session, &mut viewer, input, codecs.clone(), codec).await;
         codecs.video_sessions.leave(viewer.session.as_ref().unwrap(), 0);

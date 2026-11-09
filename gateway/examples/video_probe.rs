@@ -50,7 +50,15 @@ fn usage() -> String {
 }
 
 fn options() -> Result<Options> {
-    let mut options = Options { url: String::new(), key: String::new(), encoding: None, channel: "video-h264".to_owned(), seconds: 20.0, verbose: false, token: None };
+    let mut options = Options {
+        url: String::new(),
+        key: String::new(),
+        encoding: None,
+        channel: "video-h264".to_owned(),
+        seconds: 20.0,
+        verbose: false,
+        token: None,
+    };
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         let mut value = || args.next().with_context(|| format!("{argument} needs a value\n{}", usage()));
@@ -118,12 +126,23 @@ async fn main() -> Result<()> {
     if let Some(encoding) = &options.encoding
         && !client.encodings().iter().any(|known| known.name == *encoding)
     {
-        bail!("this gateway has no encoding {encoding:?} (it has: {})", client.encodings().iter().map(|known| known.name.clone()).collect::<Vec<_>>().join(", "));
+        bail!(
+            "this gateway has no encoding {encoding:?} (it has: {})",
+            client.encodings().iter().map(|known| known.name.clone()).collect::<Vec<_>>().join(", ")
+        );
     }
 
     // metadata: true so every frame carries its own receivedMs/writtenMs, which is where the latency comes from
-    let subscribe = SubscribeOptions { encoding: options.encoding.clone(), channel: Some(options.channel.clone()), metadata: Some(true), ..Default::default() };
-    let mut subscription = client.subscribe(&options.key, subscribe).await.with_context(|| format!("subscribing to {} on {}", options.key, options.channel))?;
+    let subscribe = SubscribeOptions {
+        encoding: options.encoding.clone(),
+        channel: Some(options.channel.clone()),
+        metadata: Some(true),
+        ..Default::default()
+    };
+    let mut subscription = client
+        .subscribe(&options.key, subscribe)
+        .await
+        .with_context(|| format!("subscribing to {} on {}", options.key, options.channel))?;
     println!("subscribed to {} on {} for {:.0}s\n", options.key, options.channel, options.seconds);
 
     // a frame's track data and its metadata travel apart and either may come first, so they are joined on seq
@@ -150,7 +169,14 @@ async fn main() -> Result<()> {
                 first_seq = Some(first_seq.map_or(info.seq, |first| first.min(info.seq)));
                 last_seq = Some(last_seq.map_or(info.seq, |last| last.max(info.seq)));
                 if options.verbose {
-                    println!("seq {} {}x{} {} {} bytes", info.seq, info.width, info.height, if info.keyframe { "key" } else { "   " }, info.encoded_bytes);
+                    println!(
+                        "seq {} {}x{} {} {} bytes",
+                        info.seq,
+                        info.width,
+                        info.height,
+                        if info.keyframe { "key" } else { "   " },
+                        info.encoded_bytes
+                    );
                 }
             }
             // the track's own frames: matched to metadata by RTP timestamp would be exact, but the metadata carries the
@@ -170,7 +196,10 @@ async fn main() -> Result<()> {
     let (Some(first_seq), Some(last_seq)) = (first_seq, last_seq) else {
         // the gateway's own account of the stream says far more than a guess from out here: whether samples arrived at
         // all, whether any were encoded, and the last error if there was one
-        println!("\nno frames in {elapsed:.1}s. what the gateway says about this subscription:\n{}", subscription_stats(&client, &options.key).await);
+        println!(
+            "\nno frames in {elapsed:.1}s. what the gateway says about this subscription:\n{}",
+            subscription_stats(&client, &options.key).await
+        );
         bail!("no frames in {elapsed:.1}s on {} (see the gateway's stats above)", options.channel);
     };
     let sent = (last_seq.wrapping_sub(first_seq) as usize) + 1;
@@ -212,7 +241,12 @@ async fn main() -> Result<()> {
         1 => println!("keyframes: 1 in {elapsed:.1}s"),
         _ => {
             let mut spacing: Vec<f64> = keyframes.windows(2).map(|pair| pair[1].wrapping_sub(pair[0]) as f64).collect();
-            println!("keyframes: {} ({:.2}/s, every {:.0} frames) — a lost frame costs the picture until the next one", keyframes.len(), keyframes.len() as f64 / elapsed, percentile(&mut spacing, 0.5).unwrap_or_default());
+            println!(
+                "keyframes: {} ({:.2}/s, every {:.0} frames) — a lost frame costs the picture until the next one",
+                keyframes.len(),
+                keyframes.len() as f64 / elapsed,
+                percentile(&mut spacing, 0.5).unwrap_or_default()
+            );
         }
     }
     if decode_errors > 0 {
@@ -240,9 +274,20 @@ async fn subscription_stats(client: &Client, key: &str) -> String {
     let field = |name: &str| stat[name].to_string();
     [
         format!("  samples received: {}   sent: {}   encoded: {}", field("received"), field("sent"), field("encodes")),
-        format!("  dropped from the queue: {}   by age: {}   stream decoder restarts: {}", field("droppedQueue"), field("droppedAge"), field("streamResyncs")),
+        format!(
+            "  dropped from the queue: {}   by age: {}   stream decoder restarts: {}",
+            field("droppedQueue"),
+            field("droppedAge"),
+            field("streamResyncs")
+        ),
         format!("  encoding errors: {}   last: {}", field("encodingErrors"), field("lastEncodingError")),
-        format!("  picture: {}x{}   decode {} ms   encode {} ms", field("videoWidth"), field("videoHeight"), field("decodeMs"), field("encodeMs")),
+        format!(
+            "  picture: {}x{}   decode {} ms   encode {} ms",
+            field("videoWidth"),
+            field("videoHeight"),
+            field("decodeMs"),
+            field("encodeMs")
+        ),
         format!("  the allocator granted: {} bytes/s at {} Hz", channel["allocation"]["budgetBytesPerSec"], channel["allocation"]["hz"]),
         format!("  cpuScaleCap: {}   quality: {}", stat["cpuScaleCap"], stat["quality"]),
         format!("  pacerWaits: {}   pacedMs: {}   droppedQueue: {}", stat["pacerWaits"], stat["pacedMs"], stat["droppedQueue"]),
