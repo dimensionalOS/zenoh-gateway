@@ -1,0 +1,28 @@
+# Publishes gateway/ to crates.io when a v<version> tag is pushed here. The token (CARGO_REGISTRY_TOKEN, scoped to
+# publish-update on zenoh-gateway only) is a repo secret: GitHub masks it in logs and never gives it to fork PRs.
+# Running it by hand (workflow_dispatch) is a dry run without the token.
+name: publish
+on:
+    push:
+        tags: ["v*"]
+    workflow_dispatch:
+permissions:
+    contents: read
+jobs:
+    publish:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - name: the tag is the crate's version
+              if: github.event_name == 'push'
+              run: |
+                  version=$(cargo metadata --no-deps --format-version 1 --manifest-path gateway/Cargo.toml | jq -r '.packages[] | select(.name == "zenoh-gateway") | .version')
+                  test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME isn't gateway/Cargo.toml's v$version"; exit 1; }
+            - name: dry run
+              if: github.event_name != 'push'
+              run: cargo publish --locked --dry-run --manifest-path gateway/Cargo.toml
+            - name: publish
+              if: github.event_name == 'push'
+              run: cargo publish --locked --manifest-path gateway/Cargo.toml
+              env:
+                  CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
